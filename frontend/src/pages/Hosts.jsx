@@ -207,6 +207,8 @@ const Hosts = () => {
 		if (changed("filter")) {
 			switch (current.filter) {
 				case "needsUpdates":
+				case "securityUpdates":
+				case "regularUpdates":
 				case "selected":
 					// Row-level predicate is applied in the filtering logic below.
 					setShowFilters(true);
@@ -952,6 +954,10 @@ const Hosts = () => {
 			const matchesUrlFilter =
 				(filter !== "needsUpdates" ||
 					(host.updatesCount && host.updatesCount > 0)) &&
+				(filter !== "securityUpdates" ||
+					(host.securityUpdatesCount && host.securityUpdatesCount > 0)) &&
+				(filter !== "regularUpdates" ||
+					(host.updatesCount > 0 && !(host.securityUpdatesCount > 0))) &&
 				(filter !== "inactive" ||
 					(host.effectiveStatus || host.status) === "inactive") &&
 				(filter !== "upToDate" || (!host.isStale && host.updatesCount === 0)) &&

@@ -21,6 +21,15 @@ hp_package_counts AS (
         COALESCE((
             SELECT COUNT(*)::int
             FROM (
+                SELECT hp.host_id
+                FROM host_packages hp
+                WHERE hp.needs_update = true AND hp.is_security_update = true
+                GROUP BY hp.host_id
+            ) hosts_with_security
+        ), 0)::int AS hosts_with_security_updates,
+        COALESCE((
+            SELECT COUNT(*)::int
+            FROM (
                 SELECT hp.package_id
                 FROM host_packages hp
                 WHERE hp.needs_update = true
@@ -41,6 +50,7 @@ SELECT
     hc.total_hosts,
     hpc.hosts_needing_updates,
     hpc.total_outdated_packages,
+    hpc.hosts_with_security_updates,
     hc.errored_hosts,
     hpc.security_updates,
     hc.offline_hosts,
