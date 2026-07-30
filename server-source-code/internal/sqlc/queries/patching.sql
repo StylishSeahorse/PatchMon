@@ -365,3 +365,14 @@ WHERE status = 'running'
 UPDATE patch_runs
 SET status = 'agent_disconnected', error_message = $1, completed_at = NOW(), updated_at = NOW()
 WHERE host_id = $2 AND status = 'running';
+
+-- name: CancelStalledPatchRuns :execrows
+-- started_at IS NULL must be handled explicitly: a run whose agent died
+-- before reporting the "started" stage (e.g. killed by a service restart
+-- mid-run) sits at status='running' with NULL started_at, and `NULL < $1`
+-- never matches - leaving a ghost row that blocks schedulers which treat
+-- the host as busy. Fall back to created_at for those rows.
+UPDATE patch_runs
+SET status = 'cancelled', error_message = $2, completed_at = NOW(), updated_at = NOW()
+WHERE status = 'running'
+  AND (started_at < $1 OR (started_at IS NULL AND created_at < $1));

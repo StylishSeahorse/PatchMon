@@ -89,6 +89,12 @@ type Querier interface {
 	// Re-parsing the JSON here is cheap (kilobytes, in-memory) and avoids a
 	// per-row round-trip — the alternative was a SELECT loop in Go.
 	BulkUpsertPackages(ctx context.Context, payload []byte) ([]BulkUpsertPackagesRow, error)
+	// started_at IS NULL must be handled explicitly: a run whose agent died
+	// before reporting the "started" stage (e.g. killed by a service restart
+	// mid-run) sits at status='running' with NULL started_at, and `NULL < $1`
+	// never matches - leaving a ghost row that blocks schedulers which treat
+	// the host as busy. Fall back to created_at for those rows.
+	CancelStalledPatchRuns(ctx context.Context, arg CancelStalledPatchRunsParams) (int64, error)
 	ClearHostComplianceHashOnEnable(ctx context.Context, arg ClearHostComplianceHashOnEnableParams) error
 	// Force a fresh docker payload on next check-in by NULLing the hash whenever
 	// the operator re-enables docker. If the agent was already streaming docker
