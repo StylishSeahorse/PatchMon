@@ -425,10 +425,10 @@ func (d *Detector) getSELinuxStatus() string {
 }
 
 // getSystemUptime gets system uptime
-func (d *Detector) getSystemUptime() string {
+func (d *Detector) getSystemUptime(parent context.Context) string {
 	// On macOS, gopsutil may be slow on cold boot — retry with backoff
 	for attempt := range 3 {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		info, err := host.InfoWithContext(ctx)
 		cancel()
 		if err == nil {

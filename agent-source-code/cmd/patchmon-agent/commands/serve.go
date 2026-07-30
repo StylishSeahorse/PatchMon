@@ -2853,7 +2853,7 @@ func runPatchBrew(ctx context.Context, httpClient *client.Client, patchRunID, pa
 	if brewPath == "" {
 		errMsg := "brew not found: macOS Homebrew package manager is required for brew patching"
 		_ = httpClient.SendPatchOutput(ctx, patchRunID, "failed", "", errMsg)
-		return fmt.Errorf(errMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 
 	consoleUser := getConsoleUser()
