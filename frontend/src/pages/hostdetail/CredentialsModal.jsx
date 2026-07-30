@@ -79,9 +79,19 @@ const CredentialsModal = ({ host, isOpen, onClose, plaintextApiKey }) => {
 	const getInstallUrl = () => {
 		const base = `${serverUrl}/api/v1/hosts/install`;
 		const params = new URLSearchParams();
-		if (host?.expected_platform === "freebsd") params.set("os", "freebsd");
-		if (host?.expected_platform === "openbsd") params.set("os", "openbsd");
-		if (host?.expected_platform === "windows" || host?.os_type === "windows")
+		const osType = (host?.os_type || "").toLowerCase();
+		if (host?.expected_platform === "freebsd" || osType.includes("freebsd"))
+			params.set("os", "freebsd");
+		if (host?.expected_platform === "openbsd" || osType.includes("openbsd"))
+			params.set("os", "openbsd");
+		if (
+			host?.expected_platform === "darwin" ||
+			host?.expected_platform === "macos" ||
+			osType.includes("darwin") ||
+			osType.includes("mac")
+		)
+			params.set("os", "darwin");
+		if (host?.expected_platform === "windows" || osType.includes("windows"))
 			params.set("os", "windows");
 		if (forceInstall && host?.expected_platform !== "windows")
 			params.set("force", "true");

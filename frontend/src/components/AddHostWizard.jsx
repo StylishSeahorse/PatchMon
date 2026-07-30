@@ -2,8 +2,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle, Copy, Download, RefreshCw, Wifi, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { DiWindows } from "react-icons/di";
+import { FaApple } from "react-icons/fa";
 import { SiFreebsd, SiLinux, SiOpenbsd } from "react-icons/si";
-import { UCSLogoIcon } from "../utils/osIcons";
 import { useNavigate } from "react-router-dom";
 import {
 	adminHostsAPI,
@@ -11,6 +11,7 @@ import {
 	hostGroupsAPI,
 	settingsAPI,
 } from "../utils/api";
+import { UCSLogoIcon } from "../utils/osIcons";
 
 const STEPS = [
 	{ key: 1, label: "Choose OS" },
@@ -38,7 +39,7 @@ const hasInitialReport = (hostData) => {
 
 const AddHostWizard = ({ isOpen, onClose, onSuccess }) => {
 	const [step, setStep] = useState(1);
-	const [platform, setPlatform] = useState("linux"); // linux | freebsd | openbsd | windows | ucs
+	const [platform, setPlatform] = useState("linux"); // linux | freebsd | openbsd | windows | ucs | darwin
 	const [formData, setFormData] = useState({
 		friendly_name: "",
 		hostGroupIds: [],
@@ -96,6 +97,7 @@ const AddHostWizard = ({ isOpen, onClose, onSuccess }) => {
 		if (platform === "openbsd") params.set("os", "openbsd");
 		if (platform === "windows") params.set("os", "windows");
 		if (platform === "ucs") params.set("os", "ucs");
+		if (platform === "darwin") params.set("os", "darwin");
 		if (force && platform !== "windows") params.set("force", "true");
 		const qs = params.toString();
 		return qs ? `${base}?${qs}` : base;
@@ -384,6 +386,18 @@ const AddHostWizard = ({ isOpen, onClose, onSuccess }) => {
 							</button>
 							<button
 								type="button"
+								onClick={() => setPlatform("darwin")}
+								className={`flex flex-col items-center justify-center p-4 rounded-lg border-2 transition-all ${
+									platform === "darwin"
+										? "border-primary-500 bg-primary-50 dark:bg-primary-900/30"
+										: "border-secondary-300 dark:border-secondary-600 hover:border-primary-400"
+								}`}
+							>
+								<FaApple className="h-12 w-12 text-secondary-700 dark:text-secondary-200 mb-2" />
+								<span className="text-sm font-medium">macOS</span>
+							</button>
+							<button
+								type="button"
 								onClick={() => setPlatform("windows")}
 								className={`flex flex-col items-center justify-center p-4 rounded-lg border-2 transition-all ${
 									platform === "windows"
@@ -404,7 +418,9 @@ const AddHostWizard = ({ isOpen, onClose, onSuccess }) => {
 								}`}
 							>
 								<UCSLogoIcon className="h-12 w-12 mb-2" />
-								<span className="text-sm font-medium text-center">Univention UCS</span>
+								<span className="text-sm font-medium text-center">
+									Univention UCS
+								</span>
 							</button>
 						</div>
 						<div className="flex justify-end pt-2">
@@ -588,7 +604,9 @@ const AddHostWizard = ({ isOpen, onClose, onSuccess }) => {
 										? "OpenBSD"
 										: platform === "ucs"
 											? "Univention UCS"
-										: "Linux"}{" "}
+											: platform === "darwin"
+												? "macOS"
+												: "Linux"}{" "}
 							host to install the agent
 							{platform === "windows"
 								? " (run PowerShell as Administrator)"

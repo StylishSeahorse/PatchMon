@@ -146,7 +146,7 @@ func (h *InstallHandler) ServeInstall(w http.ResponseWriter, r *http.Request) {
 		architecture = ""
 	}
 	osParam := r.URL.Query().Get("os")
-	if osParam != "linux" && osParam != "freebsd" && osParam != "openbsd" && osParam != "windows" && osParam != "ucs" {
+	if osParam != "linux" && osParam != "freebsd" && osParam != "openbsd" && osParam != "windows" && osParam != "ucs" && osParam != "darwin" {
 		osParam = "linux"
 	}
 	// UCS uses the Linux agent binary and install script
@@ -200,11 +200,14 @@ func (h *InstallHandler) ServeInstall(w http.ResponseWriter, r *http.Request) {
 	if forceInstall {
 		forceStr = "true"
 	}
+	osExport := ""
+	if osParam != "" {
+		osExport = fmt.Sprintf("export PATCHMON_OS=\"%s\"\n", osParam)
+	}
 
 	envBlock := fmt.Sprintf(`#!/bin/sh
 export PATCHMON_URL="%s"
-export PATCHMON_OS="%s"
-export BOOTSTRAP_TOKEN="%s"
+%sexport BOOTSTRAP_TOKEN="%s"
 export CURL_FLAGS="%s"
 export SKIP_SSL_VERIFY="%s"
 export FORCE_INSTALL="%s"
@@ -230,7 +233,7 @@ fetch_credentials() {
     fi
 }
 fetch_credentials
-`, serverURL, osParam, token, curlFlags, skipSSLVerify, forceStr, archExport)
+`, serverURL, osExport, token, curlFlags, skipSSLVerify, forceStr, archExport)
 
 	// Remove shebang from original script and prepend env block
 	script := h.scriptBase
@@ -931,6 +934,8 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 			osParam = "openbsd"
 		} else if ep == "ucs" || strings.Contains(ep, "univention") {
 			osParam = "ucs"
+		} else if ep == "darwin" || strings.Contains(ep, "mac") {
+			osParam = "darwin"
 		} else {
 			osParam = "linux"
 		}
@@ -945,6 +950,8 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 			osParam = "openbsd"
 		} else if strings.Contains(reported, "univention") {
 			osParam = "ucs"
+		} else if strings.Contains(reported, "darwin") || strings.Contains(reported, "mac") {
+			osParam = "darwin"
 		} else {
 			osParam = "linux"
 		}
@@ -953,9 +960,9 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 		osParam = "linux"
 	}
 
-	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true, "ucs": true}
+	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true, "ucs": true, "darwin": true}
 	if !validOss[osParam] {
-		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows, ucs"})
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows, ucs, darwin"})
 		return
 	}
 	// UCS uses the Linux agent binary
@@ -1131,6 +1138,8 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 			osParam = "openbsd"
 		} else if ep == "ucs" || strings.Contains(ep, "univention") {
 			osParam = "ucs"
+		} else if ep == "darwin" || strings.Contains(ep, "mac") {
+			osParam = "darwin"
 		} else {
 			osParam = "linux"
 		}
@@ -1145,6 +1154,8 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 			osParam = "openbsd"
 		} else if strings.Contains(reported, "univention") {
 			osParam = "ucs"
+		} else if strings.Contains(reported, "darwin") || strings.Contains(reported, "mac") {
+			osParam = "darwin"
 		} else {
 			osParam = "linux"
 		}
@@ -1153,9 +1164,9 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 		osParam = "linux"
 	}
 
-	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true, "ucs": true}
+	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true, "ucs": true, "darwin": true}
 	if !validOss[osParam] {
-		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows, ucs"})
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows, ucs, darwin"})
 		return
 	}
 	// UCS uses the Linux agent binary

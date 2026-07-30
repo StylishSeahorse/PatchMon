@@ -786,8 +786,7 @@ const Hosts = () => {
 			queryClient.invalidateQueries(["hosts"]);
 			setShowBulkRebootModal(false);
 			setBulkFetchReportMessage({
-				text:
-					data?.message || `Reboot queued for ${data?.queued || 0} host(s)`,
+				text: data?.message || `Reboot queued for ${data?.queued || 0} host(s)`,
 				type: "success",
 			});
 			setTimeout(
@@ -2769,10 +2768,9 @@ const Hosts = () => {
 										{selectedRebootCandidates.length !== 1 ? "s" : ""}?
 									</h3>
 									<p className="text-sm text-secondary-600 dark:text-white/80 mb-3">
-										Each agent will run <code>shutdown -r +1</code> (one
-										minute warning). The hosts will be unreachable for a few
-										minutes. Only hosts flagged as needing a reboot are
-										included.
+										Each agent will run <code>shutdown -r +1</code> (one minute
+										warning). The hosts will be unreachable for a few minutes.
+										Only hosts flagged as needing a reboot are included.
 									</p>
 									{selectedRebootSkipped > 0 && (
 										<p className="text-xs text-amber-600 dark:text-amber-400 mb-3">
@@ -2817,6 +2815,8 @@ const Hosts = () => {
 						</div>
 					</div>
 				</div>
+			)}
+
 			{/* Bulk Patch Wizard (patch_all across multiple hosts) */}
 			{showBulkPatchModal && bulkPatchablePresetHosts.length > 0 && (
 				<PatchWizard

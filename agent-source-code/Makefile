@@ -77,7 +77,7 @@ sign-all: check-signing-key
 	@[ -n "$(PATCHMON_SIGNING_PRIVATE_KEY)" ] || (echo "❌ Error: PATCHMON_SIGNING_PRIVATE_KEY (path to private key file) is not set."; exit 1)
 	@command -v minisign >/dev/null 2>&1 || (echo "❌ Error: minisign is not installed. See https://jedisct1.github.io/minisign/"; exit 1)
 	@echo "Signing agent binaries..."
-	@for f in $(GOBIN)/$(BINARY_NAME)-linux-* $(GOBIN)/$(BINARY_NAME)-freebsd-* $(GOBIN)/$(BINARY_NAME)-openbsd-* $(GOBIN)/$(BINARY_NAME)-windows-*.exe; do \
+	@for f in $(GOBIN)/$(BINARY_NAME)-linux-* $(GOBIN)/$(BINARY_NAME)-freebsd-* $(GOBIN)/$(BINARY_NAME)-openbsd-* $(GOBIN)/$(BINARY_NAME)-darwin-* $(GOBIN)/$(BINARY_NAME)-windows-*.exe; do \
 		case "$$f" in *.minisig) continue ;; esac; \
 		[ -f "$$f" ] || continue; \
 		if [ -n "$(MINISIGN_PASSWORD)" ]; then \
@@ -87,22 +87,35 @@ sign-all: check-signing-key
 		fi; \
 	done
 
-# Build all (Linux + FreeBSD + OpenBSD + Windows), sign, and copy to backend serve dirs
+# Build Darwin binaries only (amd64, arm64)
+.PHONY: build-darwin-amd64
+build-darwin-amd64:
+	@mkdir -p $(BUILD_DIR)
+	@GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO_CMD) build $(BUILD_FLAGS) $(LDFLAGS) -o $(GOBIN)/$(BINARY_NAME)-darwin-amd64 ./cmd/patchmon-agent
+
+.PHONY: build-darwin-arm64
+build-darwin-arm64:
+	@mkdir -p $(BUILD_DIR)
+	@GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO_CMD) build $(BUILD_FLAGS) $(LDFLAGS) -o $(GOBIN)/$(BINARY_NAME)-darwin-arm64 ./cmd/patchmon-agent
+
+# Build all (Linux + FreeBSD + OpenBSD + Windows + Darwin), sign, and copy to backend serve dirs
 .PHONY: build-all
-build-all: build-linux build-freebsd build-openbsd build-windows sign-all
+build-all: build-linux build-freebsd build-openbsd build-windows build-darwin-amd64 build-darwin-arm64 sign-all
 	@mkdir -p $(AGENTS_REPO) $(AGENTS_DOCKER)
-	@for f in $(GOBIN)/$(BINARY_NAME)-linux-* $(GOBIN)/$(BINARY_NAME)-freebsd-* $(GOBIN)/$(BINARY_NAME)-openbsd-* $(GOBIN)/$(BINARY_NAME)-windows-*.exe; do \
+	@for f in $(GOBIN)/$(BINARY_NAME)-linux-* $(GOBIN)/$(BINARY_NAME)-freebsd-* $(GOBIN)/$(BINARY_NAME)-openbsd-* $(GOBIN)/$(BINARY_NAME)-darwin-* $(GOBIN)/$(BINARY_NAME)-windows-*.exe; do \
 		[ -f "$$f" ] && cp "$$f" "$$f.minisig" $(AGENTS_REPO)/ && cp "$$f" "$$f.minisig" $(AGENTS_DOCKER)/; \
 	done
 	@echo "Done. agents/ and docker/compose_dev_data/agents/ updated (binaries + signatures)."
+
+
 
 # Build all agent binaries into agents-prebuilt/ (for local Docker backend build)
 .PHONY: build-all-for-docker
 build-all-for-docker:
 	@mkdir -p ../agents-prebuilt
 	@$(MAKE) build-all
-	@cp $(BUILD_DIR)/$(BINARY_NAME)-linux-* $(BUILD_DIR)/$(BINARY_NAME)-freebsd-* $(BUILD_DIR)/$(BINARY_NAME)-openbsd-* $(BUILD_DIR)/$(BINARY_NAME)-windows-*.exe ../agents-prebuilt/ 2>/dev/null || true
-	@cp $(BUILD_DIR)/$(BINARY_NAME)-linux-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-freebsd-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-openbsd-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-windows-*.minisig ../agents-prebuilt/ 2>/dev/null || true
+	@cp $(BUILD_DIR)/$(BINARY_NAME)-linux-* $(BUILD_DIR)/$(BINARY_NAME)-freebsd-* $(BUILD_DIR)/$(BINARY_NAME)-openbsd-* $(BUILD_DIR)/$(BINARY_NAME)-darwin-* $(BUILD_DIR)/$(BINARY_NAME)-windows-*.exe ../agents-prebuilt/ 2>/dev/null || true
+	@cp $(BUILD_DIR)/$(BINARY_NAME)-linux-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-freebsd-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-openbsd-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-darwin-*.minisig $(BUILD_DIR)/$(BINARY_NAME)-windows-*.minisig ../agents-prebuilt/ 2>/dev/null || true
 	@echo "Agent binaries and signatures copied to agents-prebuilt/"
 
 # Install dependencies
