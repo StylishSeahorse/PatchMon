@@ -12,7 +12,7 @@ COPY --chmod=755 agents-prebuilt/patchmon-agent-* ./agents/
 # Build frontend for embed
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install --ignore-scripts --legacy-peer-deps 2>/dev/null || true
+RUN npm install --ignore-scripts --legacy-peer-deps
 COPY frontend/ ./
 RUN npm run build
 
