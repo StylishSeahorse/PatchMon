@@ -3401,8 +3401,6 @@ Downloads the latest agent binary from the PatchMon server and performs an in-pl
 #### `version`: Print Version
 
 ```bash
-patchmon-agent version
-# or
 patchmon-agent --version
 ```
 
@@ -4201,7 +4199,7 @@ sudo journalctl -u patchmon-agent --since "30 minutes ago" --no-pager
 
 ```bash
 # Check current version
-patchmon-agent version
+patchmon-agent --version
 
 # Check if update is available
 sudo patchmon-agent check-version
@@ -6037,7 +6035,7 @@ The agent log contains `update failed`, `hash mismatch`, `binary verification fa
 **Diagnose:**
 
 ```bash
-sudo patchmon-agent version
+sudo patchmon-agent --version
 sudo patchmon-agent check-version
 ls -la /etc/patchmon/.last_update_timestamp
 ls -la /usr/local/bin/patchmon-agent.backup.*
