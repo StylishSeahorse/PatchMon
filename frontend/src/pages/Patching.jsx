@@ -1772,8 +1772,8 @@ function PoliciesTab() {
 								</label>
 								<p className="text-xs text-secondary-500 dark:text-secondary-400">
 									Automatically run "Patch all" on every host assigned to this
-									policy (directly or via groups, respecting exclusions) on
-									the selected days — no manual trigger needed.
+									policy (directly or via groups, respecting exclusions) on the
+									selected days — no manual trigger needed.
 								</p>
 								{form.auto_patch_enabled && (
 									<>
@@ -1838,10 +1838,9 @@ function PoliciesTab() {
 											</span>
 										</label>
 										<p className="text-xs text-amber-600 dark:text-amber-400">
-											Hosts reboot ~1 minute after a successful automated
-											patch run, only when a pending reboot is detected
-											(kernel/libc updates). Manual patch runs never trigger
-											this.
+											Hosts reboot ~1 minute after a successful automated patch
+											run, only when a pending reboot is detected (kernel/libc
+											updates). Manual patch runs never trigger this.
 										</p>
 									</>
 								)}

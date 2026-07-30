@@ -221,17 +221,13 @@ const PatchManagement = () => {
 													.filter(Boolean)
 													.map(
 														(d) =>
-															[
-																"Sun",
-																"Mon",
-																"Tue",
-																"Wed",
-																"Thu",
-																"Fri",
-																"Sat",
-															][Number(d.trim())] ?? d,
+															["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][
+																Number(d.trim())
+															] ?? d,
 													)
-													.join(", ")} at ${policy.auto_patch_time} (${orgTimezone})`}
+													.join(
+														", ",
+													)} at ${policy.auto_patch_time} (${orgTimezone})`}
 										</p>
 									</div>
 									<div className="flex items-center gap-2 flex-shrink-0">

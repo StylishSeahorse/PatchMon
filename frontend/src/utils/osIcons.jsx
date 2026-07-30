@@ -190,7 +190,8 @@ export const getOSDisplayName = (osType) => {
 	if (os.includes("elementary")) return "Elementary OS";
 
 	// Univention Corporate Server
-	if (os.includes("univention") || os === "ucs") return "Univention Corporate Server";
+	if (os.includes("univention") || os === "ucs")
+		return "Univention Corporate Server";
 
 	// Debian
 	if (os.includes("debian")) return "Debian";

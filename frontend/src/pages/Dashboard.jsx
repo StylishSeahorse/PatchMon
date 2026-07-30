@@ -353,15 +353,15 @@ const Dashboard = () => {
 		}
 	};
 
-   	const handleSecurityUpdateChartClick = (_, elements) => {
-    	if (elements.length > 0 && stats?.charts?.securityUpdateDistribution) {
-            const elementIndex = elements[0].index;
-            const statusItem = stats.charts.securityUpdateDistribution[elementIndex];
-            if (!statusItem?.name) return;
+	const handleSecurityUpdateChartClick = (_, elements) => {
+		if (elements.length > 0 && stats?.charts?.securityUpdateDistribution) {
+			const elementIndex = elements[0].index;
+			const statusItem = stats.charts.securityUpdateDistribution[elementIndex];
+			if (!statusItem?.name) return;
 
 			const statusName = statusItem.name.toLowerCase();
 			if (statusName.includes("up to date")) {
-			    navigate("/hosts?filter=upToDate", { replace: true });
+				navigate("/hosts?filter=upToDate", { replace: true });
 			} else if (statusName.includes("security")) {
 				navigate("/hosts?filter=securityUpdates", { replace: true });
 			} else {
@@ -1378,32 +1378,32 @@ const Dashboard = () => {
 					</button>
 				);
 
-                       case "hostSecurityUpdateStatus":
-                               return (
-                                       <button
-                                               type="button"
-                                               className="card p-4 sm:p-6 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 w-full text-left h-full flex flex-col"
-                                               onClick={handleSecurityUpdateChartClick}
-                                               onKeyDown={(e) => {
-												   if (e.key === "Enter" || e.key === " ") {
-													   e.preventDefault();
-													   handleSecurityUpdateChartClick();
-												   }
-											   }}
-                                       >
-                                               <h3 className="text-lg font-medium text-secondary-900 dark:text-white mb-4 flex-shrink-0">
-                                                       Host Security Update Status
-                                               </h3>
-                                               <div className="h-56 w-full flex items-center justify-center flex-1 min-h-0">
-                                                       <div className="w-full h-full max-w-sm">
-                                                               <Pie
-                                                                       data={securityUpdateChartData}
-                                                                       options={securityUpdateChartOptions}
-                                                               />
-                                                       </div>
-                                               </div>
-                                       </button>
-                               );
+			case "hostSecurityUpdateStatus":
+				return (
+					<button
+						type="button"
+						className="card p-4 sm:p-6 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 w-full text-left h-full flex flex-col"
+						onClick={handleSecurityUpdateChartClick}
+						onKeyDown={(e) => {
+							if (e.key === "Enter" || e.key === " ") {
+								e.preventDefault();
+								handleSecurityUpdateChartClick();
+							}
+						}}
+					>
+						<h3 className="text-lg font-medium text-secondary-900 dark:text-white mb-4 flex-shrink-0">
+							Host Security Update Status
+						</h3>
+						<div className="h-56 w-full flex items-center justify-center flex-1 min-h-0">
+							<div className="w-full h-full max-w-sm">
+								<Pie
+									data={securityUpdateChartData}
+									options={securityUpdateChartOptions}
+								/>
+							</div>
+						</div>
+					</button>
+				);
 
 			case "packagePriority":
 				return (
@@ -2013,33 +2013,33 @@ const Dashboard = () => {
 		onClick: handleUpdateStatusChartClick,
 	};
 
-       const securityUpdateChartOptions = {
-               responsive: true,
-               maintainAspectRatio: false,
-               elements: {
-                       arc: { borderRadius: 5 },
-               },
-               plugins: {
-                       legend: {
-                               position: "right",
-                               labels: {
-                                       color: isDark ? "#ffffff" : "#374151",
-                                       font: {
-                                               size: 12,
-                                       },
-                                       padding: 15,
-                                       usePointStyle: true,
-                                       pointStyle: "circle",
-                               },
-                       },
-               },
-               layout: {
-                       padding: {
-                               right: 20,
-                       },
-               },
-               onClick: handleSecurityUpdateChartClick,
-       };
+	const securityUpdateChartOptions = {
+		responsive: true,
+		maintainAspectRatio: false,
+		elements: {
+			arc: { borderRadius: 5 },
+		},
+		plugins: {
+			legend: {
+				position: "right",
+				labels: {
+					color: isDark ? "#ffffff" : "#374151",
+					font: {
+						size: 12,
+					},
+					padding: 15,
+					usePointStyle: true,
+					pointStyle: "circle",
+				},
+			},
+		},
+		layout: {
+			padding: {
+				right: 20,
+			},
+		},
+		onClick: handleSecurityUpdateChartClick,
+	};
 
 	const packagePriorityChartOptions = {
 		responsive: true,
@@ -2381,20 +2381,24 @@ const Dashboard = () => {
 		],
 	};
 
-       const securityUpdateChartData = {
-               labels: (stats.charts.securityUpdateDistribution || []).map((item) => item.name),
-               datasets: [
-                       {
-                               data: (stats.charts.securityUpdateDistribution || []).map((item) => item.count),
-                               backgroundColor: [
-                                       "#EF4444", // Red - Security updates to pass
-                                       "#F59E0B", // Orange/yellow - Updates to pass
-                                       "#10B981", // Green - Up to date
-                               ],
-                               borderWidth: 0,
-                       },
-               ],
-       };
+	const securityUpdateChartData = {
+		labels: (stats.charts.securityUpdateDistribution || []).map(
+			(item) => item.name,
+		),
+		datasets: [
+			{
+				data: (stats.charts.securityUpdateDistribution || []).map(
+					(item) => item.count,
+				),
+				backgroundColor: [
+					"#EF4444", // Red - Security updates to pass
+					"#F59E0B", // Orange/yellow - Updates to pass
+					"#10B981", // Green - Up to date
+				],
+				borderWidth: 0,
+			},
+		],
+	};
 
 	const packagePriorityChartData = {
 		labels: stats.charts.packageUpdateDistribution.map((item) => item.name),
