@@ -146,7 +146,11 @@ func (h *InstallHandler) ServeInstall(w http.ResponseWriter, r *http.Request) {
 		architecture = ""
 	}
 	osParam := r.URL.Query().Get("os")
-	if osParam != "linux" && osParam != "freebsd" && osParam != "openbsd" && osParam != "windows" {
+	if osParam != "linux" && osParam != "freebsd" && osParam != "openbsd" && osParam != "windows" && osParam != "ucs" {
+		osParam = "linux"
+	}
+	// UCS uses the Linux agent binary and install script
+	if osParam == "ucs" {
 		osParam = "linux"
 	}
 
@@ -925,6 +929,8 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 			osParam = "freebsd"
 		} else if ep == "openbsd" || strings.Contains(ep, "openbsd") {
 			osParam = "openbsd"
+		} else if ep == "ucs" || strings.Contains(ep, "univention") {
+			osParam = "ucs"
 		} else {
 			osParam = "linux"
 		}
@@ -937,6 +943,8 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 			osParam = "freebsd"
 		} else if strings.Contains(reported, "openbsd") {
 			osParam = "openbsd"
+		} else if strings.Contains(reported, "univention") {
+			osParam = "ucs"
 		} else {
 			osParam = "linux"
 		}
@@ -945,10 +953,14 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 		osParam = "linux"
 	}
 
-	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true}
+	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true, "ucs": true}
 	if !validOss[osParam] {
-		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows"})
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows, ucs"})
 		return
+	}
+	// UCS uses the Linux agent binary
+	if osParam == "ucs" {
+		osParam = "linux"
 	}
 
 	validArchLinux := map[string]bool{"amd64": true, "386": true, "arm64": true, "arm": true}
@@ -1117,6 +1129,8 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 			osParam = "freebsd"
 		} else if ep == "openbsd" || strings.Contains(ep, "openbsd") {
 			osParam = "openbsd"
+		} else if ep == "ucs" || strings.Contains(ep, "univention") {
+			osParam = "ucs"
 		} else {
 			osParam = "linux"
 		}
@@ -1129,6 +1143,8 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 			osParam = "freebsd"
 		} else if strings.Contains(reported, "openbsd") {
 			osParam = "openbsd"
+		} else if strings.Contains(reported, "univention") {
+			osParam = "ucs"
 		} else {
 			osParam = "linux"
 		}
@@ -1137,10 +1153,14 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 		osParam = "linux"
 	}
 
-	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true}
+	validOss := map[string]bool{"linux": true, "freebsd": true, "openbsd": true, "windows": true, "ucs": true}
 	if !validOss[osParam] {
-		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows"})
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid os. Must be one of: linux, freebsd, openbsd, windows, ucs"})
 		return
+	}
+	// UCS uses the Linux agent binary
+	if osParam == "ucs" {
+		osParam = "linux"
 	}
 
 	validArchLinux := map[string]bool{"amd64": true, "386": true, "arm64": true, "arm": true}
