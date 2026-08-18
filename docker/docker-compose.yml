@@ -59,7 +59,11 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Postgres 18+ images refuse to start with the volume at
+      # /var/lib/postgresql/data: they store data in a major-version
+      # subdirectory so pg_upgrade --link can work across a single mount.
+      # Mounting the parent is the layout those images expect.
+      - postgres_data:/var/lib/postgresql
     networks:
       - patchmon-internal
     healthcheck:
