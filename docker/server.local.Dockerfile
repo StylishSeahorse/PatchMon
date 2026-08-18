@@ -104,8 +104,14 @@ WORKDIR /app/server
 
 ARG TARGETOS
 ARG TARGETARCH
+# Without this the binary reports 0.0.0, so the UI shows a permanent "update
+# available" and the agent update path compares against a version that can
+# never match. Pass --build-arg VERSION=2.1.3 to match the release under test.
+ARG VERSION=0.0.0-dev
 RUN go mod download && \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -buildvcs=false -ldflags="-s -w" -o /app/patchmon-server ./cmd/server
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -buildvcs=false \
+      -ldflags="-s -w -X 'github.com/PatchMon/PatchMon/server-source-code/internal/config.DefaultVersion=${VERSION}'" \
+      -o /app/patchmon-server ./cmd/server
 
 # SSG content stage — download ComplianceAsCode datastream files at build time.
 # Pass --build-arg SSG_VERSION=0.1.80 to pin a specific version; otherwise
