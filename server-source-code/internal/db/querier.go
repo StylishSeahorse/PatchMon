@@ -66,17 +66,28 @@ type Querier interface {
 	//
 	// The DO UPDATE WHERE clause skips no-op updates: when the agent reports the
 	// same description/category/latest_version that's already stored, no row
-	// update happens, no dead tuple is created, and no FOR NO KEY UPDATE row
-	// lock is taken. Steady-state production workloads with mostly-stable package
-	// catalogues see ~95% of upsert calls become no-ops, drastically reducing
-	// WAL volume, vacuum pressure, AND the lock-conflict surface that produced
-	// the deadlocks.
+	// update happens and no dead tuple is created. Steady-state production
+	// workloads with mostly-stable package catalogues see ~95% of upsert calls
+	// become no-ops, drastically reducing WAL volume and vacuum pressure.
+	//
+	// It does NOT avoid the row lock: the ON CONFLICT arbiter takes its
+	// FOR NO KEY UPDATE lock on the conflicting tuple BEFORE evaluating this
+	// WHERE, and holds it to end of transaction whether or not the update
+	// fires. Deadlock freedom comes from the sorted lock acquisition above, not
+	// from this clause.
 	//
 	// The UNION ALL fallback returns (id, name) for input rows that did NOT fire
-	// DO UPDATE (i.e. the values are unchanged), so the caller's name → id map
-	// is complete regardless of whether each row was newly inserted, updated, or
-	// left unchanged. This is required: BulkInsertHostPackages depends on
-	// knowing the package_id for every input package.
+	// DO UPDATE (i.e. the values are unchanged), covering the single-threaded
+	// case where every input name resolves to an id.
+	//
+	// It is NOT complete under concurrency. The ON CONFLICT arbiter re-reads the
+	// conflicting row outside the statement snapshot, so it can see a row another
+	// transaction committed after this statement began; if that row's values are
+	// identical the skip-no-op WHERE suppresses RETURNING, while the fallback
+	// SELECT still reads `packages` at the (older) statement snapshot and cannot
+	// see the row either. That name is then absent from the result. The caller
+	// MUST detect missing names and resolve them with GetPackageIDsByNames, which
+	// runs as a separate statement and therefore takes a fresh snapshot.
 	//
 	// The DO UPDATE intentionally touches only NON-KEY columns
 	// (description / category / latest_version / updated_at). The row lock taken
@@ -175,6 +186,7 @@ type Querier interface {
 	CreateSession(ctx context.Context, arg CreateSessionParams) error
 	CreateTrustedDevice(ctx context.Context, arg CreateTrustedDeviceParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) error
+	CreateUserApiToken(ctx context.Context, arg CreateUserApiTokenParams) (CreateUserApiTokenRow, error)
 	DeleteAlert(ctx context.Context, id string) error
 	DeleteAlertsByIDs(ctx context.Context, dollar_1 []string) error
 	DeleteAutoEnrollmentToken(ctx context.Context, id string) error
@@ -226,6 +238,7 @@ type Querier interface {
 	DeleteSSHHostAccount(ctx context.Context, arg DeleteSSHHostAccountParams) error
 	DeleteScheduledReport(ctx context.Context, id string) error
 	DeleteUser(ctx context.Context, id string) error
+	DeleteUserApiToken(ctx context.Context, id string) error
 	DeleteVolume(ctx context.Context, id string) error
 	DisableTfa(ctx context.Context, id string) error
 	ExistsByUsernameOrEmail(ctx context.Context, arg ExistsByUsernameOrEmailParams) (bool, error)
@@ -273,6 +286,22 @@ type Querier interface {
 	GetDockerHostsMinimalByIDs(ctx context.Context, dollar_1 []string) ([]GetDockerHostsMinimalByIDsRow, error)
 	GetFirstComplianceProfileByType(ctx context.Context, type_ string) (ComplianceProfile, error)
 	GetFirstSettings(ctx context.Context) (Setting, error)
+	// The host counters here must match GetDashboardStats, otherwise a widget and
+	// the dashboard card it mirrors report different numbers for the same fleet.
+	// They previously filtered on status = 'active', which silently dropped hosts
+	// that had been created but not yet enrolled. That filter also did not mean
+	// what it appeared to: hosts.status is an enrolment lifecycle column and never
+	// becomes 'inactive', so a host that stopped reporting was counted regardless.
+	// Distinct counts are expressed as GROUP BY subqueries, not COUNT(DISTINCT),
+	// and must stay that way. COUNT(DISTINCT) cannot stream: it sorts the whole
+	// matching set, which at 3.7M host_packages rows spills multiple megabytes to
+	// disk and costs ~3x what the identical aggregates cost in GetDashboardStats,
+	// which already uses this shape. GROUP BY reads straight off the partial
+	// covering indexes (idx_host_packages_needs_update_host_cover and the
+	// _package / _security_package pair) and sorts nothing worth spilling.
+	//
+	// Exact, not approximate: the two forms differ only on NULL handling, and
+	// host_id and package_id are both NOT NULL.
 	GetHomepageStats(ctx context.Context, since pgtype.Timestamp) (GetHomepageStatsRow, error)
 	GetHostByApiID(ctx context.Context, apiID string) (Host, error)
 	GetHostByID(ctx context.Context, id string) (Host, error)
@@ -344,7 +373,6 @@ type Querier interface {
 	GetImageUpdatesByImageID(ctx context.Context, imageID string) ([]DockerImageUpdate, error)
 	GetImagesByIDs(ctx context.Context, dollar_1 []string) ([]DockerImage, error)
 	GetImagesBySource(ctx context.Context) ([]GetImagesBySourceRow, error)
-	GetLatestAlertHistoryForAlerts(ctx context.Context, dollar_1 []string) ([]GetLatestAlertHistoryForAlertsRow, error)
 	GetLatestCompletedScans(ctx context.Context) ([]GetLatestCompletedScansRow, error)
 	GetLatestCompletedScansByProfile(ctx context.Context, profileID string) ([]GetLatestCompletedScansByProfileRow, error)
 	GetLatestComplianceScanByHost(ctx context.Context, hostID string) (GetLatestComplianceScanByHostRow, error)
@@ -360,6 +388,17 @@ type Querier interface {
 	GetOSDistributionByTypeAndVersion(ctx context.Context) ([]GetOSDistributionByTypeAndVersionRow, error)
 	GetPackageByID(ctx context.Context, id string) (Package, error)
 	GetPackageByName(ctx context.Context, name string) (Package, error)
+	// Off-fast-path resolver for names BulkUpsertPackages could not return (see
+	// the concurrency note there). Issued as its own statement so it reads at a
+	// fresh snapshot and observes rows committed by concurrent reports. Takes no
+	// row locks. The caller only runs this when a name is actually missing.
+	//
+	// REQUIRES READ COMMITTED. Only under READ COMMITTED does a new statement take
+	// a new snapshot; at REPEATABLE READ or SERIALIZABLE this reuses the
+	// transaction snapshot, resolves nothing, and the race it exists to close
+	// silently returns. The pool sets no TxOptions, so the server default applies
+	// — do not raise it without revisiting this.
+	GetPackageIDsByNames(ctx context.Context, names []string) ([]GetPackageIDsByNamesRow, error)
 	GetPatchPolicyAssignmentByID(ctx context.Context, id string) (PatchPolicyAssignment, error)
 	GetPatchPolicyByGroupAssignment(ctx context.Context, targetID string) (PatchPolicy, error)
 	GetPatchPolicyByID(ctx context.Context, id string) (PatchPolicy, error)
@@ -375,6 +414,20 @@ type Querier interface {
 	GetRecentUsers(ctx context.Context, limit int32) ([]GetRecentUsersRow, error)
 	GetRepoCountsForRepos(ctx context.Context, dollar_1 []string) ([]GetRepoCountsForReposRow, error)
 	GetRepositoryByID(ctx context.Context, id string) (Repository, error)
+	// Lock-free read on the (url, distribution, components) unique key. Serves
+	// two purposes for the report path, both described on UpsertRepository:
+	//   1. The pre-check that lets an unchanged report skip the upsert entirely,
+	//      so it never takes the hot-row lock. Hence the projection is exactly
+	//      the columns UpsertRepository's DO UPDATE would set.
+	//   2. Resolving the id when that upsert skipped its no-op DO UPDATE and
+	//      returned nothing. As a separate statement it reads at a fresh
+	//      snapshot and sees rows committed by concurrent reports.
+	//
+	// Use (2) REQUIRES READ COMMITTED: only there does a new statement take a new
+	// snapshot. At REPEATABLE READ or SERIALIZABLE it would reuse the transaction
+	// snapshot and resolve nothing. The pool sets no TxOptions, so the server
+	// default applies — do not raise it without revisiting this.
+	GetRepositoryByURLDistComponents(ctx context.Context, arg GetRepositoryByURLDistComponentsParams) (GetRepositoryByURLDistComponentsRow, error)
 	GetRepositoryForDelete(ctx context.Context, id string) (GetRepositoryForDeleteRow, error)
 	GetRolePermissions(ctx context.Context, role string) (RolePermission, error)
 	GetRuleAggregationsFromScans(ctx context.Context, arg GetRuleAggregationsFromScansParams) ([]GetRuleAggregationsFromScansRow, error)
@@ -392,11 +445,16 @@ type Querier interface {
 	GetUpdateHistory(ctx context.Context, arg GetUpdateHistoryParams) ([]GetUpdateHistoryRow, error)
 	GetUpdateHistoryDaily(ctx context.Context, arg GetUpdateHistoryDailyParams) ([]GetUpdateHistoryDailyRow, error)
 	GetUpdateTrends(ctx context.Context, timestamp pgtype.Timestamp) ([]GetUpdateTrendsRow, error)
+	GetUserApiTokenByHash(ctx context.Context, tokenHash string) (GetUserApiTokenByHashRow, error)
 	GetUserByDiscordID(ctx context.Context, discordID *string) (User, error)
 	GetUserByDiscordIDOrEmail(ctx context.Context, arg GetUserByDiscordIDOrEmailParams) (User, error)
 	GetUserByEmail(ctx context.Context, lower string) (User, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByOidcSub(ctx context.Context, oidcSub *string) (User, error)
+	// The "$2 != ''" guard mirrors GetUserByDiscordIDOrEmail. Without it an IdP
+	// asserting an empty email participates in the email branch, which is junk
+	// input rather than a takeover (the oidc_sub cross-check blocks a second such
+	// login) but should not reach account matching at all.
 	GetUserByOidcSubOrEmail(ctx context.Context, arg GetUserByOidcSubOrEmailParams) (User, error)
 	GetUserByUsername(ctx context.Context, lower string) (User, error)
 	GetUserByUsernameOrEmail(ctx context.Context, lower string) (User, error)
@@ -408,6 +466,8 @@ type Querier interface {
 	IncrementAutoEnrollmentHostsCreated(ctx context.Context, id string) error
 	InsertAlertHistory(ctx context.Context, arg InsertAlertHistoryParams) (AlertHistory, error)
 	InsertDashboardPreference(ctx context.Context, arg InsertDashboardPreferenceParams) error
+	// ON CONFLICT: callers may pass the same group id twice, and the delete has
+	// already run by then.
 	InsertHostGroupMembership(ctx context.Context, arg InsertHostGroupMembershipParams) error
 	InsertHostRepository(ctx context.Context, arg InsertHostRepositoryParams) error
 	InsertJobHistory(ctx context.Context, arg InsertJobHistoryParams) error
@@ -430,8 +490,6 @@ type Querier interface {
 	ListAlertActions(ctx context.Context) ([]AlertAction, error)
 	ListAlertConfig(ctx context.Context) ([]ListAlertConfigRow, error)
 	ListAlertHistoryByAlertID(ctx context.Context, alertID string) ([]ListAlertHistoryByAlertIDRow, error)
-	ListAlerts(ctx context.Context) ([]ListAlertsRow, error)
-	ListAlertsAssignedTo(ctx context.Context, assignedToUserID *string) ([]ListAlertsAssignedToRow, error)
 	ListAutoEnrollmentTokens(ctx context.Context) ([]ListAutoEnrollmentTokensRow, error)
 	ListAutoPatchPolicies(ctx context.Context) ([]PatchPolicy, error)
 	ListComplianceProfiles(ctx context.Context) ([]ComplianceProfile, error)
@@ -443,7 +501,6 @@ type Querier interface {
 	ListDashboardPreferencesByUserID(ctx context.Context, userID string) ([]DashboardPreference, error)
 	ListDockerHostsPaginated(ctx context.Context, arg ListDockerHostsPaginatedParams) ([]ListDockerHostsPaginatedRow, error)
 	ListExistingHostApiIDs(ctx context.Context, dollar_1 []string) ([]string, error)
-	ListHostApiIDs(ctx context.Context) ([]string, error)
 	ListExpiredSSHRecordings(ctx context.Context, arg ListExpiredSSHRecordingsParams) ([]SshSession, error)
 	ListHostGroups(ctx context.Context) ([]HostGroup, error)
 	ListHostGroupsWithHostCount(ctx context.Context) ([]ListHostGroupsWithHostCountRow, error)
@@ -498,6 +555,7 @@ type Querier interface {
 	ListSystemStatisticsByDateRange(ctx context.Context, arg ListSystemStatisticsByDateRangeParams) ([]SystemStatistic, error)
 	ListTrustedDevicesForUser(ctx context.Context, userID string) ([]UserTrustedDevice, error)
 	ListUpdateHistoryByDateRange(ctx context.Context, arg ListUpdateHistoryByDateRangeParams) ([]ListUpdateHistoryByDateRangeRow, error)
+	ListUserApiTokens(ctx context.Context, userID string) ([]ListUserApiTokensRow, error)
 	ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error)
 	ListVolumes(ctx context.Context, arg ListVolumesParams) ([]DockerVolume, error)
 	// User-initiated cancel from StopRun. Deliberately does NOT touch shell_output
@@ -514,7 +572,11 @@ type Querier interface {
 	// outcome the agent later reports.
 	MarkPatchRunsTimedOut(ctx context.Context, arg MarkPatchRunsTimedOutParams) (int64, error)
 	MarkSSHRecordingDeleted(ctx context.Context, id string) error
-	MarkValidationApproved(ctx context.Context, arg MarkValidationApprovedParams) error
+	// Declared :execrows, not :exec, because the status guard IS the concurrency
+	// control. Two approvals racing both pass the handler's Go-side status check;
+	// only one of them updates a row here, and the loser must be told so rather
+	// than going on to create a second patch run and enqueue a second task.
+	MarkValidationApproved(ctx context.Context, arg MarkValidationApprovedParams) (int64, error)
 	RevokeAllSessionsForUser(ctx context.Context, userID string) error
 	RevokeAllSessionsForUserExcept(ctx context.Context, arg RevokeAllSessionsForUserExceptParams) error
 	RevokeAllTrustedDevicesForUser(ctx context.Context, userID string) error
@@ -550,8 +612,8 @@ type Querier interface {
 	// Host report/update flow (agent sends package and system info)
 	UpdateHostFromReport(ctx context.Context, arg UpdateHostFromReportParams) error
 	UpdateHostGroup(ctx context.Context, arg UpdateHostGroupParams) error
-	// Ping-side write of volatile metrics. Each column is COALESCE-guarded so a
-	// ping that omits a metric leaves the previous value intact.
+	// Ping-side write of volatile metrics. Every column is guarded so a ping that
+	// omits a metric leaves the stored value intact.
 	UpdateHostMetrics(ctx context.Context, arg UpdateHostMetricsParams) error
 	UpdateHostNotes(ctx context.Context, arg UpdateHostNotesParams) error
 	// Records the outcome of a Windows Update installation for a specific host+GUID combination.
@@ -562,6 +624,7 @@ type Querier interface {
 	UpdateJobHistoryCompleted(ctx context.Context, jobID string) error
 	UpdateJobHistoryDelayed(ctx context.Context, jobID string) error
 	UpdateJobHistoryFailed(ctx context.Context, arg UpdateJobHistoryFailedParams) error
+	UpdateLastLogin(ctx context.Context, arg UpdateLastLoginParams) error
 	UpdateNotificationDestination(ctx context.Context, arg UpdateNotificationDestinationParams) (NotificationDestination, error)
 	UpdateNotificationRoute(ctx context.Context, arg UpdateNotificationRouteParams) (NotificationRoute, error)
 	UpdatePassword(ctx context.Context, arg UpdatePasswordParams) error
@@ -620,6 +683,7 @@ type Querier interface {
 	UpdateTfaEnabled(ctx context.Context, arg UpdateTfaEnabledParams) error
 	UpdateTfaSecret(ctx context.Context, arg UpdateTfaSecretParams) error
 	UpdateUser(ctx context.Context, arg UpdateUserParams) error
+	UpdateUserApiTokenLastUsed(ctx context.Context, id string) error
 	UpdateUserDiscordLink(ctx context.Context, arg UpdateUserDiscordLinkParams) error
 	UpdateUserDiscordProfile(ctx context.Context, arg UpdateUserDiscordProfileParams) error
 	UpdateUserDiscordUnlink(ctx context.Context, id string) error
@@ -627,6 +691,16 @@ type Querier interface {
 	UpdateUserOidcProfile(ctx context.Context, arg UpdateUserOidcProfileParams) error
 	UpdateUserPreferences(ctx context.Context, arg UpdateUserPreferencesParams) error
 	UpsertAlertConfig(ctx context.Context, arg UpsertAlertConfigParams) (AlertConfig, error)
+	// DO UPDATE rather than DO NOTHING so the row is always returned on conflict.
+	// Deliberately does not touch type: an existing profile keeps the type it was
+	// created with. Overwriting it flips which scanner toggle gates it in SubmitScan.
+	UpsertComplianceProfile(ctx context.Context, arg UpsertComplianceProfileParams) (ComplianceProfile, error)
+	// Metadata columns are COALESCE-guarded so a submission omitting a field does
+	// not blank a stored value.
+	//
+	// title reads the raw parameter, not EXCLUDED: the column is NOT NULL so the
+	// INSERT arm supplies a rule_ref fallback, which EXCLUDED would already hold.
+	UpsertComplianceRule(ctx context.Context, arg UpsertComplianceRuleParams) (string, error)
 	UpsertDashboardLayout(ctx context.Context, arg UpsertDashboardLayoutParams) error
 	UpsertDockerContainer(ctx context.Context, arg UpsertDockerContainerParams) error
 	UpsertDockerImage(ctx context.Context, arg UpsertDockerImageParams) (string, error)
@@ -644,21 +718,35 @@ type Querier interface {
 	// KEY UPDATE — safe vs concurrent FK FOR KEY SHARE locks held by
 	// host_packages inserts pointing at this row.
 	//
-	// Returns the canonical id whether the row was newly inserted, updated, or
-	// (in the no-op case where every column matches) updated to identical
-	// values. There is no skip-no-op WHERE here because reports rarely repeat
-	// identical repository metadata across runs and the row count per host is
-	// small (typically 1-10) — the WAL/lock cost of unconditional UPDATE is
-	// negligible compared with packages, and avoiding the WHERE keeps RETURNING
-	// always-populated for a simpler caller contract.
+	// Repository rows are shared across the whole fleet: every host on a distro
+	// reports the same (url, distribution, components). Running this statement on
+	// every report takes a FOR NO KEY UPDATE lock on ONE hot row and holds it
+	// until the report transaction commits — which is after that transaction's
+	// full host_packages delete and bulk insert. Contention scales with fleet
+	// concurrency, not with the handful of repository rows per host, so at 64
+	// concurrent reports they serialise behind the hot row until statement_timeout.
+	//
+	// The skip-no-op WHERE below does NOT prevent that lock. PostgreSQL's
+	// ON CONFLICT arbiter locks the conflicting tuple BEFORE it evaluates the
+	// DO UPDATE WHERE, so a skipped no-op still holds the row lock to end of
+	// transaction (verified: holder reports INSERT 0 0 while a concurrent
+	// FOR NO KEY UPDATE on the same row blocks). The WHERE earns its keep by
+	// avoiding the heap write, dead tuple and WAL when two reports race on the
+	// same genuine change — not by avoiding locks.
+	//
+	// Avoiding the lock is therefore the CALLER's job: upsertRepositoryResolvingID
+	// reads the row first (a plain SELECT takes no lock) and only reaches this
+	// statement when the row is absent or a column it would set actually differs.
+	// Do not "simplify" the caller back to calling this unconditionally.
+	//
+	// Consequence of the WHERE: RETURNING is NOT always populated. A skipped
+	// no-op returns zero rows and this is a :one query, so the caller gets
+	// pgx.ErrNoRows and MUST resolve the id via GetRepositoryByURLDistComponents.
+	// Do NOT "fix" this with a same-statement fallback SELECT — both halves would
+	// read at the same statement snapshot and miss rows a concurrent transaction
+	// committed after the statement began.
 	UpsertRepository(ctx context.Context, arg UpsertRepositoryParams) (string, error)
 	UpsertRolePermissions(ctx context.Context, arg UpsertRolePermissionsParams) (RolePermission, error)
-	// User API tokens (long-lived bearer tokens for automation)
-	ListUserApiTokens(ctx context.Context, userID string) ([]ListUserApiTokensRow, error)
-	GetUserApiTokenByHash(ctx context.Context, tokenHash string) (GetUserApiTokenByHashRow, error)
-	CreateUserApiToken(ctx context.Context, arg CreateUserApiTokenParams) (ListUserApiTokensRow, error)
-	DeleteUserApiToken(ctx context.Context, id string) error
-	UpdateUserApiTokenLastUsed(ctx context.Context, id string) error
 	UpsertSSHHostAccount(ctx context.Context, arg UpsertSSHHostAccountParams) (SshHostAccount, error)
 }
 

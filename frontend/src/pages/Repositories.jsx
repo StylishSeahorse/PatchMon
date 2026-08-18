@@ -27,11 +27,26 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { usePageRefresh } from "../hooks/usePageRefresh";
 import { dashboardAPI, repositoryAPI } from "../utils/api";
+
+// The summary cards read from their own query, so refreshing the table alone
+// left the counts above it unchanged.
+const REPOSITORIES_REFRESH_KEYS = [["repositories"], ["repository-stats"]];
 
 const REPOSITORIES_PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
 const REPOSITORIES_DEFAULT_PAGE_SIZE = 50;
 const REPOSITORIES_PAGE_SIZE_STORAGE_KEY = "repositories-page-size";
+
+// Mirrors the backend sort whitelist in store/repositories.go (repoListSortKey).
+const SORTABLE_COLUMN_IDS = new Set([
+	"name",
+	"url",
+	"distribution",
+	"security",
+	"status",
+	"hostCount",
+]);
 
 const Repositories = () => {
 	const queryClient = useQueryClient();
@@ -135,13 +150,15 @@ const Repositories = () => {
 		data: repositoriesResponse,
 		isLoading,
 		error,
-		refetch,
-		isFetching,
 	} = useQuery({
 		queryKey: ["repositories", repoQueryParams],
 		queryFn: () => repositoryAPI.list(repoQueryParams).then((res) => res.data),
 		placeholderData: keepPreviousData,
 	});
+
+	const { refresh: refreshRepositories, isRefreshing } = usePageRefresh(
+		REPOSITORIES_REFRESH_KEYS,
+	);
 	const repositories = repositoriesResponse?.items || [];
 	const totalRepositories = repositoriesResponse?.total || 0;
 	const totalPages = Math.max(1, Math.ceil(totalRepositories / pageSize));
@@ -322,38 +339,64 @@ const Repositories = () => {
 	}
 
 	return (
-		<div className="min-h-screen flex flex-col">
+		<div className="min-h-[calc(100vh-var(--app-main-inset))] flex flex-col">
 			{/* Delete Confirmation Modal */}
 			{deleteModalData && (
-				<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-					<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 max-w-md w-full mx-4">
-						<div className="flex items-center mb-4">
-							<AlertTriangle className="h-6 w-6 text-red-500 mr-3" />
-							<h3 className="text-lg font-semibold text-secondary-900 dark:text-white">
-								Delete Repository
-							</h3>
+				<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+					<button
+						type="button"
+						onClick={cancelDelete}
+						className="fixed inset-0 cursor-default"
+						aria-label="Close modal"
+						disabled={deleteRepositoryMutation.isPending}
+					/>
+					<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-md w-full mx-4 relative z-10">
+						<div className="px-6 py-4 border-b border-secondary-200 dark:border-secondary-600">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-3 min-w-0">
+									<div className="w-10 h-10 bg-danger-100 dark:bg-danger-900 rounded-full flex items-center justify-center flex-shrink-0">
+										<AlertTriangle className="h-5 w-5 text-danger-600 dark:text-danger-400" />
+									</div>
+									<div className="min-w-0">
+										<h3 className="text-lg font-medium text-secondary-900 dark:text-white">
+											Delete Repository
+										</h3>
+										<p className="text-sm text-secondary-600 dark:text-white">
+											This action cannot be undone
+										</p>
+									</div>
+								</div>
+								<button
+									type="button"
+									onClick={cancelDelete}
+									className="p-1 rounded hover:bg-secondary-100 dark:hover:bg-secondary-700 text-secondary-400 hover:text-secondary-600 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+									aria-label="Close"
+									disabled={deleteRepositoryMutation.isPending}
+								>
+									<X className="h-5 w-5" />
+								</button>
+							</div>
 						</div>
-						<div className="mb-6">
-							<p className="text-secondary-700 dark:text-white mb-2">
+						<div className="px-6 py-4">
+							<p className="text-secondary-700 dark:text-white">
 								Are you sure you want to delete{" "}
-								<strong>"{deleteModalData.name}"</strong>?
+								<span className="font-semibold">"{deleteModalData.name}"</span>?
 							</p>
 							{deleteModalData.hostCount > 0 && (
-								<p className="text-amber-600 dark:text-amber-400 text-sm">
-									⚠️ This repository is currently assigned to{" "}
-									{deleteModalData.hostCount} host
-									{deleteModalData.hostCount !== 1 ? "s" : ""}.
-								</p>
+								<div className="mt-3 p-3 bg-danger-50 dark:bg-danger-900 border border-danger-200 dark:border-danger-700 rounded-md">
+									<p className="text-sm text-danger-800 dark:text-danger-200">
+										<strong>Warning:</strong> This repository is currently
+										assigned to {deleteModalData.hostCount} host
+										{deleteModalData.hostCount !== 1 ? "s" : ""}.
+									</p>
+								</div>
 							)}
-							<p className="text-red-600 dark:text-red-400 text-sm mt-2">
-								This action cannot be undone.
-							</p>
 						</div>
-						<div className="flex gap-3 justify-end">
+						<div className="px-6 py-4 border-t border-secondary-200 dark:border-secondary-600 flex justify-end gap-3">
 							<button
 								type="button"
 								onClick={cancelDelete}
-								className="px-4 py-2 text-secondary-600 dark:text-white hover:text-secondary-800 dark:hover:text-secondary-200 transition-colors"
+								className="btn-outline"
 								disabled={deleteRepositoryMutation.isPending}
 							>
 								Cancel
@@ -361,7 +404,7 @@ const Repositories = () => {
 							<button
 								type="button"
 								onClick={confirmDelete}
-								className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+								className="btn-danger disabled:opacity-50 disabled:cursor-not-allowed"
 								disabled={deleteRepositoryMutation.isPending}
 							>
 								{deleteRepositoryMutation.isPending
@@ -386,22 +429,31 @@ const Repositories = () => {
 				<div className="flex items-center gap-3">
 					<button
 						type="button"
-						onClick={() => refetch()}
-						disabled={isFetching}
+						onClick={() => refreshRepositories()}
+						disabled={isRefreshing}
 						className="btn-outline flex items-center gap-2"
 						title="Refresh repositories data"
 					>
 						<RefreshCw
-							className={`h-4 w-4 ${isFetching ? "animate-spin" : ""}`}
+							className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
 						/>
-						{isFetching ? "Refreshing..." : "Refresh"}
+						{isRefreshing ? "Refreshing..." : "Refresh"}
 					</button>
 				</div>
 			</div>
 
 			{/* Summary Stats */}
 			<div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6 flex-shrink-0">
-				<div className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200">
+				<button
+					type="button"
+					onClick={() => {
+						setFilterType("all");
+						setFilterStatus("all");
+						setSearchTerm("");
+					}}
+					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full min-h-[44px]"
+					title="Click to clear all repository filters"
+				>
 					<div className="flex items-center">
 						<Database className="h-5 w-5 text-primary-600 mr-2" />
 						<div>
@@ -413,9 +465,18 @@ const Repositories = () => {
 							</p>
 						</div>
 					</div>
-				</div>
+				</button>
 
-				<div className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200">
+				<button
+					type="button"
+					onClick={() => {
+						setFilterStatus("active");
+						setFilterType("all");
+						setSearchTerm("");
+					}}
+					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full min-h-[44px]"
+					title="Click to filter active repositories only"
+				>
 					<div className="flex items-center">
 						<Server className="h-5 w-5 text-success-600 mr-2" />
 						<div>
@@ -427,9 +488,18 @@ const Repositories = () => {
 							</p>
 						</div>
 					</div>
-				</div>
+				</button>
 
-				<div className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200">
+				<button
+					type="button"
+					onClick={() => {
+						setFilterType("secure");
+						setFilterStatus("all");
+						setSearchTerm("");
+					}}
+					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full min-h-[44px]"
+					title="Click to filter HTTPS repositories only"
+				>
 					<div className="flex items-center">
 						<Shield className="h-5 w-5 text-warning-600 mr-2" />
 						<div>
@@ -441,9 +511,9 @@ const Repositories = () => {
 							</p>
 						</div>
 					</div>
-				</div>
+				</button>
 
-				<div className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200">
+				<div className="card p-4">
 					<div className="flex items-center">
 						<ShieldCheck className="h-5 w-5 text-danger-600 mr-2" />
 						<div>
@@ -607,10 +677,10 @@ const Repositories = () => {
 														(col) => col.id === "status",
 													) && (
 														<span
-															className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium flex-shrink-0 ${
+															className={`flex-shrink-0 ${
 																repo.is_active
-																	? "bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-300"
-																	: "bg-red-100 dark:bg-red-900/20 text-red-800 dark:text-red-300"
+																	? "badge-success"
+																	: "badge-danger"
 															}`}
 														>
 															{repo.is_active ? "Active" : "Inactive"}
@@ -702,14 +772,20 @@ const Repositories = () => {
 														key={column.id}
 														className="px-4 py-2 text-left text-xs font-medium text-secondary-500 dark:text-white uppercase tracking-wider"
 													>
-														<button
-															type="button"
-															onClick={() => handleSort(column.id)}
-															className="flex items-center justify-start gap-1 hover:text-secondary-700 dark:hover:text-secondary-200 transition-colors"
-														>
-															{column.label}
-															{getSortIcon(column.id)}
-														</button>
+														{SORTABLE_COLUMN_IDS.has(column.id) ? (
+															<button
+																type="button"
+																onClick={() => handleSort(column.id)}
+																className="flex items-center justify-start gap-1 hover:text-secondary-700 dark:hover:text-secondary-200 transition-colors"
+															>
+																{column.label}
+																{getSortIcon(column.id)}
+															</button>
+														) : (
+															<span className="flex items-center justify-start">
+																{column.label}
+															</span>
+														)}
 													</th>
 												))}
 											</tr>
@@ -857,13 +933,7 @@ const Repositories = () => {
 			}
 			case "status":
 				return (
-					<span
-						className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${
-							repo.is_active
-								? "bg-green-100 dark:bg-green-900/20 text-green-800 dark:text-green-300"
-								: "bg-red-100 dark:bg-red-900/20 text-red-800 dark:text-red-300"
-						}`}
-					>
+					<span className={repo.is_active ? "badge-success" : "badge-danger"}>
 						{repo.is_active ? "Active" : "Inactive"}
 					</span>
 				);
@@ -922,6 +992,10 @@ const ColumnSettingsModal = ({
 		setDraggedIndex(null);
 	};
 
+	const handleDragEnd = () => {
+		setDraggedIndex(null);
+	};
+
 	return (
 		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-md">
@@ -949,6 +1023,7 @@ const ColumnSettingsModal = ({
 							onDragStart={(e) => handleDragStart(e, index)}
 							onDragOver={handleDragOver}
 							onDrop={(e) => handleDrop(e, index)}
+							onDragEnd={handleDragEnd}
 							className="flex items-center justify-between p-3 bg-secondary-50 dark:bg-secondary-700 rounded-lg cursor-move hover:bg-secondary-100 dark:hover:bg-secondary-600 transition-colors w-full"
 						>
 							<div className="flex items-center gap-3">

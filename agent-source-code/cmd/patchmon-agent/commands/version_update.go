@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -33,6 +34,10 @@ const (
 	serverTimeout       = 30 * time.Second
 	versionCheckTimeout = 10 * time.Second // Shorter timeout for version checks
 )
+
+// agentVersionOutputRe parses the version out of `patchmon-agent --version`,
+// which cobra renders as "patchmon-agent version 2.0.3-rc.137".
+var agentVersionOutputRe = regexp.MustCompile(`(?i)(?:PatchMon Agent v|patchmon-agent version |patchmon-agent v|version )?([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)`)
 
 // ServerVersionResponse represents the response from the server when checking for version updates
 type ServerVersionResponse struct {
@@ -249,48 +254,63 @@ func updateAgent() error {
 	// into the locked install directory.
 	tempPath := executablePath + ".new"
 	if runtime.GOOS == "windows" {
-		tempPath = filepath.Join(os.TempDir(), fmt.Sprintf("patchmon-agent-update-%d.exe", time.Now().UnixNano()))
+		dir, dirErr := secureUpdateDir()
+		if dirErr != nil {
+			return fmt.Errorf("failed to prepare update directory: %w", dirErr)
+		}
+		tempPath = filepath.Join(dir, fmt.Sprintf("patchmon-agent-update-%d.exe", time.Now().UnixNano()))
 	}
 	if err := os.WriteFile(tempPath, newAgentData, 0755); err != nil {
 		return fmt.Errorf("failed to write new agent: %w", err)
 	}
 
-	// Verify the new executable works and check its version
+	// Verify the new executable works and check its version.
+	// Bounded: this contacts the server, and a hang here strands the host with
+	// the backup taken and the replacement not yet renamed into place.
 	logger.Debug("Validating new executable...")
-	testCmd := exec.Command(tempPath, "check-version")
+	testCtx, testCancel := context.WithTimeout(context.Background(), serverTimeout+30*time.Second)
+	testCmd := exec.CommandContext(testCtx, tempPath, "check-version")
 	testCmd.Env = os.Environ() // Preserve environment variables
-	if err := testCmd.Run(); err != nil {
+	testErr := testCmd.Run()
+	testCancel()
+	if testErr != nil {
 		if removeErr := os.Remove(tempPath); removeErr != nil {
 			logger.WithError(removeErr).Warn("Failed to remove temporary file after validation failure")
 		}
-		return fmt.Errorf("new agent executable is invalid: %w", err)
+		return fmt.Errorf("new agent executable is invalid: %w", testErr)
 	}
 	logger.Debug("New executable validation passed")
 
-	// Verify the downloaded binary version matches expected version
-	// This prevents issues where wrong binary might be downloaded
+	// Verify the downloaded binary version matches expected version.
+	// The binary only exposes --version (cobra's version flag); there is no
+	// "version" subcommand, and asking for one silently skipped this check.
 	logger.Debug("Verifying downloaded binary version...")
-	versionCmd := exec.Command(tempPath, "version")
+	versionCtx, versionCancel := context.WithTimeout(context.Background(), versionCheckTimeout)
+	versionCmd := exec.CommandContext(versionCtx, tempPath, "--version")
 	versionCmd.Env = os.Environ()
-	versionOutput, err := versionCmd.Output()
-	if err == nil {
-		// Try to extract version from output (format: "PatchMon Agent v1.3.4" or "1.3.4")
-		versionStr := strings.TrimSpace(string(versionOutput))
-		// Remove "PatchMon Agent v" prefix if present
-		versionStr = strings.TrimPrefix(versionStr, "PatchMon Agent v")
-		versionStr = strings.TrimPrefix(versionStr, "v")
-		versionStr = strings.TrimSpace(versionStr)
+	versionOutput, versionErr := versionCmd.CombinedOutput()
+	versionCancel()
+	if versionErr == nil {
+		versionStr := ""
+		if m := agentVersionOutputRe.FindStringSubmatch(string(versionOutput)); len(m) >= 2 {
+			versionStr = m[1]
+		}
 
-		if versionStr != "" && versionStr != newVersion {
+		switch {
+		case versionStr == "":
+			logger.Debug("Could not parse version from downloaded binary (non-critical)")
+		case versionStr != newVersion:
 			logger.WithFields(logutil.SanitizeMap(map[string]interface{}{
 				"expected": newVersion,
 				"actual":   versionStr,
 			})).Warn("Downloaded binary version mismatch - this may indicate server issue, but proceeding")
-		} else if versionStr == newVersion {
+			// Prefer what the binary reports over what the server advertised.
+			newVersion = versionStr
+		default:
 			logger.WithField("version", versionStr).Debug("Downloaded binary version verified")
 		}
 	} else {
-		logger.WithError(err).Debug("Could not verify binary version (non-critical)")
+		logger.WithError(versionErr).Debug("Could not verify binary version (non-critical)")
 	}
 
 	// Windows: os.Rename cannot overwrite a running .exe (file locked by SCM).
@@ -345,6 +365,19 @@ func updateAgent() error {
 	return nil // Unreachable, but satisfies function signature
 }
 
+// serviceName is the Windows service name. Declared here rather than in the
+// windows-only file because the update path builds PowerShell referencing it
+// from code that compiles on every platform, and a second literal would drift.
+const serviceName = "PatchMonAgent"
+
+// psQuote escapes a value for use inside a single-quoted PowerShell string.
+// PowerShell escapes a quote by doubling it. Without this, an install path
+// containing an apostrophe, which is legal on Windows, closes the literal and
+// the rest of the path is parsed as code.
+func psQuote(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // updateAgentWindows handles the Windows-specific update path.
 //
 // On Windows, os.Rename cannot overwrite a running executable because the SCM
@@ -355,19 +388,37 @@ func updateAgent() error {
 //  3. Launch that script detached so it outlives this process.
 //  4. Exit immediately — the script takes over.
 func updateAgentWindows(executablePath, tempPath, newVersion string) error {
-	psScriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("patchmon-update-%d.ps1", time.Now().UnixNano()))
+	dir, err := secureUpdateDir()
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to prepare update directory: %w", err)
+	}
+	psScriptPath := filepath.Join(dir, fmt.Sprintf("patchmon-update-%d.ps1", time.Now().UnixNano()))
 
-	// Use single-quoted strings inside the script to avoid PS variable expansion.
+	// Start-Service runs from finally so a failed copy cannot leave the host
+	// with the service stopped and the old binary still in place. Copy-Item is
+	// also retried, because Stop-Service returns when the SCM reports stopped,
+	// which is not always when the image handle has been released.
 	psScript := fmt.Sprintf(`$ErrorActionPreference = 'SilentlyContinue'
 Start-Sleep -Seconds 2
-Stop-Service -Name 'PatchMonAgent' -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-Copy-Item -Path '%s' -Destination '%s' -Force -ErrorAction Stop
-Start-Sleep -Seconds 1
-Start-Service -Name 'PatchMonAgent'
-Remove-Item -Path '%s' -Force -ErrorAction SilentlyContinue
-Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
-`, tempPath, executablePath, tempPath)
+Stop-Service -Name '%s' -Force -ErrorAction SilentlyContinue
+try {
+    $copied = $false
+    for ($i = 0; $i -lt 10 -and -not $copied; $i++) {
+        Start-Sleep -Seconds 2
+        try {
+            Copy-Item -Path '%s' -Destination '%s' -Force -ErrorAction Stop
+            $copied = $true
+        } catch {
+            # Image still locked; retry.
+        }
+    }
+} finally {
+    Start-Service -Name '%s'
+    Remove-Item -Path '%s' -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+}
+`, serviceName, psQuote(tempPath), psQuote(executablePath), serviceName, psQuote(tempPath))
 
 	if err := os.WriteFile(psScriptPath, []byte(psScript), 0600); err != nil {
 		_ = os.Remove(tempPath)
@@ -853,7 +904,9 @@ func markRecentUpdate() {
 		markerDir = `C:\ProgramData\PatchMon`
 	}
 
-	// SECURITY: Ensure directory exists with restrictive permissions
+	// SECURITY: restrictive on Unix. On Windows the mode is not applied, so
+	// the marker directory inherits the ProgramData ACL; it is a hint used to
+	// damp update loops, not a trust boundary.
 	if err := os.MkdirAll(markerDir, 0700); err != nil {
 		logger.WithError(err).Debug("Could not create patchmon directory (non-critical)")
 		return
@@ -885,14 +938,20 @@ func restartService(_ string, _ string) error {
 	// This branch is a safety net; the primary Windows update path goes through
 	// updateAgentWindows() before restartService is ever called.
 	if runtime.GOOS == "windows" {
-		psScriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("patchmon-restart-%d.ps1", time.Now().UnixNano()))
-		psScript := `$ErrorActionPreference = 'SilentlyContinue'
+		dir, dirErr := secureUpdateDir()
+		if dirErr != nil {
+			logger.WithError(dirErr).Error("Failed to prepare update directory for restart script")
+			os.Exit(0)
+			return nil
+		}
+		psScriptPath := filepath.Join(dir, fmt.Sprintf("patchmon-restart-%d.ps1", time.Now().UnixNano()))
+		psScript := fmt.Sprintf(`$ErrorActionPreference = 'SilentlyContinue'
 Start-Sleep -Seconds 2
-Stop-Service -Name 'PatchMonAgent' -Force -ErrorAction SilentlyContinue
+Stop-Service -Name '%s' -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
-Start-Service -Name 'PatchMonAgent'
+Start-Service -Name '%s'
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
-`
+`, serviceName, serviceName)
 		if err := os.WriteFile(psScriptPath, []byte(psScript), 0600); err != nil {
 			logger.WithError(err).Error("Failed to write Windows restart script")
 			os.Exit(0)

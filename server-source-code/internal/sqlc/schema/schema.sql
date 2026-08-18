@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS settings (
     oidc_readonly_group TEXT,
     oidc_user_group TEXT,
     oidc_enforce_https BOOLEAN NOT NULL DEFAULT true,
+    oidc_trust_unverified_email BOOLEAN NOT NULL DEFAULT false,
     max_login_attempts INTEGER,
     lockout_duration_minutes INTEGER,
     session_inactivity_timeout_minutes INTEGER,
@@ -126,7 +127,8 @@ CREATE TABLE IF NOT EXISTS settings (
     agent_rate_limit_max INTEGER,
     password_rate_limit_window_ms INTEGER,
     password_rate_limit_max INTEGER,
-    auth_browser_session_cookies BOOLEAN
+    auth_browser_session_cookies BOOLEAN,
+    prometheus_enabled BOOLEAN NOT NULL DEFAULT false
 );
 
 -- host_groups
@@ -595,6 +597,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_compliance_scans_host_profile_completed
 ON compliance_scans (host_id, profile_id)
 WHERE status = 'completed';
 
+-- Serves the stalled-scan sweep and its matching read paths (ListActiveComplianceScans,
+-- ListStalledComplianceScansWithDetails). Predicate mirrors those queries' WHERE clause
+-- exactly so the partial index is provably usable; see migration 000046.
+CREATE INDEX IF NOT EXISTS idx_compliance_scans_stalled
+ON compliance_scans (started_at)
+WHERE status = 'running' OR (completed_at IS NULL AND status != 'failed');
+
 -- compliance_rules
 CREATE TABLE IF NOT EXISTS compliance_rules (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
@@ -820,7 +829,7 @@ CREATE TABLE IF NOT EXISTS scheduled_report_runs (
 -- couple of minutes (see TypePackageStatsRefresh). Declared here so sqlc
 -- can resolve column references in queries that join against it; the
 -- authoritative definition lives in
--- migrations/000047_v2-0-4_package_stats_mat_view.up.sql.
+-- migrations/000041_v2-1-0_release.up.sql.
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_package_stats AS
 SELECT
     hp.package_id,
@@ -880,3 +889,14 @@ CREATE INDEX IF NOT EXISTS ssh_sessions_status_started_idx
     ON ssh_sessions(status, started_at DESC);
 CREATE INDEX IF NOT EXISTS ssh_recording_access_session_idx
     ON ssh_recording_access_audit(session_id, created_at DESC);
+
+-- User-owned long-lived API tokens for automation/scripting.
+CREATE TABLE user_api_tokens (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL UNIQUE,
+    created_at  TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at  TIMESTAMP(3),
+    last_used_at TIMESTAMP(3)
+);

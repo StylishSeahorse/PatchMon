@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +22,7 @@ import (
 	"github.com/PatchMon/PatchMon/server-source-code/internal/queue"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/redis"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/server"
+	"github.com/PatchMon/PatchMon/server-source-code/internal/ssgcontent"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
 	"github.com/hibiken/asynq"
@@ -86,6 +88,8 @@ func main() {
 	var poolCache *hostctx.PoolCache
 	var redisCache *hostctx.RedisCache
 	if cfg.RegistryDatabaseURL != "" {
+		hostctx.EnableMultiContextChecks()
+
 		// Poll interval is a failsafe - the primary path for registry updates is the
 		// immediate reload webhook (POST /api/v1/internal/reload-registry-map) triggered
 		// by the provisioner after every context create/update/delete.
@@ -155,6 +159,8 @@ func main() {
 		r := config.ResolveConfig(context.Background(), cfg, s)
 		return r.AgentReportsRetentionDays
 	}
+	warnIfSSGContentUnusable(cfg.SSGContentDir, slog)
+
 	queueMux := queue.Mux(queue.MuxOpts{
 		Registry:                     registry,
 		DB:                           db,
@@ -197,7 +203,7 @@ func main() {
 	// waiting for the next daily 5 AM scheduled run.
 	go func() {
 		time.Sleep(30 * time.Second)
-		ssgTask := asynq.NewTask(queue.TypeSSGUpdateCheck, []byte("{}"))
+		ssgTask := asynq.NewTask(queue.TypeSSGUpdateCheck, nil)
 		if _, err := queueClient.Enqueue(ssgTask, asynq.Queue(queue.QueueSSGUpdateCheck)); err != nil {
 			slog.Debug("startup ssg-update-check enqueue skipped", "error", err)
 		} else {
@@ -210,7 +216,7 @@ func main() {
 	// rather than waiting up to 2 minutes for the next scheduled run.
 	go func() {
 		time.Sleep(15 * time.Second)
-		t := asynq.NewTask(queue.TypePackageStatsRefresh, []byte("{}"))
+		t := asynq.NewTask(queue.TypePackageStatsRefresh, nil)
 		if _, err := queueClient.Enqueue(t, asynq.Queue(queue.QueuePackageStatsRefresh)); err != nil {
 			slog.Debug("startup package-stats-refresh enqueue skipped", "error", err)
 		} else {
@@ -249,6 +255,18 @@ func main() {
 		}
 	}()
 
+	// Profiling listens on its own loopback-only port. See internal/server/pprof.go.
+	var pprofSrv *http.Server
+	if cfg.EnablePprof {
+		pprofSrv = server.NewPprofServer(cfg.PprofPort)
+		go func() {
+			slog.Info("pprof listening", "addr", pprofSrv.Addr)
+			if err := pprofSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("pprof server", "error", err)
+			}
+		}()
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -273,8 +291,49 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	if pprofSrv != nil {
+		if err := pprofSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("pprof shutdown", "error", err)
+		}
+	}
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown", "error", err)
 	}
 	slog.Info("server stopped")
+}
+
+// warnIfSSGContentUnusable surfaces an SSG content directory the server cannot
+// serve from, at startup. Agents have no source for this content other than the
+// server, so a directory that is empty, unreadable, or holds datastreams whose
+// release cannot be determined silently disables compliance content updates
+// fleet-wide. Better to say so in the logs than to let operators find out from
+// stale SSG versions weeks later.
+func warnIfSSGContentUnusable(dir string, log *slog.Logger) {
+	if dir == "" {
+		log.Warn("SSG content directory is not configured; compliance content updates are unavailable", "env", "SSG_CONTENT_DIR")
+		return
+	}
+
+	// Load-bearing despite the discarded result: Files reports nil for an
+	// unreadable directory and for an empty one alike, and those want different
+	// warnings.
+	if _, err := os.ReadDir(dir); err != nil {
+		log.Warn("SSG content directory is unreadable; compliance content updates are unavailable", "dir", dir, "error", err)
+		return
+	}
+
+	// Deliberately the same view of the directory the serving code takes, so this
+	// check cannot pass on content the handlers would not recognise.
+	if len(ssgcontent.Files(dir)) == 0 {
+		log.Warn("SSG content directory contains no datastream files; compliance content updates are unavailable", "dir", dir)
+		return
+	}
+
+	// Datastreams alone are not enough: everything downstream keys off the
+	// release they belong to, so content whose version cannot be resolved is
+	// content agents will never be offered.
+	if ssgcontent.Version(dir) == "" {
+		log.Warn("SSG content version could not be determined; compliance content updates are unavailable", "dir", dir)
+	}
 }

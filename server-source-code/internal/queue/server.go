@@ -108,11 +108,11 @@ func Mux(opts MuxOpts) *asynq.ServeMux {
 	mux := asynq.NewServeMux()
 	registry, db, log := opts.Registry, opts.DB, opts.Log
 	wrap := func(typ string, h asynq.Handler) asynq.Handler { return loggingHandler(typ, h, log) }
-	mux.Handle(TypeReportNow, wrap(TypeReportNow, NewReportNowHandler(registry, db, log)))
-	mux.Handle(TypeRefreshIntegrationStatus, wrap(TypeRefreshIntegrationStatus, NewRefreshIntegrationStatusHandler(registry, db, log)))
-	mux.Handle(TypeDockerInventoryRefresh, wrap(TypeDockerInventoryRefresh, NewDockerInventoryRefreshHandler(registry, db, log)))
-	mux.Handle(TypeUpdateAgent, wrap(TypeUpdateAgent, NewUpdateAgentHandler(registry, db, log)))
-	mux.Handle(TypeRebootHost, wrap(TypeRebootHost, NewRebootHostHandler(registry, db, log)))
+	mux.Handle(TypeReportNow, wrap(TypeReportNow, NewReportNowHandler(registry, db, opts.PoolCache, log)))
+	mux.Handle(TypeRefreshIntegrationStatus, wrap(TypeRefreshIntegrationStatus, NewRefreshIntegrationStatusHandler(registry, db, opts.PoolCache, log)))
+	mux.Handle(TypeDockerInventoryRefresh, wrap(TypeDockerInventoryRefresh, NewDockerInventoryRefreshHandler(registry, db, opts.PoolCache, log)))
+	mux.Handle(TypeUpdateAgent, wrap(TypeUpdateAgent, NewUpdateAgentHandler(registry, db, opts.PoolCache, log)))
+	mux.Handle(TypeRebootHost, wrap(TypeRebootHost, NewRebootHostHandler(registry, db, opts.PoolCache, log)))
 	dbResolver := &hostctx.DBResolver{Default: db}
 	mux.Handle(TypeHostStatusMonitor, wrap(TypeHostStatusMonitor, NewHostStatusMonitorHandler(db, opts.PoolCache, registry, opts.Emit, log)))
 	mux.Handle(TypeUpdateThresholdMonitor, wrap(TypeUpdateThresholdMonitor, NewUpdateThresholdMonitorHandler(db, opts.PoolCache, opts.Emit, log)))
@@ -132,13 +132,13 @@ func Mux(opts MuxOpts) *asynq.ServeMux {
 	mux.Handle(TypePackageStatsRefresh, wrap(TypePackageStatsRefresh, NewPackageStatsRefreshHandler(db, opts.PoolCache, log)))
 	mux.Handle(TypeSSGUpdateCheck, wrap(TypeSSGUpdateCheck, NewSSGUpdateCheckHandler(registry, db, opts.PoolCache, opts.QueueClient, opts.SSGContentDir, log)))
 	mux.Handle(TypeSSGUpgrade, wrap(TypeSSGUpgrade, NewSSGUpgradeHandler(registry, db, opts.PoolCache, log)))
-	complianceStore := store.NewComplianceStore(db)
+	complianceStore := store.NewComplianceStore(&hostctx.DBResolver{Default: db})
 	var integrationStatusStore *store.IntegrationStatusStore
 	if opts.RDB != nil {
 		integrationStatusStore = store.NewIntegrationStatusStore(&hostctx.RedisResolver{Default: opts.RDB})
 	}
 	mux.Handle(TypeRunScan, wrap(TypeRunScan, NewRunScanHandler(registry, db, opts.PoolCache, complianceStore, opts.QueueClient, integrationStatusStore, log)))
-	mux.Handle(TypeInstallComplianceTools, wrap(TypeInstallComplianceTools, NewInstallComplianceToolsHandler(registry, db, opts.RDB, opts.RedisCache, log)))
+	mux.Handle(TypeInstallComplianceTools, wrap(TypeInstallComplianceTools, NewInstallComplianceToolsHandler(registry, db, opts.PoolCache, opts.RDB, opts.RedisCache, log)))
 	patchRunsStore := store.NewPatchRunsStore(&hostctx.DBResolver{Default: db})
 	mux.Handle(TypeRunPatch, wrap(TypeRunPatch, NewRunPatchHandler(registry, patchRunsStore, opts.PoolCache, opts.QueueClient, log)))
 	patchPoliciesStore := store.NewPatchPoliciesStore(dbResolver)
@@ -249,8 +249,10 @@ func NewScheduler(opts asynq.RedisClientOpt, db *database.DB, log *slog.Logger) 
 		return nil, err
 	}
 
+	// Hourly, not daily: the handler ends scans running over three hours, and a
+	// daily sweep left them holding the host's Run Scan button for most of a day.
 	complianceScanTask := asynq.NewTask(TypeComplianceScanCleanup, nil)
-	if _, err := scheduler.Register("0 1 * * *", complianceScanTask, asynq.Queue(QueueComplianceScanCleanup), asynq.Retention(AutomationRetention)); err != nil {
+	if _, err := scheduler.Register("0 * * * *", complianceScanTask, asynq.Queue(QueueComplianceScanCleanup), asynq.Retention(AutomationRetention)); err != nil {
 		return nil, err
 	}
 

@@ -12,10 +12,12 @@ import SetupCheckError from "./components/SetupCheckError";
 import { isAuthPhase } from "./constants/authPhases";
 import { AuthProvider, useAuth } from "./contexts/AuthContext";
 import { ColorThemeProvider } from "./contexts/ColorThemeContext";
+import { ConfirmProvider } from "./contexts/ConfirmContext";
 import { SettingsProvider } from "./contexts/SettingsContext";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { ToastProvider } from "./contexts/ToastContext";
 import { UpdateNotificationProvider } from "./contexts/UpdateNotificationContext";
+import { useSessionHeartbeat } from "./hooks/useSessionHeartbeat";
 import Automation from "./pages/Automation";
 import Compliance from "./pages/Compliance";
 // Eager load main nav pages for instant navigation (no loading flash)
@@ -100,6 +102,10 @@ function AppRoutes() {
 		firstTimeWizardActive,
 	} = useAuth();
 	const isAuth = isAuthenticated(); // Call the function to get boolean value
+
+	// Mounted above the route tree so every authenticated screen beats, including
+	// the ones under SettingsLayout rather than Layout.
+	useSessionHeartbeat(isAuth);
 
 	// Show loading while checking setup or initialising
 	if (
@@ -571,11 +577,13 @@ function App() {
 					<SettingsProvider>
 						<ColorThemeProvider>
 							<ToastProvider>
-								<UpdateNotificationProvider>
-									<LogoProvider>
-										<AppRoutes />
-									</LogoProvider>
-								</UpdateNotificationProvider>
+								<ConfirmProvider>
+									<UpdateNotificationProvider>
+										<LogoProvider>
+											<AppRoutes />
+										</LogoProvider>
+									</UpdateNotificationProvider>
+								</ConfirmProvider>
 							</ToastProvider>
 						</ColorThemeProvider>
 					</SettingsProvider>

@@ -2,11 +2,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	Bell,
 	Check,
+	CheckCircle2,
+	CheckSquare,
 	ChevronLeft,
 	ChevronRight,
 	Clock,
 	Edit2,
 	Globe,
+	Info,
 	Loader2,
 	Mail,
 	Play,
@@ -14,6 +17,7 @@ import {
 	RefreshCw,
 	Send,
 	Slack,
+	Square,
 	Trash2,
 	X,
 } from "lucide-react";
@@ -21,6 +25,7 @@ import { useMemo, useState } from "react";
 import { SiDiscord, SiNtfy } from "react-icons/si";
 import { Link } from "react-router-dom";
 import { useAuth } from "../../contexts/AuthContext";
+import { useConfirm } from "../../contexts/ConfirmContext";
 import { useToast } from "../../contexts/ToastContext";
 import {
 	adminHostsAPI,
@@ -28,6 +33,11 @@ import {
 	hostGroupsAPI,
 	notificationsAPI,
 } from "../../utils/api";
+import {
+	detectWebhookFormat,
+	WEBHOOK_FORMATS,
+	webhookFormatLabel,
+} from "../../utils/webhookFormat";
 
 /* ───────────────────── Constants ───────────────────── */
 
@@ -92,7 +102,7 @@ const CHANNEL_TYPES = [
 	{
 		value: "webhook",
 		label: "Webhook",
-		description: "Generic, Discord, or Slack",
+		description: "Generic, Discord, Slack, Mattermost or Rocket.Chat",
 		icon: Globe,
 		brandIcons: { discord: SiDiscord, slack: Slack },
 	},
@@ -150,7 +160,7 @@ const TLS_MODE_HELP = {
 	starttls:
 		"Connect in plaintext on the submission port, then upgrade to TLS via the STARTTLS command. Typical port: 587.",
 	tls: "Open a TLS connection from the start (sometimes called SMTPS). Typical port: 465.",
-	none: "Send mail in plaintext. Credentials will be rejected by the server. Use only for local relays you trust.",
+	none: "Send mail in plaintext. Credentials are only sent if you enable the unencrypted credentials option below. Use only for local relays you trust.",
 	auto: "Try STARTTLS first, then fall back to implicit TLS on the same host and port. Mail is never sent in plaintext in this mode; if neither works, sending fails.",
 };
 
@@ -172,6 +182,11 @@ export const hydrateTLSMode = (cfg) => {
 	}
 	if (cfg.use_tls === false) return "none";
 	return "auto";
+};
+
+export const hydrateAllowInsecureAuth = (cfg) => {
+	if (!cfg || typeof cfg !== "object") return false;
+	return cfg.allow_insecure_auth === true;
 };
 
 const buildCron = (frequency, time, days, monthDay) => {
@@ -257,6 +272,36 @@ const statusBadge = (status) => {
 	);
 };
 
+/* Shows which payload PatchMon will send to the webhook URL as it is typed. */
+const WebhookFormatHint = ({ url }) => {
+	const format = useMemo(() => detectWebhookFormat(url), [url]);
+	const meta = webhookFormatLabel(format);
+
+	if (!meta) {
+		return (
+			<p className="mt-1 text-xs text-secondary-500">
+				Discord, Slack, Mattermost and Rocket.Chat URLs are auto-detected for
+				rich formatting
+			</p>
+		);
+	}
+
+	const isGeneric = format === WEBHOOK_FORMATS.GENERIC;
+	return (
+		<p className="mt-1 flex items-start gap-1.5 text-xs text-secondary-500">
+			{isGeneric ? (
+				<Info className="h-3.5 w-3.5 shrink-0 mt-px" />
+			) : (
+				<CheckCircle2 className="h-3.5 w-3.5 shrink-0 mt-px text-success-600 dark:text-success-400" />
+			)}
+			<span>
+				Detected <span className="font-medium">{meta.label}</span>.{" "}
+				{meta.detail}.
+			</span>
+		</p>
+	);
+};
+
 /* ───────────────── Destination Modal ───────────────── */
 
 const DestinationModal = ({
@@ -278,6 +323,9 @@ const DestinationModal = ({
 	const [tlsMode, setTlsMode] = useState(
 		editingDest ? hydrateTLSMode(editingDest._loadedConfig || {}) : "starttls",
 	);
+	const [allowInsecureAuth, setAllowInsecureAuth] = useState(
+		hydrateAllowInsecureAuth(editingDest?._loadedConfig),
+	);
 	const [isTestingSMTP, setIsTestingSMTP] = useState(false);
 	const toast = useToast();
 
@@ -287,8 +335,9 @@ const DestinationModal = ({
 		(config.username && String(config.username).length > 0) ||
 			(config.password && String(config.password).length > 0),
 	);
-	const showPlainAuthWarning =
+	const insecureAuthApplies =
 		channelType === "email" && tlsMode === "none" && credentialsSet;
+	const insecureAuthBlocked = insecureAuthApplies && !allowInsecureAuth;
 
 	const handleSave = () => {
 		if (!displayName.trim()) {
@@ -306,9 +355,9 @@ const DestinationModal = ({
 			toast.warning("SMTP host, from, and to are required");
 			return;
 		}
-		if (channelType === "email" && showPlainAuthWarning) {
+		if (channelType === "email" && insecureAuthBlocked) {
 			toast.warning(
-				"Clear the credentials or pick STARTTLS / Implicit TLS before saving",
+				"Tick the unencrypted credentials option, clear the credentials, or pick STARTTLS / Implicit TLS before saving",
 			);
 			return;
 		}
@@ -324,6 +373,7 @@ const DestinationModal = ({
 				...config,
 				tls_mode: tlsMode,
 				use_tls: tlsMode !== "none",
+				allow_insecure_auth: insecureAuthApplies && allowInsecureAuth,
 			};
 		}
 		onSave({
@@ -403,9 +453,7 @@ const DestinationModal = ({
 								value={config.url || ""}
 								onChange={(e) => updateConfig("url", e.target.value)}
 							/>
-							<p className="mt-1 text-xs text-secondary-500">
-								Discord and Slack URLs are auto-detected for rich formatting
-							</p>
+							<WebhookFormatHint url={config.url} />
 						</div>
 						<div>
 							<label className="block text-sm font-medium text-secondary-700 dark:text-white mb-1">
@@ -517,11 +565,34 @@ const DestinationModal = ({
 								{TLS_MODE_HELP[tlsMode]}
 							</p>
 						</div>
-						{showPlainAuthWarning && (
-							<div className="bg-danger-50 dark:bg-danger-900/30 border border-danger-200 dark:border-danger-700 rounded-md p-3 text-sm text-danger-700 dark:text-danger-300">
-								PLAIN authentication over an unencrypted connection will be
-								rejected by the server. Either clear the credentials or choose
-								STARTTLS / Implicit TLS.
+						{insecureAuthApplies && (
+							<div className="bg-danger-50 dark:bg-danger-900/30 border border-danger-200 dark:border-danger-700 rounded-md p-3">
+								<p className="text-sm text-danger-700 dark:text-danger-300">
+									This connection is not encrypted, so the username and password
+									are sent in cleartext. Anyone on the network path between
+									PatchMon and this relay can read them. Only do this on a
+									trusted local network.
+								</p>
+								<button
+									type="button"
+									aria-pressed={allowInsecureAuth}
+									onClick={() => setAllowInsecureAuth((v) => !v)}
+									className="mt-2 flex w-full items-center gap-2 min-h-[44px] text-left text-sm font-medium text-danger-800 dark:text-danger-200"
+								>
+									{allowInsecureAuth ? (
+										<CheckSquare className="h-5 w-5 flex-shrink-0 text-danger-600 dark:text-danger-400" />
+									) : (
+										<Square className="h-5 w-5 flex-shrink-0 text-danger-500 dark:text-danger-400" />
+									)}
+									Send credentials over an unencrypted connection
+								</button>
+								{insecureAuthBlocked && (
+									<p className="mt-2 text-sm text-danger-700 dark:text-danger-300">
+										Until this is ticked, PatchMon will not authenticate over an
+										unencrypted connection and sending will fail. Alternatively,
+										clear the credentials or choose STARTTLS / Implicit TLS.
+									</p>
+								)}
 							</div>
 						)}
 					</div>
@@ -714,13 +785,13 @@ const DestinationModal = ({
 									!editingDest?.id ||
 									isPending ||
 									isTestingSMTP ||
-									showPlainAuthWarning
+									insecureAuthBlocked
 								}
 								onClick={handleSendTestEmail}
 								title={
 									!editingDest?.id
 										? "Save the destination first to send a test email"
-										: "Send a test email using the saved configuration"
+										: "Sends using the last saved configuration. Save first to test unsaved changes."
 								}
 							>
 								{isTestingSMTP ? (
@@ -745,7 +816,7 @@ const DestinationModal = ({
 							<button
 								type="button"
 								className="btn-primary flex items-center gap-1"
-								disabled={isPending || isTestingSMTP || showPlainAuthWarning}
+								disabled={isPending || isTestingSMTP || insecureAuthBlocked}
 								onClick={handleSave}
 							>
 								{isPending ? (
@@ -1378,6 +1449,7 @@ const ReportModal = ({
 export const NotificationPanel = ({ panel }) => {
 	const queryClient = useQueryClient();
 	const toast = useToast();
+	const confirm = useConfirm();
 	const { canManageNotifications, canViewNotificationLogs, hasPermission } =
 		useAuth();
 	const canManage = canManageNotifications();
@@ -1423,15 +1495,19 @@ export const NotificationPanel = ({ panel }) => {
 		queryFn: () => hostGroupsAPI.list().then((r) => r.data ?? []),
 		enabled: canManage && canListHostGroups,
 	});
-	const { data: hostsList = [] } = useQuery({
+	const { data: hostsData } = useQuery({
 		queryKey: ["hosts-list"],
-		queryFn: () => adminHostsAPI.list().then((r) => r.data ?? []),
+		queryFn: () => adminHostsAPI.list().then((r) => r.data),
 		enabled: canManage && canListHostGroups,
 	});
 
 	const hostGroupOptions = useMemo(
 		() => (Array.isArray(hostGroups) ? hostGroups : []),
 		[hostGroups],
+	);
+	const hostOptions = useMemo(
+		() => (Array.isArray(hostsData?.data) ? hostsData.data : []),
+		[hostsData],
 	);
 	const destNameMap = useMemo(() => {
 		const m = {};
@@ -1753,8 +1829,14 @@ export const NotificationPanel = ({ panel }) => {
 														<button
 															type="button"
 															className="text-red-600 hover:text-red-700 inline-flex items-center gap-1 text-xs"
-															onClick={() => {
-																if (confirm("Delete this destination?"))
+															onClick={async () => {
+																if (
+																	await confirm({
+																		title: "Delete destination",
+																		message: `Delete the destination "${d.display_name}"?`,
+																		confirmLabel: "Delete destination",
+																	})
+																)
 																	deleteDest.mutate(d.id);
 															}}
 														>
@@ -1876,8 +1958,14 @@ export const NotificationPanel = ({ panel }) => {
 												<button
 													type="button"
 													className="text-red-600 hover:text-red-700 inline-flex items-center gap-1 text-xs"
-													onClick={() => {
-														if (confirm("Delete this route?"))
+													onClick={async () => {
+														if (
+															await confirm({
+																title: "Delete route",
+																message: "Delete this event route?",
+																confirmLabel: "Delete route",
+															})
+														)
 															deleteRoute.mutate(row.id);
 													}}
 												>
@@ -1986,8 +2074,14 @@ export const NotificationPanel = ({ panel }) => {
 												<button
 													type="button"
 													className="text-red-600 hover:text-red-700 inline-flex items-center gap-1 text-xs"
-													onClick={() => {
-														if (confirm("Delete this report?"))
+													onClick={async () => {
+														if (
+															await confirm({
+																title: "Delete scheduled report",
+																message: `Delete the scheduled report "${r.name}"?`,
+																confirmLabel: "Delete report",
+															})
+														)
 															deleteReport.mutate(r.id);
 													}}
 												>
@@ -2143,7 +2237,7 @@ export const NotificationPanel = ({ panel }) => {
 				editingRoute={routeModal.editing}
 				destinations={destinations}
 				hostGroups={hostGroupOptions}
-				hosts={Array.isArray(hostsList) ? hostsList : []}
+				hosts={hostOptions}
 				isPending={createRoute.isPending || updateRoute.isPending}
 			/>
 			<ReportModal

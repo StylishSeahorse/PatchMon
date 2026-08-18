@@ -75,8 +75,10 @@ info "🗑️  Starting PatchMon Agent Removal..."
 info "🛑 Stopping PatchMon service..."
 SERVICE_STOPPED=0
 
-# Check for systemd service
-if command -v systemctl >/dev/null 2>&1; then
+# Check for systemd service. /run/systemd/system exists only when systemd is the
+# running init; the systemctl binary alone is also present when systemd is
+# merely installed, and every systemctl call then fails.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     info "📋 Checking systemd service status..."
     
     # Check if service is active
@@ -245,6 +247,17 @@ if [ -f "/usr/local/bin/patchmon-agent.sh" ]; then
     warning "Removing legacy agent script: /usr/local/bin/patchmon-agent.sh"
     rm -f /usr/local/bin/patchmon-agent.sh
     AGENTS_REMOVED=1
+fi
+
+# Remove macOS brew wrapper and sudoers entry
+if [ -f "/usr/local/bin/patchmon-brew" ]; then
+    warning "Removing brew wrapper: /usr/local/bin/patchmon-brew"
+    rm -f /usr/local/bin/patchmon-brew
+    AGENTS_REMOVED=1
+fi
+if [ -f "/etc/sudoers.d/patchmon" ]; then
+    warning "Removing sudoers entry: /etc/sudoers.d/patchmon"
+    rm -f /etc/sudoers.d/patchmon
 fi
 
 # Remove backup files for Go agent

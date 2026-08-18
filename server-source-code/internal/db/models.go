@@ -633,6 +633,7 @@ type Setting struct {
 	OidcReadonlyGroup               *string          `json:"oidc_readonly_group"`
 	OidcUserGroup                   *string          `json:"oidc_user_group"`
 	OidcEnforceHttps                bool             `json:"oidc_enforce_https"`
+	OidcTrustUnverifiedEmail        bool             `json:"oidc_trust_unverified_email"`
 	MaxLoginAttempts                *int32           `json:"max_login_attempts"`
 	LockoutDurationMinutes          *int32           `json:"lockout_duration_minutes"`
 	SessionInactivityTimeoutMinutes *int32           `json:"session_inactivity_timeout_minutes"`
@@ -761,6 +762,16 @@ type User struct {
 	DiscordLinkedAt        pgtype.Timestamp `json:"discord_linked_at"`
 	NewsletterSubscribed   bool             `json:"newsletter_subscribed"`
 	NewsletterSubscribedAt pgtype.Timestamp `json:"newsletter_subscribed_at"`
+}
+
+type UserApiToken struct {
+	ID         string           `json:"id"`
+	UserID     string           `json:"user_id"`
+	Name       string           `json:"name"`
+	TokenHash  string           `json:"token_hash"`
+	CreatedAt  pgtype.Timestamp `json:"created_at"`
+	ExpiresAt  pgtype.Timestamp `json:"expires_at"`
+	LastUsedAt pgtype.Timestamp `json:"last_used_at"`
 }
 
 type UserSession struct {

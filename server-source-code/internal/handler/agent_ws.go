@@ -9,29 +9,20 @@ import (
 	"time"
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/agentregistry"
+	hostctx "github.com/PatchMon/PatchMon/server-source-code/internal/context"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
 	"github.com/gorilla/websocket"
 )
 
-// Server-side ping cadence and read timeout for the agent WS. Together they
-// detect a half-open socket in bounded time (~agentReadTimeout) rather than
-// waiting on kernel TCP keepalive (Linux default ≈ 2h). Must be at least as
-// short as the agent's own ping cadence so we don't fight each other.
-const (
-	agentPingInterval = 30 * time.Second
-	agentReadTimeout  = 90 * time.Second
-	agentPingTimeout  = 5 * time.Second
-)
-
 // OnSshProxyMessage is called when agent sends ssh_proxy_* messages.
 type OnSshProxyMessage func(apiID string, msg []byte)
 
-// OnSSHBastionMessage is called for multiplexed PTY and raw SSH tunnel messages.
-type OnSSHBastionMessage func(apiID string, msg []byte)
-
 // OnRDPProxyMessage is called when agent sends rdp_proxy_* messages.
 type OnRDPProxyMessage func(apiID string, msg []byte)
+
+// OnSSHBastionMessage is called for multiplexed PTY and raw SSH tunnel messages.
+type OnSSHBastionMessage func(apiID string, msg []byte)
 
 // OnAgentDisconnect is called when an agent's WebSocket disconnects. Used for host_down alerting.
 type OnAgentDisconnect func(ctx context.Context, apiID string)
@@ -44,8 +35,8 @@ type AgentWSHandler struct {
 	hosts               *store.HostsStore
 	registry            *agentregistry.Registry
 	onSshProxyMessage   OnSshProxyMessage
-	onSSHBastionMessage OnSSHBastionMessage
 	onRDPProxyMessage   OnRDPProxyMessage
+	onSSHBastionMessage OnSSHBastionMessage
 	onDisconnect        OnAgentDisconnect
 	onConnect           OnAgentConnect
 	upgrader            websocket.Upgrader
@@ -75,6 +66,7 @@ func WithOnRDPProxyMessage(f OnRDPProxyMessage) AgentWSHandlerOption {
 	}
 }
 
+// WithOnSSHBastionMessage sets the callback invoked for PTY and raw SSH tunnel messages.
 func WithOnSSHBastionMessage(f OnSSHBastionMessage) AgentWSHandlerOption {
 	return func(h *AgentWSHandler) {
 		h.onSSHBastionMessage = f
@@ -100,6 +92,13 @@ func NewAgentWSHandler(hosts *store.HostsStore, registry *agentregistry.Registry
 	}
 	return h
 }
+
+// Mirrors the agent's own settings in serve.go.
+const (
+	agentWSPongWait   = 90 * time.Second
+	agentWSPingPeriod = 30 * time.Second
+	agentWSWriteWait  = 10 * time.Second
+)
 
 // ServeWS handles GET /api/v1/agents/ws - upgrades to WebSocket with API key auth.
 func (h *AgentWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
@@ -133,22 +132,14 @@ func (h *AgentWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 	// Detect secure (wss) from TLS or X-Forwarded-Proto
 	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-	h.registry.Register(apiID, secure)
+	// Label the connection with the context that owns it, so registry lookups
+	// can be scoped without a database round-trip. Empty in single-context mode.
+	h.registry.Register(apiID, secure, hostctx.TenantHostKey(connCtx))
 	h.registry.SetConnection(apiID, conn)
 	if h.onConnect != nil {
 		h.onConnect(connCtx, apiID)
 	}
-
-	// pingDone signals the ping goroutine to exit when this handler returns.
-	// Single defer keeps a strict teardown order: (1) stop the pinger so it
-	// can't race on the conn, (2) conn-scoped unregister so a zombie goroutine
-	// from a stale TCP socket doesn't wipe out a newer live registration, and
-	// (3) only fire onDisconnect when WE were the authoritative connection.
-	pingDone := make(chan struct{})
 	defer func() {
-		// Stop the pinger before touching the registry so it can't race on the
-		// conn we are about to close.
-		close(pingDone)
 		// Registry teardown FIRST, and identity-aware. onDisconnect does up to
 		// 5s of real database work while agent reconnect backoff starts at ~1s,
 		// so doing the registry update afterwards let a stale teardown delete
@@ -169,30 +160,36 @@ func (h *AgentWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("agent ws connected", "api_id", apiID)
 
-	// Configure connection. Set an initial read deadline so a half-open socket
-	// is detected within agentReadTimeout even before the first pong arrives.
-	// The pong handler refreshes it each time the agent acknowledges our ping.
+	// Configure connection
 	conn.SetReadLimit(512 * 1024) // 512KB max message
-	_ = conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
+
+	// The deadline must be armed here: a pong handler alone never fires, since
+	// the server has to ping first. Cadence mirrors the agent side.
+	_ = conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
+		return conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
+	})
+	// Chain to the default handler so the pong reply still goes out.
+	defaultPingHandler := conn.PingHandler()
+	conn.SetPingHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
+		return defaultPingHandler(appData)
 	})
 
-	// Server-initiated ping ticker. Without this, the read deadline above can
-	// only ever fire (we never see a pong because we never sent a ping), so a
-	// healthy agent would be disconnected every 90s. SendMessageWithTimeout
-	// goes through the per-conn write mutex so it doesn't race with other
-	// writers (SSH/RDP proxy traffic).
+	// WriteControl is the one write method gorilla documents as concurrency-safe,
+	// so this need not take the registry write mutex. Registered after the
+	// teardown defer so it stops first.
+	pingStop := make(chan struct{})
+	defer close(pingStop)
 	go func() {
-		t := time.NewTicker(agentPingInterval)
+		t := time.NewTicker(agentWSPingPeriod)
 		defer t.Stop()
 		for {
 			select {
-			case <-pingDone:
+			case <-pingStop:
 				return
 			case <-t.C:
-				if err := h.registry.SendMessageWithTimeout(apiID, websocket.PingMessage, nil, agentPingTimeout); err != nil {
-					// Conn is gone or wedged — read loop will notice next.
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(agentWSWriteWait)); err != nil {
 					return
 				}
 			}
@@ -208,6 +205,7 @@ func (h *AgentWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			}
 			break
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(agentWSPongWait))
 
 		// Forward SSH proxy messages to SSH terminal handler
 		if h.onSshProxyMessage != nil {
@@ -222,19 +220,6 @@ func (h *AgentWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if h.onSSHBastionMessage != nil {
-			var msg struct {
-				Type string `json:"type"`
-			}
-			if err := json.Unmarshal(message, &msg); err == nil {
-				switch msg.Type {
-				case "pty_opened", "pty_output", "pty_input_ack", "pty_exited", "pty_error", "pty_closed",
-					"ssh_tunnel_opened", "ssh_tunnel_data", "ssh_tunnel_error", "ssh_tunnel_closed":
-					h.onSSHBastionMessage(apiID, message)
-					continue
-				}
-			}
-		}
 		// Forward RDP proxy messages to RDP handler
 		if h.onRDPProxyMessage != nil {
 			var msg struct {
@@ -244,6 +229,20 @@ func (h *AgentWSHandler) ServeWS(w http.ResponseWriter, r *http.Request) {
 				switch msg.Type {
 				case "rdp_proxy_data", "rdp_proxy_connected", "rdp_proxy_error", "rdp_proxy_closed":
 					h.onRDPProxyMessage(apiID, message)
+					continue
+				}
+			}
+		}
+		// Forward PTY and raw SSH tunnel messages to the bastion broker
+		if h.onSSHBastionMessage != nil {
+			var msg struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(message, &msg); err == nil {
+				switch msg.Type {
+				case "pty_opened", "pty_output", "pty_input_ack", "pty_exited", "pty_error", "pty_closed",
+					"ssh_tunnel_opened", "ssh_tunnel_data", "ssh_tunnel_error", "ssh_tunnel_closed":
+					h.onSSHBastionMessage(apiID, message)
 					continue
 				}
 			}

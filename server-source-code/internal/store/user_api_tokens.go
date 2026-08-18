@@ -29,7 +29,19 @@ func (s *UserApiTokenStore) GetByHash(ctx context.Context, tokenHash string) (db
 
 func (s *UserApiTokenStore) Create(ctx context.Context, arg db.CreateUserApiTokenParams) (db.ListUserApiTokensRow, error) {
 	d := s.db.DB(ctx)
-	return d.Queries.CreateUserApiToken(ctx, arg)
+	row, err := d.Queries.CreateUserApiToken(ctx, arg)
+	if err != nil {
+		return db.ListUserApiTokensRow{}, err
+	}
+	// Same columns, distinct generated row types: convert rather than widen the
+	// store API, so callers keep one shape for both list and create.
+	return db.ListUserApiTokensRow{
+		ID:         row.ID,
+		Name:       row.Name,
+		CreatedAt:  row.CreatedAt,
+		ExpiresAt:  row.ExpiresAt,
+		LastUsedAt: row.LastUsedAt,
+	}, nil
 }
 
 func (s *UserApiTokenStore) Delete(ctx context.Context, id string) error {
@@ -55,8 +67,8 @@ func RowToUserApiTokenListItem(r db.ListUserApiTokensRow) UserApiTokenListItem {
 	return UserApiTokenListItem{
 		ID:         r.ID,
 		Name:       r.Name,
-		CreatedAt:  r.CreatedAt,
-		ExpiresAt:  r.ExpiresAt,
-		LastUsedAt: r.LastUsedAt,
+		CreatedAt:  pgTime(r.CreatedAt),
+		ExpiresAt:  pgTimePtr(r.ExpiresAt),
+		LastUsedAt: pgTimePtr(r.LastUsedAt),
 	}
 }

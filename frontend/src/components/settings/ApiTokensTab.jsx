@@ -61,7 +61,7 @@ const ApiTokensTab = () => {
 		mutationFn: (data) => apiTokensAPI.create(data).then((r) => r.data),
 		onSuccess: (data) => {
 			const name = form.name.trim();
-			queryClient.invalidateQueries(["apiTokens"]);
+			queryClient.invalidateQueries({ queryKey: ["apiTokens"] });
 			setShowCreateModal(false);
 			setForm({ name: "", expires_at: "" });
 			setNewTokenData({ name, token: data.token });
@@ -72,7 +72,7 @@ const ApiTokensTab = () => {
 	const revokeMutation = useMutation({
 		mutationFn: (id) => apiTokensAPI.revoke(id),
 		onSuccess: () => {
-			queryClient.invalidateQueries(["apiTokens"]);
+			queryClient.invalidateQueries({ queryKey: ["apiTokens"] });
 		},
 	});
 

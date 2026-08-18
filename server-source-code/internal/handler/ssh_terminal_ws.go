@@ -217,13 +217,13 @@ func (h *SshTerminalWSHandler) handleConnection(ctx context.Context, conn *webso
 		})
 	}
 
+	// One serialising writer for this frontend connection, shared with the
+	// proxy session so the agent read-loop goroutine writes under the same
+	// lock. mu below still guards the local SSH/session state, not the socket.
+	writer := sshproxy.NewConnWriter(conn)
+
 	send := func(msg interface{}) {
-		mu.Lock()
-		defer mu.Unlock()
-		if conn == nil {
-			return
-		}
-		if err := conn.WriteJSON(msg); err != nil {
+		if err := writer.WriteJSON(msg); err != nil {
 			h.log.Debug("ssh-terminal send error", "error", err)
 		}
 	}
@@ -332,7 +332,7 @@ func (h *SshTerminalWSHandler) handleConnection(ctx context.Context, conn *webso
 				proxySessionID = hex.EncodeToString(b)
 				mu.Unlock()
 				h.proxySess.Set(proxySessionID, &sshproxy.Session{
-					FrontendWS:      conn,
+					Frontend:        writer,
 					HostID:          host.ID,
 					ApiID:           host.ApiID,
 					RecordOutput:    func(data string) { recordEvent(sessionrecording.Event{Type: "output", Data: data}) },
@@ -577,7 +577,7 @@ func (h *SshTerminalWSHandler) HandleAgentMessage(apiID string, raw []byte) {
 	if sess.ApiID != apiID {
 		return
 	}
-	ws := sess.FrontendWS
+	ws := sess.Frontend
 	if ws == nil {
 		h.proxySess.Delete(msg.Session)
 		return

@@ -428,30 +428,6 @@ func (q *Queries) ListExistingHostApiIDs(ctx context.Context, dollar_1 []string)
 	return items, nil
 }
 
-const listHostApiIDs = `-- name: ListHostApiIDs :many
-SELECT api_id FROM hosts ORDER BY friendly_name ASC
-`
-
-func (q *Queries) ListHostApiIDs(ctx context.Context) ([]string, error) {
-	rows, err := q.db.Query(ctx, listHostApiIDs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []string
-	for rows.Next() {
-		var api_id string
-		if err := rows.Scan(&api_id); err != nil {
-			return nil, err
-		}
-		items = append(items, api_id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listHostOptions = `-- name: ListHostOptions :many
 SELECT id, friendly_name, hostname, os_type, status
 FROM hosts
@@ -580,17 +556,20 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 }
 
 const listHostsForComplianceDashboard = `-- name: ListHostsForComplianceDashboard :many
-SELECT id, hostname, friendly_name, compliance_enabled, compliance_on_demand_only, docker_enabled
+SELECT id, hostname, friendly_name, compliance_enabled, compliance_on_demand_only, docker_enabled,
+       compliance_openscap_enabled, compliance_docker_bench_enabled
 FROM hosts
 `
 
 type ListHostsForComplianceDashboardRow struct {
-	ID                     string  `json:"id"`
-	Hostname               *string `json:"hostname"`
-	FriendlyName           string  `json:"friendly_name"`
-	ComplianceEnabled      bool    `json:"compliance_enabled"`
-	ComplianceOnDemandOnly bool    `json:"compliance_on_demand_only"`
-	DockerEnabled          bool    `json:"docker_enabled"`
+	ID                           string  `json:"id"`
+	Hostname                     *string `json:"hostname"`
+	FriendlyName                 string  `json:"friendly_name"`
+	ComplianceEnabled            bool    `json:"compliance_enabled"`
+	ComplianceOnDemandOnly       bool    `json:"compliance_on_demand_only"`
+	DockerEnabled                bool    `json:"docker_enabled"`
+	ComplianceOpenscapEnabled    bool    `json:"compliance_openscap_enabled"`
+	ComplianceDockerBenchEnabled bool    `json:"compliance_docker_bench_enabled"`
 }
 
 func (q *Queries) ListHostsForComplianceDashboard(ctx context.Context) ([]ListHostsForComplianceDashboardRow, error) {
@@ -609,6 +588,8 @@ func (q *Queries) ListHostsForComplianceDashboard(ctx context.Context) ([]ListHo
 			&i.ComplianceEnabled,
 			&i.ComplianceOnDemandOnly,
 			&i.DockerEnabled,
+			&i.ComplianceOpenscapEnabled,
+			&i.ComplianceDockerBenchEnabled,
 		); err != nil {
 			return nil, err
 		}
@@ -909,7 +890,15 @@ UPDATE hosts SET
     boot_time      = COALESCE($7::timestamptz, boot_time),
     load_average   = COALESCE($8::jsonb, load_average),
     needs_reboot   = COALESCE($9::boolean, needs_reboot),
-    reboot_reason  = $10,
+    -- Not a plain COALESCE: that would make the reason unclearable. Tied to
+    -- needs_reboot so clearing the flag clears both, while a ping asserting the
+    -- flag without a reason leaves the stored one alone.
+    reboot_reason  = CASE
+        WHEN $9::boolean IS NULL THEN reboot_reason
+        WHEN $9::boolean IS TRUE
+             AND $10::text IS NULL THEN reboot_reason
+        ELSE $10::text
+    END,
     agent_version  = COALESCE($11::text, agent_version)
 WHERE id = $12
 `
@@ -929,8 +918,8 @@ type UpdateHostMetricsParams struct {
 	ID           string             `json:"id"`
 }
 
-// Ping-side write of volatile metrics. Each column is COALESCE-guarded so a
-// ping that omits a metric leaves the previous value intact.
+// Ping-side write of volatile metrics. Every column is guarded so a ping that
+// omits a metric leaves the stored value intact.
 func (q *Queries) UpdateHostMetrics(ctx context.Context, arg UpdateHostMetricsParams) error {
 	_, err := q.db.Exec(ctx, updateHostMetrics,
 		arg.CpuCores,

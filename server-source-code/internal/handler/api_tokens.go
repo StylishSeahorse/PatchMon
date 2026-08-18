@@ -11,6 +11,7 @@ import (
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/db"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/middleware"
+	"github.com/PatchMon/PatchMon/server-source-code/internal/pgtime"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -112,7 +113,7 @@ func (h *UserApiTokenHandler) Create(w http.ResponseWriter, r *http.Request) {
 		UserID:    userID,
 		Name:      req.Name,
 		TokenHash: hashToken(rawToken),
-		ExpiresAt: expiresAt,
+		ExpiresAt: pgtime.FromPtr(expiresAt),
 	})
 	if err != nil {
 		if h.log != nil {

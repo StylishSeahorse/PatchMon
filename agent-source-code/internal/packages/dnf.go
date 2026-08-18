@@ -2,15 +2,22 @@ package packages
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"patchmon-agent/pkg/models"
 
 	"github.com/sirupsen/logrus"
 )
+
+// Vendor advisory identifiers all share the shape PREFIX-YEAR:SEQUENCE, for
+// example RHSA-2025:1234, ALSA-2025:11140, RLSA-2025:5678, ELSA-2025-1234.
+var advisoryIDRe = regexp.MustCompile(`^[A-Z]{2,10}-\d{4}[:-]\d+`)
 
 // DNFManager handles dnf/yum package information collection
 type DNFManager struct {
@@ -24,43 +31,52 @@ func NewDNFManager(logger *logrus.Logger) *DNFManager {
 	}
 }
 
-// knownArchitectures lists RPM architecture suffixes used to recognise
-// "name.arch" package identifiers in dnf/yum output.
-var knownArchitectures = map[string]bool{
+// Only these are stripped. Splitting on a dot unconditionally would mangle
+// real names that contain one, e.g. python3.11.
+var rpmArchSuffixes = map[string]bool{
 	"x86_64":  true,
 	"i686":    true,
+	"i586":    true,
 	"i386":    true,
 	"noarch":  true,
 	"aarch64": true,
 	"arm64":   true,
 	"armv7hl": true,
-	"ppc64":   true,
 	"ppc64le": true,
+	"ppc64":   true,
 	"s390x":   true,
 	"riscv64": true,
 	"src":     true,
 }
 
-// stripArchSuffix removes a trailing ".arch" from a package string when the
-// suffix is a known RPM architecture, e.g. "kernel.x86_64" -> "kernel".
-func stripArchSuffix(packageString string) string {
-	if idx := strings.LastIndex(packageString, "."); idx > 0 && knownArchitectures[packageString[idx+1:]] {
-		return packageString[:idx]
+// An RPM EVR is "[epoch:]version-release": it always starts with a digit
+// (epoch or version) and always carries a release separated by a hyphen.
+// Both conditions together are enough to tell a version column apart from
+// an English word.
+func looksLikeRPMVersion(s string) bool {
+	s = strings.TrimPrefix(s, "*") // yum marks obsoleting packages with a leading *
+	if i := strings.Index(s, ":"); i > 0 {
+		if _, err := strconv.Atoi(s[:i]); err == nil {
+			s = s[i+1:]
+		}
 	}
-	return packageString
-}
-
-// isPackageLine reports whether the fields of a "dnf list" / "dnf check-update"
-// output line describe a package. Package lines always start with "name.arch";
-// informational messages that plugins print to stdout do not. Without this
-// check, subscription-manager output such as "This system is not registered
-// with an entitlement server..." is parsed as a package named "This".
-func isPackageLine(fields []string) bool {
-	if len(fields) < 3 {
+	if s == "" || s[0] < '0' || s[0] > '9' {
 		return false
 	}
-	name := fields[0]
-	return name != stripArchSuffix(name)
+	return strings.Contains(s, "-")
+}
+
+// Both parsers must agree: CombinePackageData keys its upgradable set on
+// Package.Name.
+func stripRPMArchSuffix(name string) string {
+	idx := strings.LastIndex(name, ".")
+	if idx <= 0 {
+		return name
+	}
+	if rpmArchSuffixes[name[idx+1:]] {
+		return name[:idx]
+	}
+	return name
 }
 
 // detectPackageManager detects whether to use dnf or yum
@@ -75,7 +91,7 @@ func (m *DNFManager) detectPackageManager() string {
 }
 
 // GetPackages gets package information for RHEL-based systems
-func (m *DNFManager) GetPackages() []models.Package {
+func (m *DNFManager) GetPackages() ([]models.Package, error) {
 	// Determine package manager
 	packageManager := m.detectPackageManager()
 
@@ -92,27 +108,27 @@ func (m *DNFManager) GetPackages() []models.Package {
 	// while dnf uses flag syntax: "dnf list --installed"
 	m.logger.Debug("Getting installed packages...")
 	var listCmd *exec.Cmd
+	var cancelList context.CancelFunc
 	if packageManager == "yum" {
-		listCmd = exec.Command(packageManager, "list", "installed")
+		listCmd, cancelList = boundedCommand(collectorTimeout, packageManager, "list", "installed")
 	} else {
-		listCmd = exec.Command(packageManager, "list", "--installed")
+		listCmd, cancelList = boundedCommand(collectorTimeout, packageManager, "list", "--installed")
 	}
+	defer cancelList()
 	// OPTIMIZATION: Set minimal environment to reduce overhead
 	listCmd.Env = append(os.Environ(), "LANG=C")
 	installedOutput, err := listCmd.Output()
-	var installedPackages map[string]models.Package
 	if err != nil {
-		m.logger.WithError(err).Warn("Failed to get installed packages")
-		installedPackages = make(map[string]models.Package)
-	} else {
-		m.logger.WithField("outputSize", len(installedOutput)).Debug("Received output from list installed command")
-		m.logger.Debug("Parsing installed packages...")
-		installedPackages = m.parseInstalledPackages(string(installedOutput))
-		m.logger.WithField("count", len(installedPackages)).Info("Found installed packages")
+		// An empty inventory reads as "fully patched" in the UI. Fail instead.
+		return nil, commandError(packageManager+" list installed", err)
+	}
+	m.logger.WithField("outputSize", len(installedOutput)).Debug("Received output from list installed command")
+	m.logger.Debug("Parsing installed packages...")
+	installedPackages := m.parseInstalledPackages(string(installedOutput))
+	m.logger.WithField("count", len(installedPackages)).Info("Found installed packages")
 
-		if len(installedPackages) == 0 {
-			m.logger.Warn("No installed packages found - this may indicate a parsing issue")
-		}
+	if len(installedPackages) == 0 {
+		m.logger.Warn("No installed packages found - this may indicate a parsing issue")
 	}
 
 	// Get security updates first to identify which packages are security updates
@@ -122,8 +138,16 @@ func (m *DNFManager) GetPackages() []models.Package {
 
 	// Get upgradable packages
 	m.logger.Debug("Getting upgradable packages...")
-	checkCmd := exec.Command(packageManager, "check-update")
-	checkOutput, _ := checkCmd.Output() // This command returns exit code 100 when updates are available
+	checkCmd, cancelCheck := boundedCommand(networkCollectorTimeout, packageManager, "check-update")
+	defer cancelCheck()
+	checkOutput, checkErr := checkCmd.Output()
+	if checkErr != nil {
+		// check-update exit codes: 0 none, 100 updates available, anything
+		// else a real failure.
+		if !isExitCode(checkErr, 100) {
+			return nil, commandError(packageManager+" check-update", checkErr)
+		}
+	}
 
 	var upgradablePackages []models.Package
 	if len(checkOutput) > 0 {
@@ -152,7 +176,7 @@ func (m *DNFManager) GetPackages() []models.Package {
 		m.logger.Error("WARNING: Returning 0 packages - this will show as empty in PatchMon UI")
 	}
 
-	return packages
+	return packages, nil
 }
 
 // enrichWithRepoAttribution populates SourceRepository for each package by running
@@ -165,17 +189,19 @@ func (m *DNFManager) enrichWithRepoAttribution(packages []models.Package) {
 	packageManager := m.detectPackageManager()
 
 	var cmd *exec.Cmd
+	var cancel context.CancelFunc
 	if packageManager == "dnf" {
-		cmd = exec.Command("dnf", "repoquery", "--installed", "--cacheonly", "--qf", "%{name}\t%{from_repo}")
+		cmd, cancel = boundedCommand(collectorTimeout, "dnf", "repoquery", "--installed", "--cacheonly", "--qf", "%{name}\t%{from_repo}")
 	} else {
 		// yum: try repoquery from yum-utils
 		if _, err := exec.LookPath("repoquery"); err == nil {
-			cmd = exec.Command("repoquery", "--installed", "--qf", "%{name}\t%{ui_from_repo}")
+			cmd, cancel = boundedCommand(collectorTimeout, "repoquery", "--installed", "--qf", "%{name}\t%{ui_from_repo}")
 		} else {
 			// Try yum repoquery (available on some systems)
-			cmd = exec.Command("yum", "repoquery", "--installed", "--qf", "%{name}\t%{ui_from_repo}")
+			cmd, cancel = boundedCommand(collectorTimeout, "yum", "repoquery", "--installed", "--qf", "%{name}\t%{ui_from_repo}")
 		}
 	}
+	defer cancel()
 	cmd.Env = append(os.Environ(), "LANG=C")
 
 	output, err := cmd.Output()
@@ -219,8 +245,7 @@ func (m *DNFManager) enrichWithRepoAttribution(packages []models.Package) {
 			continue
 		}
 		// Strip arch suffix (e.g. "glibc.x86_64" -> "glibc")
-		if idx := strings.LastIndex(name, "."); idx > 0 {
-			baseName := name[:idx]
+		if baseName := stripRPMArchSuffix(name); baseName != name {
 			if repo, ok := repoByName[baseName]; ok {
 				packages[i].SourceRepository = repo
 				attributed++
@@ -235,13 +260,19 @@ func (m *DNFManager) enrichWithRepoAttribution(packages []models.Package) {
 func (m *DNFManager) getSecurityPackages(packageManager string) map[string]bool {
 	securityPackages := make(map[string]bool)
 
+	// Scoped so each variant releases its own context: a function-level defer
+	// would bind to the first cancel func only.
+	runUpdateInfo := func(subcommand string) ([]byte, error) {
+		cmd, cancel := boundedCommand(networkCollectorTimeout, packageManager, "updateinfo", "list", subcommand)
+		defer cancel()
+		return cmd.Output()
+	}
+
 	// Try dnf updateinfo list security (works for dnf)
-	updateInfoCmd := exec.Command(packageManager, "updateinfo", "list", "security")
-	updateInfoOutput, err := updateInfoCmd.Output()
+	updateInfoOutput, err := runUpdateInfo("security")
 	if err != nil {
 		// Fall back to "sec" if "security" doesn't work
-		updateInfoCmd = exec.Command(packageManager, "updateinfo", "list", "sec")
-		updateInfoOutput, err = updateInfoCmd.Output()
+		updateInfoOutput, err = runUpdateInfo("sec")
 	}
 
 	if err != nil {
@@ -267,16 +298,11 @@ func (m *DNFManager) getSecurityPackages(packageManager string) map[string]bool 
 			continue
 		}
 
-		// Skip lines that don't start with advisory IDs
-		// Common advisory ID prefixes: RHSA (Red Hat), ALSA (AlmaLinux), ELSA (Oracle/Enterprise Linux), CESA (CentOS)
-		// This filters out header lines like "expiration"
+		// Match the advisory ID by shape rather than by a list of known
+		// vendor prefixes, so a new distribution does not silently report
+		// zero security updates. Filters out header lines like "expiration".
 		advisoryID := fields[0]
-		isAdvisory := strings.HasPrefix(advisoryID, "RHSA") ||
-			strings.HasPrefix(advisoryID, "ALSA") ||
-			strings.HasPrefix(advisoryID, "ELSA") ||
-			strings.HasPrefix(advisoryID, "CESA")
-
-		if !isAdvisory {
+		if !advisoryIDRe.MatchString(advisoryID) {
 			continue
 		}
 
@@ -304,7 +330,7 @@ func (m *DNFManager) getSecurityPackages(packageManager string) map[string]bool 
 // - package-name.arch (from check-update)
 func (m *DNFManager) extractBasePackageName(packageString string) string {
 	// Remove architecture suffix first (e.g., .x86_64, .noarch)
-	baseName := stripArchSuffix(packageString)
+	baseName := stripRPMArchSuffix(packageString)
 
 	// If the base name contains a version pattern (starts with a digit after a dash),
 	// extract just the package name part
@@ -336,46 +362,41 @@ func (m *DNFManager) parseUpgradablePackages(output string, packageManager strin
 		// Skip header lines and empty lines
 		if line == "" || strings.Contains(line, "Loaded plugins") ||
 			strings.Contains(line, "Last metadata") || strings.HasPrefix(line, "Loading") ||
-            strings.HasPrefix(line, "Updating Subscription") {
+			strings.HasPrefix(line, "Updating Subscription") {
 			continue
 		}
 
 		fields := slices.Collect(strings.FieldsSeq(line))
-		if !isPackageLine(fields) {
+		if len(fields) < 3 {
+			continue
+		}
+		if !looksLikeRPMVersion(fields[1]) {
 			continue
 		}
 
-		packageName := fields[0]
+		// A real row is "name.arch  epoch:version-release  repo". Banner lines
+		// such as "Updating Subscription Management repositories." also have
+		// three or more fields, so the column has to be validated by shape or
+		// they are ingested as packages.
+		if !looksLikeRPMVersion(fields[1]) {
+			continue
+		}
+
+		packageName := stripRPMArchSuffix(fields[0])
 		availableVersion := fields[1]
 
-		// Get current version from installed packages map (already collected)
-		// Try exact match first
+		// Get current version from installed packages map (already collected).
 		var currentVersion string
 		if p, ok := installedPackages[packageName]; ok {
 			currentVersion = p.CurrentVersion
 		}
 
-		// If not found, try to find by base name (handles architecture suffixes)
-		// e.g., if packageName is "package" but installed has "package.x86_64"
-		// or if packageName is "package.x86_64" but installed has "package"
+		// Tolerate an installed map that still holds arch-qualified keys.
 		if currentVersion == "" {
-			// Try to find by removing architecture suffix from packageName (if present)
-			basePackageName := stripArchSuffix(packageName)
-			if basePackageName != packageName {
-				if p, ok := installedPackages[basePackageName]; ok {
+			for installedName, p := range installedPackages {
+				if stripRPMArchSuffix(installedName) == packageName {
 					currentVersion = p.CurrentVersion
-				}
-			}
-
-			// If still not found, search through installed packages for matching base name
-			if currentVersion == "" {
-				for installedName, p := range installedPackages {
-					// Compare base names (handles both cases: package vs package.x86_64)
-					baseName := stripArchSuffix(installedName)
-					if baseName == basePackageName || baseName == packageName {
-						currentVersion = p.CurrentVersion
-						break
-					}
+					break
 				}
 			}
 		}
@@ -384,17 +405,21 @@ func (m *DNFManager) parseUpgradablePackages(output string, packageManager strin
 		if currentVersion == "" {
 			// yum (CentOS 7 / legacy) requires positional argument; dnf accepts --installed flag
 			var getCurrentCmd *exec.Cmd
+			var cancelCurrent context.CancelFunc
 			if packageManager == "yum" {
-				getCurrentCmd = exec.Command(packageManager, "list", "installed", packageName)
+				getCurrentCmd, cancelCurrent = boundedCommand(collectorTimeout, packageManager, "list", "installed", packageName)
 			} else {
-				getCurrentCmd = exec.Command(packageManager, "list", "--installed", packageName)
+				getCurrentCmd, cancelCurrent = boundedCommand(collectorTimeout, packageManager, "list", "--installed", packageName)
 			}
 			getCurrentOutput, err := getCurrentCmd.Output()
+			// Released immediately rather than deferred: this runs once per
+			// upgradable package, so a deferred cancel would accumulate.
+			cancelCurrent()
 			if err == nil {
 				for _, currentLine := range strings.Split(string(getCurrentOutput), "\n") {
 					if strings.Contains(currentLine, packageName) && !strings.Contains(currentLine, "Installed") && !strings.Contains(currentLine, "Available") {
 						currentFields := slices.Collect(strings.FieldsSeq(currentLine))
-						if isPackageLine(currentFields) {
+						if len(currentFields) >= 3 && looksLikeRPMVersion(currentFields[1]) {
 							currentVersion = currentFields[1]
 							break
 						}
@@ -451,8 +476,8 @@ func (m *DNFManager) parseInstalledPackages(output string) map[string]models.Pac
 		parts := strings.Fields(trimmed)
 
 		// Normal single-line format: "name.arch  version  repo"
-		if isPackageLine(parts) {
-			packageName := stripArchSuffix(parts[0])
+		if len(parts) >= 3 && looksLikeRPMVersion(parts[1]) {
+			packageName := stripRPMArchSuffix(parts[0])
 			version := parts[1]
 			installedPackages[packageName] = models.Package{
 				Name:           packageName,
@@ -466,10 +491,10 @@ func (m *DNFManager) parseInstalledPackages(output string) map[string]models.Pac
 		// Wrapped format, line 1: just the package name (no version/repo yet).
 		// Detect by checking the original line starts without leading whitespace
 		// and the trimmed text is a single "name.arch" token.
-		if len(parts) == 1 && parts[0] != stripArchSuffix(parts[0]) &&
+		if len(parts) == 1 && parts[0] != stripRPMArchSuffix(parts[0]) &&
 			!strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
 			// Looks like a bare package name line - remember it
-			pendingName = stripArchSuffix(parts[0])
+			pendingName = stripRPMArchSuffix(parts[0])
 			continue
 		}
 

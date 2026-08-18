@@ -27,9 +27,18 @@ var ErrNotConnected = errors.New("agent not connected")
 // cleared (set to nil) on reconnect. The handler exposes time.Since(*DisconnectedAt)
 // to the frontend as `disconnected_seconds_ago` so the WS pill can show how
 // long the agent has been gone independently of host-report freshness.
+//
+// Scope records which deployment context the agent belongs to. The registry is
+// process-global and keyed on bare api_id, but in a multi-context deployment a
+// single process serves every context in the region, so without this field the
+// connected set is a flat pool with no way to tell whose agent is whose. It is
+// the empty string in single-context deployments, which makes every scoped
+// lookup naturally match the whole fleet. Never serialised: it holds the
+// context's hostname and must not reach an API response.
 type ConnectionInfo struct {
 	Connected       bool       `json:"connected"`
 	Secure          bool       `json:"secure"`
+	Scope           string     `json:"-"`
 	LastConnectedAt *time.Time `json:"last_connected_at,omitempty"`
 	DisconnectedAt  *time.Time `json:"disconnected_at,omitempty"`
 }
@@ -68,13 +77,16 @@ func New() *Registry {
 	}
 }
 
-// Register adds or updates an agent as connected.
-func (r *Registry) Register(apiID string, secure bool) {
+// Register adds or updates an agent as connected. scope is the deployment
+// context the agent belongs to (empty in single-context deployments); pass
+// hostctx.TenantHostKey(ctx) from the request that carried the upgrade.
+func (r *Registry) Register(apiID string, secure bool, scope string) {
 	now := time.Now().UTC()
 	r.mu.Lock()
 	r.meta[apiID] = ConnectionInfo{
 		Connected:       true,
 		Secure:          secure,
+		Scope:           scope,
 		LastConnectedAt: &now,
 		DisconnectedAt:  nil,
 	}
@@ -82,12 +94,17 @@ func (r *Registry) Register(apiID string, secure bool) {
 	r.mu.Unlock()
 	// Publish presence asynchronously (best-effort)
 	if r.rdb != nil {
-		go func() { _ = r.setPresence(apiID, secure) }()
+		go func() { _ = r.setPresence(apiID, secure, scope) }()
 	}
 }
 
 // SetConnection stores the agent WebSocket alongside a fresh per-agent write
 // mutex. Must be called once per upgraded connection.
+//
+// Register must run first: SetConnection carries the context label forward from
+// the existing entry but cannot derive one, since it has no request to read it
+// from. Calling it alone leaves the agent in the empty scope, where scoped
+// lookups in a multi-context deployment will not find it.
 func (r *Registry) SetConnection(apiID string, conn *websocket.Conn) {
 	now := time.Now().UTC()
 	r.mu.Lock()
@@ -102,9 +119,16 @@ func (r *Registry) SetConnection(apiID string, conn *websocket.Conn) {
 	prev.LastConnectedAt = &now
 	prev.DisconnectedAt = nil
 	r.meta[apiID] = prev
+	// Both carried from the Register call that precedes this on the upgrade
+	// path, so the presence record republished below keeps the agent's context
+	// label and its real TLS state. Secure must never be a constant here: the
+	// two publishes race through agent:events, and the pod consumes its own
+	// events, so a hardcoded value wins for roughly half the fleet.
+	scope := prev.Scope
+	secure := prev.Secure
 	r.mu.Unlock()
 	if r.rdb != nil {
-		go func() { _ = r.setPresence(apiID, true) }()
+		go func() { _ = r.setPresence(apiID, secure, scope) }()
 	}
 }
 
@@ -349,12 +373,30 @@ func (r *Registry) EnableDistributed(ctx context.Context, rdb *redisclient.Clien
 }
 
 // snapshotPresence reads existing agent:meta:* keys and populates local maps.
+//
+// It runs once from EnableDistributed, at startup, when this process owns no
+// agent connections at all. A record naming another pod is therefore a claim
+// about a connection someone else holds, and is imported as connected. A
+// record naming US is a leftover from the process we just replaced: its socket
+// died with the old process, so importing it as connected would have the
+// registry assert a connection nothing in this process can write to. That lie
+// reaches operators directly — the WS pill shows connected, the sidebar count
+// is inflated, and host_down alerting is suppressed — for as long as the key
+// survives its 5 minute TTL, or until the agent reconnects and Register
+// overwrites the entry honestly.
+//
+// Own records are imported disconnected instead, stamped from now: the real
+// drop time is unknowable here, and "since this server started" is the honest
+// floor. Residual case not covered: a restart that changes the pod identity
+// (POD_ID unset and the container recreated, so os.Hostname differs) makes our
+// own leftovers indistinguishable from a peer's, and they import as connected
+// until the TTL expires.
 func (r *Registry) snapshotPresence() error {
 	if r.rdb == nil {
 		return fmt.Errorf("redis not configured")
 	}
 	var cursor uint64
-	var total int
+	var total, stale int
 	for {
 		keys, cur, err := r.rdb.Scan(r.distCtx, cursor, "agent:meta:*", 100).Result()
 		if err != nil {
@@ -380,13 +422,25 @@ func (r *Registry) snapshotPresence() error {
 					lastConnected = &t
 				}
 			}
-			r.mu.Lock()
-			r.meta[apiID] = ConnectionInfo{
-				Connected:       true,
+			// An empty pod is treated as ours: it cannot be routed to, so
+			// claiming it is connected is the same unbackable assertion.
+			ours := pod == "" || pod == r.podID
+			info := ConnectionInfo{
+				Connected:       !ours,
 				Secure:          secure,
+				Scope:           vals["scope"],
 				LastConnectedAt: lastConnected,
 			}
-			if pod != "" {
+			if ours {
+				now := time.Now().UTC()
+				info.DisconnectedAt = &now
+				stale++
+			}
+			r.mu.Lock()
+			r.meta[apiID] = info
+			// Only record a route we could actually publish to; publishForward
+			// rejects our own pod anyway.
+			if !ours {
 				r.podMap[apiID] = pod
 			}
 			r.mu.Unlock()
@@ -396,7 +450,7 @@ func (r *Registry) snapshotPresence() error {
 			break
 		}
 	}
-	slog.Info("agentregistry: snapshotPresence loaded", "keys", total)
+	slog.Info("agentregistry: snapshotPresence loaded", "keys", total, "stale_own_pod", stale)
 	return nil
 }
 
@@ -407,10 +461,27 @@ func (r *Registry) handlePubSubMessage(channel string, payload []byte) {
 			Type   string `json:"type"`
 			Pod    string `json:"pod"`
 			Secure bool   `json:"secure"`
+			Scope  string `json:"scope"`
 			TS     string `json:"ts"`
 		}
 		if err := json.Unmarshal(payload, &ev); err != nil {
 			slog.Error("agentregistry: invalid event payload", "error", err)
+			return
+		}
+		// Our own events carry nothing we do not already hold: Register,
+		// SetConnection and markDisconnectedLocked all write meta and podMap
+		// under the lock before the publish leaves the process. Applying them
+		// back is not merely redundant, it reorders. setPresence publishes from
+		// a goroutine while removePresence publishes inline, so a socket that
+		// dies inside that scheduling window delivers connect AFTER disconnect
+		// and the connect branch below rebuilds the entry as connected. Nothing
+		// then clears it — meta has no TTL — so the agent is a ghost for the
+		// life of the process: host_down suppressed, sidebar count inflated,
+		// every send failing with ErrNotConnected.
+		r.mu.RLock()
+		self := r.podID
+		r.mu.RUnlock()
+		if ev.Pod == self {
 			return
 		}
 		r.mu.Lock()
@@ -423,6 +494,7 @@ func (r *Registry) handlePubSubMessage(channel string, payload []byte) {
 			r.meta[ev.APIID] = ConnectionInfo{
 				Connected:       true,
 				Secure:          ev.Secure,
+				Scope:           ev.Scope,
 				LastConnectedAt: &now,
 				DisconnectedAt:  nil,
 			}
@@ -469,7 +541,7 @@ func (r *Registry) handlePubSubMessage(channel string, payload []byte) {
 	}
 }
 
-func (r *Registry) publishEvent(apiID, typ string, secure bool) error {
+func (r *Registry) publishEvent(apiID, typ string, secure bool, scope string) error {
 	if r.rdb == nil {
 		return fmt.Errorf("redis not configured")
 	}
@@ -478,24 +550,25 @@ func (r *Registry) publishEvent(apiID, typ string, secure bool) error {
 		"type":   typ,
 		"pod":    r.podID,
 		"secure": secure,
+		"scope":  scope,
 		"ts":     time.Now().UTC().Format(time.RFC3339),
 	}
 	b, _ := json.Marshal(ev)
 	return r.rdb.Publish(r.distCtx, "agent:events", b).Err()
 }
 
-func (r *Registry) setPresence(apiID string, secure bool) error {
+func (r *Registry) setPresence(apiID string, secure bool, scope string) error {
 	if r.rdb == nil {
 		return fmt.Errorf("redis not configured")
 	}
 	key := fmt.Sprintf("agent:meta:%s", apiID)
-	vals := map[string]interface{}{`pod`: r.podID, `secure`: secure, `last_seen`: time.Now().UTC().Format(time.RFC3339)}
+	vals := map[string]interface{}{`pod`: r.podID, `secure`: secure, `scope`: scope, `last_seen`: time.Now().UTC().Format(time.RFC3339)}
 	if err := r.rdb.HSet(r.distCtx, key, vals).Err(); err != nil {
 		return err
 	}
 	// keep a TTL so crashed pods eventually expire
 	_ = r.rdb.Expire(r.distCtx, key, 5*time.Minute).Err()
-	_ = r.publishEvent(apiID, "connect", secure)
+	_ = r.publishEvent(apiID, "connect", secure, scope)
 	return nil
 }
 
@@ -507,16 +580,27 @@ func (r *Registry) removePresence(apiID string) error {
 	if err := r.rdb.Del(r.distCtx, key).Err(); err != nil {
 		return err
 	}
-	_ = r.publishEvent(apiID, "disconnect", false)
+	// Scope is deliberately empty on disconnect: the receiving side only flips
+	// Connected on an entry it already holds, and a disconnected entry is never
+	// counted, so the label would go unread. Connect events carry the real one.
+	_ = r.publishEvent(apiID, "disconnect", false, "")
 	return nil
 }
 
+// Publishing to our own channel would be delivered back into
+// handlePubSubMessage and re-published, an unbounded loop that wedges the
+// pubsub consumer. podMap names the local pod with no conn after
+// snapshotPresence, and briefly during Register.
 func (r *Registry) publishForward(apiID string, messageType int, data []byte) error {
 	r.mu.RLock()
 	pod := r.podMap[apiID]
+	self := r.podID
 	r.mu.RUnlock()
 	if pod == "" {
 		return fmt.Errorf("no remote pod for apiID")
+	}
+	if pod == self {
+		return ErrNotConnected
 	}
 	b64 := base64.StdEncoding.EncodeToString(data)
 	fwd := map[string]any{"api_id": apiID, "message_type": messageType, "data": b64}
@@ -525,17 +609,42 @@ func (r *Registry) publishForward(apiID string, messageType int, data []byte) er
 	return r.rdb.Publish(r.distCtx, ch, b).Err()
 }
 
-// GetConnectedApiIDs returns all api_ids that are currently connected.
-func (r *Registry) GetConnectedApiIDs() []string {
+// GetConnectedApiIDs returns the api_ids currently connected within scope.
+//
+// scope MUST be the caller's deployment context (hostctx.TenantHostKey(ctx)).
+// It is a required argument rather than an option because the registry pools
+// every context this process serves: anything that fans out over the result,
+// such as a settings push or a collection trigger, would otherwise reach other
+// contexts' agents. In single-context deployments the key is empty and this
+// returns the whole fleet.
+func (r *Registry) GetConnectedApiIDs(scope string) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var ids []string
 	for id, info := range r.meta {
-		if info.Connected {
+		if info.Connected && info.Scope == scope {
 			ids = append(ids, id)
 		}
 	}
 	return ids
+}
+
+// CountConnected returns how many agents are currently connected within scope.
+// See GetConnectedApiIDs for what scope means and why it is mandatory.
+//
+// This answers the WS status summary endpoint entirely from memory: one RLock,
+// no allocation and no database round-trip, which matters because the sidebar
+// polls it every 10 seconds on every page for every signed-in user.
+func (r *Registry) CountConnected(scope string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, info := range r.meta {
+		if info.Connected && info.Scope == scope {
+			n++
+		}
+	}
+	return n
 }
 
 // GetBulk returns connection info for multiple api_ids. Disconnected entries

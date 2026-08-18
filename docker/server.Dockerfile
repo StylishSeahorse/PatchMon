@@ -5,8 +5,8 @@ RUN apk add --no-cache git ca-certificates tzdata curl nodejs npm
 
 WORKDIR /app
 
-# Copy agent scripts and binaries (same layout as production; run `make build-all-for-docker` in agent-source-code if agents-prebuilt is missing)
-COPY agents ./agents/
+# Copy agent binaries (run `make build-all-for-docker` in agent-source-code if agents-prebuilt is missing).
+# Scripts are not copied: they are go:embed'ed into the server binary.
 COPY --chmod=755 agents-prebuilt/patchmon-agent-* ./agents/
 
 # Build frontend for embed
@@ -31,63 +31,6 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=5 \
 ENV AGENTS_DIR=/app/agents
 ENV PORT=3000
 CMD ["go", "run", "./cmd/server"]
-
-# Frontend builder stage for production.
-#
-# Pinned to $BUILDPLATFORM. The output is static JS/CSS/HTML (see the COPY of
-# /app/frontend/dist below), which is architecture-independent, so there is
-# nothing to gain from building it once per target platform — and a great deal
-# to lose. Without this pin BuildKit instantiates this stage for every
-# --platform in the build, so the linux/arm64 variant runs Node and npm under
-# QEMU user-mode emulation on an amd64 runner. That crashed `npm ci` with
-# "qemu: uncaught target signal 4 (Illegal instruction)" and exit code 132,
-# while the native amd64 variant of the same step succeeded in seconds.
-#
-# Pinning also roughly halves this stage's wall-clock cost, since the install
-# and the Vite build no longer run twice. The consumer of dist is the `builder`
-# stage, which is itself $BUILDPLATFORM-pinned, so nothing downstream needs a
-# target-architecture copy of these files.
-FROM --platform=$BUILDPLATFORM dhi.io/node:22-debian13-dev AS frontend-builder
-
-WORKDIR /app
-
-# Install from the committed lockfile so the image resolves exactly the versions
-# the host and CI resolve. The previous "rm package-lock.json && npm install
-# --force" left the image free to pick any version matching the semver ranges,
-# which silently broke the build when react-icons 5.7.0 dropped SiSlack.
-#
-# frontend is an npm workspace member and the lockfile lives at the repo root,
-# so both manifests must be present before npm ci can run.
-COPY package.json package-lock.json ./
-COPY frontend/package.json ./frontend/
-
-RUN npm ci --workspace=patchmon-frontend --include=dev --ignore-scripts --no-audit \
-    && npm cache clean --force
-
-COPY frontend/ ./frontend/
-
-WORKDIR /app/frontend
-
-RUN npm run build
-
-# Build stage - server (runs on amd64, cross-compiles for target platform)
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
-
-RUN apk add --no-cache git ca-certificates tzdata
-
-WORKDIR /app
-
-# Copy server source
-COPY server-source-code/ ./server/
-# Copy built frontend into embed directory
-COPY --from=frontend-builder /app/frontend/dist ./server/cmd/server/static/frontend/dist
-
-WORKDIR /app/server
-
-ARG TARGETOS
-ARG TARGETARCH
-RUN go mod download && \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -buildvcs=false -ldflags="-s -w" -o /app/patchmon-server ./cmd/server
 
 # SSG content stage — download ComplianceAsCode datastream files at build time.
 # Pass --build-arg SSG_VERSION=0.1.80 to pin a specific version; otherwise
@@ -127,14 +70,17 @@ FROM dhi.io/alpine-base:3.23
 
 WORKDIR /app
 
-# Copy binary (migrations and frontend are embedded in the binary)
-COPY --from=builder /app/patchmon-server ./
+# Prebuilt by CI or by docker/build.sh, the same way agents-prebuilt/ is. The
+# version, community counts, frontend and release notes are all baked in at
+# compile time, so this image and the release assets are the same binary.
+ARG TARGETARCH
+COPY --chmod=755 server-prebuilt/patchmon-server-linux-${TARGETARCH} ./patchmon-server
 
 # Copy SSG content (SCAP datastream files for compliance scanning)
 COPY --from=ssg-content /ssg-content ./ssg-content/
 
-# Copy agent scripts and binaries to /app/agents (in-image, read-only; no volume)
-COPY agents ./agents/
+# Copy agent binaries to /app/agents (in-image, read-only; no volume).
+# Scripts are not copied: they are go:embed'ed into the server binary.
 COPY --chmod=755 agents-prebuilt/patchmon-agent-* ./agents/
 
 # Entrypoint starts server (no volume copy; agents served from image)
