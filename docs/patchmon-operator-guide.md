@@ -306,6 +306,14 @@ docker compose logs database
 
 Verify that `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` in your `.env` are set and consistent.
 
+#### Server fails to start: password authentication failed
+
+```
+[fatal] migrations failed: ... pq: password authentication failed for user "patchmon_user"
+```
+
+The database is up and reachable, but `POSTGRES_PASSWORD` in `.env` is not the password stored in the `postgres_data` volume. Postgres only picks that password up when it initialises an empty volume, so changing it in `.env` afterwards — most often by re-running `setup-env.sh` on an existing install — leaves the two out of step. See [Database Password Mismatch](#database-password-mismatch) for the recovery steps; both of them keep your data.
+
 #### Server fails to start: Redis connection refused
 
 ```bash
@@ -6082,6 +6090,7 @@ Look at the first 30 lines. The crash cause is almost always logged right there.
 | `config: DATABASE_URL is required` | `DATABASE_URL` is empty or missing from `.env` | Set `DATABASE_URL=postgresql://user:pass@database:5432/patchmon?sslmode=disable` in `.env` and `docker compose up -d`. |
 | `config: JWT_SECRET is required` | `JWT_SECRET` is missing | Generate one: `openssl rand -base64 48`. Add to `.env`. |
 | `migrations failed: ...` | Database migration error at boot | See **Database Migration Errors** below. |
+| `migrations failed: ... pq: password authentication failed for user` | `POSTGRES_PASSWORD` in `.env` no longer matches the password stored in the database volume | See **Database Password Mismatch** below. |
 | `database: ...: connect: connection refused` | Postgres is not yet healthy or `DATABASE_URL` hostname is wrong | `docker compose ps database` and ensure it shows `healthy`. The hostname in `DATABASE_URL` must match the service name in `docker-compose.yml` (`database`, not `localhost`). |
 | `redis: ... NOAUTH Authentication required` | Server is connecting to Redis without a password but Redis has one set | Set `REDIS_PASSWORD` to the same value as the one passed to `redis-server --requirepass` in `docker-compose.yml`. Both are read from the same `.env`. |
 | `encryption init failed` | Bootstrap tokens / OIDC secrets will not work. Set at least one of `DATABASE_URL`, `SESSION_SECRET`, or `AI_ENCRYPTION_KEY`. | Set `SESSION_SECRET` in `.env` (32+ characters, random). |
@@ -6095,6 +6104,62 @@ docker compose run --rm --entrypoint /bin/sh server
 ```
 
 From the resulting shell you can `env | grep -E 'DATABASE_URL|REDIS|JWT'` and test connectivity with `nc -zv database 5432` and `redis-cli -h redis -a "$REDIS_PASSWORD" ping`.
+
+#### Database Password Mismatch
+
+##### Symptoms
+
+The server crash-loops, and each restart adds a matching pair of lines to the two logs:
+
+```
+server-1    | [fatal] migrations failed: create migrate instance: failed to open database: pq: password authentication failed for user "patchmon_user" (28P01)
+database-1  | FATAL:  password authentication failed for user "patchmon_user"
+```
+
+The database container itself is healthy and logs `database system is ready to accept connections`, usually just above `PostgreSQL Database directory appears to contain a database; Skipping initialization`.
+
+##### Cause
+
+Postgres reads `POSTGRES_PASSWORD` **only** when it initialises an empty data directory. From then on the password lives in the `postgres_data` volume, and changing `POSTGRES_PASSWORD` in `.env` has no effect on it — the new value is simply a password the database has never heard of.
+
+The usual way to get here is re-running `setup-env.sh` on an existing install. Older versions of the script overwrote `.env` unconditionally and generated a fresh `POSTGRES_PASSWORD` every time. Editing the password by hand, or restoring a `.env` from a different install, does the same thing.
+
+##### Fix
+
+Both routes below keep your data. Pick whichever is more convenient.
+
+**Option A — put the old password back in `.env`.** Best when you still have it, for example in a `.env.bak.*` file written by `setup-env.sh`:
+
+```bash
+grep '^POSTGRES_PASSWORD=' .env.bak.*
+```
+
+Copy that value into `POSTGRES_PASSWORD=` in `.env`, then `docker compose up -d`.
+
+> `DATABASE_URL` in `.env` references `${POSTGRES_PASSWORD}`, so it follows automatically. If you have hardcoded the password into `DATABASE_URL` instead, update it there as well.
+
+**Option B — set the new password on the database.** Best when the old password is gone. The `psql` session runs inside the container over a Unix socket, which the image trusts without a password, so this works even though TCP logins are failing:
+
+```bash
+docker compose up -d database
+
+# Read the password your .env now expects, and apply it to the role
+docker compose exec database psql -U "$(grep '^POSTGRES_USER=' .env | cut -d= -f2-)" \
+  -d "$(grep '^POSTGRES_DB=' .env | cut -d= -f2-)" \
+  -c "ALTER USER \"$(grep '^POSTGRES_USER=' .env | cut -d= -f2-)\" WITH PASSWORD '$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2-)';"
+
+docker compose up -d
+```
+
+`docker compose logs -f server` should then show the migrations running instead of the authentication failure.
+
+##### If the other secrets were regenerated too
+
+A re-run of the old `setup-env.sh` rotated `JWT_SECRET`, `SESSION_SECRET`, and `AI_ENCRYPTION_KEY` alongside the passwords. Once the database is reachable again, check the rest of `.env` against your backup:
+
+- `JWT_SECRET` — a new value only logs everyone out. Harmless.
+- `AI_ENCRYPTION_KEY` / `SESSION_SECRET` — these decrypt values already stored in the database (bootstrap tokens, OIDC client secrets, AI provider keys). Restore the originals from `.env.bak.*`, or expect to re-enter those secrets in the UI.
+- `REDIS_PASSWORD` — safe to change. Redis takes it from `--requirepass` at every start, so nothing is persisted.
 
 ### 2. Database Migration Errors at Boot
 

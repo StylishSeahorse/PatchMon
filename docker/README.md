@@ -42,6 +42,8 @@ docker compose up -d
 
 Access the application at the URL you configured (default: `http://localhost:3000`).
 
+The script is safe to re-run: it backs up your `.env` to `.env.bak.<timestamp>`, keeps the existing file, and only generates secrets that are still empty. Pass `--force` to start over from `env.example` instead — but only if you are also starting from an empty database volume, since a regenerated `POSTGRES_PASSWORD` will not match a `postgres_data` volume that already exists.
+
 #### Manual
 
 1. Download the Docker Compose file and environment example:

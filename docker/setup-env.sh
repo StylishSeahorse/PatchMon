@@ -4,18 +4,44 @@
 # =============================================================================
 # Downloads docker-compose.yml and env.example if not already present,
 # then:
-# 1. Copies env.example to .env
-# 2. Generates and injects POSTGRES_PASSWORD, REDIS_PASSWORD (32 hex)
-# 3. Generates and injects JWT_SECRET, SESSION_SECRET, AI_ENCRYPTION_KEY (64 hex)
+# 1. Creates .env from env.example (an existing .env is kept, see below)
+# 2. Fills in any empty POSTGRES_PASSWORD, REDIS_PASSWORD (32 hex)
+# 3. Fills in any empty JWT_SECRET, SESSION_SECRET, AI_ENCRYPTION_KEY (64 hex)
 # 4. Interactively configures CORS_ORIGIN, TRUST_PROXY, and TZ
+#
+# Re-running the script is safe: an existing .env is backed up and kept, and
+# only secrets that are still empty get generated. That matters most for
+# POSTGRES_PASSWORD, which Postgres bakes into the data volume the first time
+# it initialises: handing it a new password later does not change the stored
+# one, it just makes the server fail to log in with
+# "password authentication failed for user". Use --force only when you also
+# intend to start from an empty database volume.
 #
 # Run from any directory:
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/PatchMon/PatchMon/refs/heads/main/docker/setup-env.sh)"
 # Or if already downloaded:
-#   ./setup-env.sh
+#   ./setup-env.sh            # keep an existing .env, fill in what is missing
+#   ./setup-env.sh --force    # discard .env and generate a fresh set of secrets
 # =============================================================================
 
 set -e
+
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    -f|--force)
+      FORCE=1
+      ;;
+    -h|--help)
+      sed -n '2,26p' "${BASH_SOURCE[0]}" 2>/dev/null || true
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg (supported: --force)" >&2
+      exit 1
+      ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -46,23 +72,109 @@ if [ ! -f "./env.example" ]; then
   echo "env.example downloaded."
 fi
 
-echo "Copying env.example to .env"
-cp env.example .env
+# -----------------------------------------------------------------------------
+# Create or preserve .env
+# -----------------------------------------------------------------------------
+# Re-running this script used to overwrite .env with a fresh env.example and a
+# fresh set of secrets. That silently breaks an existing install: Postgres only
+# reads POSTGRES_PASSWORD when it initialises an empty data directory, so a
+# regenerated password never reaches the database and every later connection
+# fails with "password authentication failed for user". Keep the existing file
+# by default and only fill in what is still empty.
+TIMESTAMP="$(date +%Y%m%d%H%M%S)"
 
-# Generate secrets: one 64-hex for JWT/SESSION/AI, one 32-hex for both passwords
-HEX64=$(openssl rand -hex 64)
-HEX32=$(openssl rand -hex 32)
+if [ -f .env ]; then
+  cp .env ".env.bak.$TIMESTAMP"
+  echo "Existing .env backed up to .env.bak.$TIMESTAMP"
+  if [ "$FORCE" -eq 1 ]; then
+    echo "--force given: replacing .env with a fresh copy of env.example."
+    echo "WARNING: this regenerates POSTGRES_PASSWORD. If the database volume"
+    echo "         already exists it still holds the old password, and the"
+    echo "         server will fail to connect until you either delete the"
+    echo "         volume or change the password inside Postgres."
+    cp env.example .env
+  else
+    echo "Keeping it. Only secrets that are still empty will be generated."
+    echo "(Run with --force to start over from env.example.)"
+  fi
+else
+  echo "Copying env.example to .env"
+  cp env.example .env
+fi
 
-# Inject 32-char secrets (same value for POSTGRES_PASSWORD and REDIS_PASSWORD)
-sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$HEX32/" .env
-sed -i "s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=$HEX32/" .env
+echo ""
 
-# Inject 64-char secrets (same value for JWT_SECRET, SESSION_SECRET, AI_ENCRYPTION_KEY)
-sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$HEX64/" .env
-sed -i "s/^AI_ENCRYPTION_KEY=.*/AI_ENCRYPTION_KEY=$HEX64/" .env
-sed -i "s/^SESSION_SECRET=.*/SESSION_SECRET=$HEX64/" .env
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
-echo "Done. .env created with generated secrets."
+# Read the value of KEY from .env, empty if the key is absent or commented out.
+read_env_var() {
+  [ -f .env ] || return 0
+  grep -E "^$1=" .env | tail -n 1 | cut -d= -f2- || true
+}
+
+# Set KEY=VALUE in .env, appending the line if it is not already there.
+# perl rather than sed because generated values and URLs contain / and &.
+set_env_var() {
+  PM_KEY="$1" PM_VALUE="$2" perl -i -pe 's/^\Q$ENV{PM_KEY}\E=.*/$ENV{PM_KEY}=$ENV{PM_VALUE}/' .env
+  if ! grep -qE "^$1=" .env; then
+    printf '%s=%s\n' "$1" "$2" >> .env
+  fi
+}
+
+# Generate KEY only when it has no value yet, so re-runs keep working secrets.
+# Each secret gets its own random value.
+ensure_secret() {
+  local key="$1" bytes="$2"
+  if [ -n "$(read_env_var "$key")" ]; then
+    echo "  $key: kept"
+    return 0
+  fi
+  set_env_var "$key" "$(openssl rand -hex "$bytes")"
+  echo "  $key: generated"
+  GENERATED_SECRETS="$GENERATED_SECRETS $key"
+}
+
+# -----------------------------------------------------------------------------
+# Secrets
+# -----------------------------------------------------------------------------
+GENERATED_SECRETS=""
+
+echo "Secrets:"
+ensure_secret POSTGRES_PASSWORD 32
+ensure_secret REDIS_PASSWORD 32
+ensure_secret JWT_SECRET 64
+ensure_secret SESSION_SECRET 64
+ensure_secret AI_ENCRYPTION_KEY 64
+
+# A generated POSTGRES_PASSWORD only reaches Postgres on a first start with an
+# empty data directory. If the volume is already there, say so now rather than
+# letting the server crash-loop on an authentication failure later.
+case " $GENERATED_SECRETS " in
+  *" POSTGRES_PASSWORD "*)
+    if command -v docker >/dev/null 2>&1 &&
+       docker volume ls -q 2>/dev/null | grep -qx "patchmon_postgres_data"; then
+      echo ""
+      echo "WARNING: the patchmon_postgres_data volume already exists, so the"
+      echo "         database still uses its original password and will reject"
+      echo "         the one just written to .env."
+      echo ""
+      echo "         Point .env at the existing database by restoring the old"
+      echo "         POSTGRES_PASSWORD from a .env.bak.* file, or set the new"
+      echo "         password on the database itself:"
+      echo ""
+      echo "           docker compose up -d database"
+      echo "           docker compose exec database psql -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" \\"
+      echo "             -c \"ALTER USER \\\"\$POSTGRES_USER\\\" WITH PASSWORD '<new password>';\""
+      echo ""
+      echo "         Deleting the volume also works, and destroys all PatchMon data."
+    fi
+    ;;
+esac
+
+echo ""
+echo "Done. .env is ready."
 echo ""
 
 # -----------------------------------------------------------------------------
@@ -74,8 +186,15 @@ echo "PatchMon runs on port 3000 by default. If using a reverse proxy or differe
 echo ""
 
 # Reverse proxy / TRUST_PROXY
-read -r -p "Will you be accessing PatchMon via a reverse proxy (nginx, Caddy, etc.)? (y/n) [n]: " use_proxy
-use_proxy=${use_proxy:-n}
+# Default the prompt to whatever .env already says, so pressing enter on a
+# re-run keeps the current setting instead of resetting it.
+if [ "$(read_env_var TRUST_PROXY)" = "true" ]; then
+  proxy_default="y"
+else
+  proxy_default="n"
+fi
+read -r -p "Will you be accessing PatchMon via a reverse proxy (nginx, Caddy, etc.)? (y/n) [$proxy_default]: " use_proxy
+use_proxy=${use_proxy:-$proxy_default}
 if [ "$use_proxy" = "y" ] || [ "$use_proxy" = "Y" ]; then
   TRUST_PROXY_VALUE="true"
   echo "TRUST_PROXY will be set to true (server will trust X-Forwarded-* headers)."
