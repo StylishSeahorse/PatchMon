@@ -486,6 +486,7 @@ type PatchPolicy struct {
 	RecurrenceCron      *string          `json:"recurrence_cron"`
 	RecurrenceNextRunAt pgtype.Timestamp `json:"recurrence_next_run_at"`
 	RecurrenceLastRunAt pgtype.Timestamp `json:"recurrence_last_run_at"`
+	AutoReboot          bool             `json:"auto_reboot"`
 	CreatedAt           pgtype.Timestamp `json:"created_at"`
 	UpdatedAt           pgtype.Timestamp `json:"updated_at"`
 }

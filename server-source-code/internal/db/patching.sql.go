@@ -272,7 +272,7 @@ func (q *Queries) ExistsPatchPolicyExclusion(ctx context.Context, arg ExistsPatc
 }
 
 const getDirectPatchPolicyAssignment = `-- name: GetDirectPatchPolicyAssignment :one
-SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.recurrence_cron, pp.recurrence_next_run_at, pp.recurrence_last_run_at, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
+SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.recurrence_cron, pp.recurrence_next_run_at, pp.recurrence_last_run_at, pp.auto_reboot, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
 JOIN patch_policies pp ON ppa.patch_policy_id = pp.id
 WHERE ppa.target_type = 'host' AND ppa.target_id = $1
 ORDER BY ppa.created_at ASC
@@ -294,6 +294,7 @@ func (q *Queries) GetDirectPatchPolicyAssignment(ctx context.Context, targetID s
 		&i.RecurrenceCron,
 		&i.RecurrenceNextRunAt,
 		&i.RecurrenceLastRunAt,
+		&i.AutoReboot,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -343,7 +344,7 @@ func (q *Queries) GetPatchPolicyAssignmentByID(ctx context.Context, id string) (
 }
 
 const getPatchPolicyByGroupAssignment = `-- name: GetPatchPolicyByGroupAssignment :one
-SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.recurrence_cron, pp.recurrence_next_run_at, pp.recurrence_last_run_at, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
+SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.recurrence_cron, pp.recurrence_next_run_at, pp.recurrence_last_run_at, pp.auto_reboot, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
 JOIN patch_policies pp ON ppa.patch_policy_id = pp.id
 WHERE ppa.target_type = 'host_group' AND ppa.target_id = $1
 ORDER BY ppa.created_at ASC
@@ -364,6 +365,7 @@ func (q *Queries) GetPatchPolicyByGroupAssignment(ctx context.Context, targetID 
 		&i.RecurrenceCron,
 		&i.RecurrenceNextRunAt,
 		&i.RecurrenceLastRunAt,
+		&i.AutoReboot,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -371,7 +373,7 @@ func (q *Queries) GetPatchPolicyByGroupAssignment(ctx context.Context, targetID 
 }
 
 const getPatchPolicyByID = `-- name: GetPatchPolicyByID :one
-SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies WHERE id = $1
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, auto_reboot, created_at, updated_at FROM patch_policies WHERE id = $1
 `
 
 func (q *Queries) GetPatchPolicyByID(ctx context.Context, id string) (PatchPolicy, error) {
@@ -388,6 +390,7 @@ func (q *Queries) GetPatchPolicyByID(ctx context.Context, id string) (PatchPolic
 		&i.RecurrenceCron,
 		&i.RecurrenceNextRunAt,
 		&i.RecurrenceLastRunAt,
+		&i.AutoReboot,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -640,7 +643,7 @@ func (q *Queries) ListHostIDsInGroup(ctx context.Context, hostGroupID string) ([
 }
 
 const listPatchPolicies = `-- name: ListPatchPolicies :many
-SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies ORDER BY name ASC
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, auto_reboot, created_at, updated_at FROM patch_policies ORDER BY name ASC
 `
 
 // patch_policies
@@ -664,6 +667,7 @@ func (q *Queries) ListPatchPolicies(ctx context.Context) ([]PatchPolicy, error) 
 			&i.RecurrenceCron,
 			&i.RecurrenceNextRunAt,
 			&i.RecurrenceLastRunAt,
+			&i.AutoReboot,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -678,7 +682,7 @@ func (q *Queries) ListPatchPolicies(ctx context.Context) ([]PatchPolicy, error) 
 }
 
 const listPatchPoliciesRecurrenceDue = `-- name: ListPatchPoliciesRecurrenceDue :many
-SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, auto_reboot, created_at, updated_at FROM patch_policies
 WHERE recurrence_cron IS NOT NULL AND recurrence_next_run_at IS NOT NULL AND recurrence_next_run_at <= $1
 ORDER BY recurrence_next_run_at ASC
 `
@@ -703,6 +707,7 @@ func (q *Queries) ListPatchPoliciesRecurrenceDue(ctx context.Context, dueBefore 
 			&i.RecurrenceCron,
 			&i.RecurrenceNextRunAt,
 			&i.RecurrenceLastRunAt,
+			&i.AutoReboot,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -717,7 +722,7 @@ func (q *Queries) ListPatchPoliciesRecurrenceDue(ctx context.Context, dueBefore 
 }
 
 const listPatchPoliciesWithRecurrence = `-- name: ListPatchPoliciesWithRecurrence :many
-SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies WHERE recurrence_cron IS NOT NULL
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, auto_reboot, created_at, updated_at FROM patch_policies WHERE recurrence_cron IS NOT NULL
 `
 
 func (q *Queries) ListPatchPoliciesWithRecurrence(ctx context.Context) ([]PatchPolicy, error) {
@@ -740,6 +745,7 @@ func (q *Queries) ListPatchPoliciesWithRecurrence(ctx context.Context) ([]PatchP
 			&i.RecurrenceCron,
 			&i.RecurrenceNextRunAt,
 			&i.RecurrenceLastRunAt,
+			&i.AutoReboot,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -2158,6 +2164,20 @@ func (q *Queries) RequeuePatchRun(ctx context.Context, arg RequeuePatchRunParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setPatchPolicyAutoReboot = `-- name: SetPatchPolicyAutoReboot :exec
+UPDATE patch_policies SET auto_reboot = $1, updated_at = NOW() WHERE id = $2
+`
+
+type SetPatchPolicyAutoRebootParams struct {
+	AutoReboot bool   `json:"auto_reboot"`
+	ID         string `json:"id"`
+}
+
+func (q *Queries) SetPatchPolicyAutoReboot(ctx context.Context, arg SetPatchPolicyAutoRebootParams) error {
+	_, err := q.db.Exec(ctx, setPatchPolicyAutoReboot, arg.AutoReboot, arg.ID)
+	return err
 }
 
 const setPatchPolicyRecurrence = `-- name: SetPatchPolicyRecurrence :exec

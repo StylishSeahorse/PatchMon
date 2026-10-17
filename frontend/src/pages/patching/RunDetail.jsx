@@ -386,7 +386,7 @@ const RunDetail = () => {
 		if (!snap) return null;
 		const type = snap.patch_delay_type;
 		if (snap.trigger === "scheduled")
-			return `Scheduled run (${snap.recurrence_cron || "recurring policy"})`;
+			return `Scheduled run (${snap.recurrence_cron || "recurring policy"})${snap.auto_reboot ? ", reboots if required" : ""}`;
 		if (type === "immediate") return "Runs immediately on trigger";
 		if (type === "delayed" && snap.delay_minutes != null)
 			return `Delayed by ${snap.delay_minutes} min after trigger`;

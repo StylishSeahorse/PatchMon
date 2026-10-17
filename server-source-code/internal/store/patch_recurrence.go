@@ -50,6 +50,12 @@ func NextRecurrence(expr, tz string, from time.Time) (time.Time, error) {
 	return next.UTC(), nil
 }
 
+// SetAutoReboot sets whether scheduled runs of a policy reboot the host after a
+// successful run when the host reports a pending reboot.
+func (s *PatchPoliciesStore) SetAutoReboot(ctx context.Context, id string, autoReboot bool) error {
+	return s.db.DB(ctx).Queries.SetPatchPolicyAutoReboot(ctx, db.SetPatchPolicyAutoRebootParams{ID: id, AutoReboot: autoReboot})
+}
+
 // SetRecurrence sets or clears (expr nil) the recurring schedule of a policy.
 // tz is the organisation timezone the schedule is read in.
 func (s *PatchPoliciesStore) SetRecurrence(ctx context.Context, id string, expr *string, tz string) error {

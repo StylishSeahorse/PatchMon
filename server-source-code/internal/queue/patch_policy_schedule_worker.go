@@ -219,6 +219,7 @@ func (h *PatchPolicyScheduleHandler) startRun(ctx context.Context, d *database.D
 		"fixed_time_utc":   p.FixedTimeUtc,
 		"timezone":         p.Timezone,
 		"recurrence_cron":  p.RecurrenceCron,
+		"auto_reboot":      p.AutoReboot,
 		"trigger":          "scheduled",
 	})
 	runID := uuid.New().String()
@@ -239,6 +240,8 @@ func (h *PatchPolicyScheduleHandler) startRun(ctx context.Context, d *database.D
 		ApiID:      host.ApiID,
 		PatchRunID: runID,
 		PatchType:  "patch_all",
+
+		RebootIfRequired: p.AutoReboot,
 	})
 	if err == nil {
 		_, err = h.qc.Enqueue(task)

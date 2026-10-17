@@ -1364,6 +1364,7 @@ function PoliciesTab() {
 		delay_minutes: 60,
 		fixed_time_utc: "03:00",
 		recurrence: { ...DEFAULT_RECURRENCE },
+		auto_reboot: false,
 	});
 	const [expandedPolicyId, setExpandedPolicyId] = useState(null);
 
@@ -1425,6 +1426,7 @@ function PoliciesTab() {
 			delay_minutes: 60,
 			fixed_time_utc: "03:00",
 			recurrence: { ...DEFAULT_RECURRENCE },
+			auto_reboot: false,
 		});
 
 	const openCreate = () => {
@@ -1442,12 +1444,20 @@ function PoliciesTab() {
 			delay_minutes: policy.delay_minutes ?? 60,
 			fixed_time_utc: policy.fixed_time_utc || "03:00",
 			recurrence: parseRecurrenceCron(policy.recurrence_cron),
+			auto_reboot: policy.auto_reboot || false,
 		});
 		setShowModal(true);
 	};
 
 	const handleSubmit = (e) => {
 		e.preventDefault();
+		if (
+			form.recurrence.mode === "weekly" &&
+			form.recurrence.weekdays.length === 0
+		) {
+			toast.error("Select at least one day to repeat on");
+			return;
+		}
 		const payload = {
 			name: form.name.trim(),
 			description: form.description.trim() || null,
@@ -1457,6 +1467,7 @@ function PoliciesTab() {
 			fixed_time_utc:
 				form.patch_delay_type === "fixed_time" ? form.fixed_time_utc : null,
 			recurrence_cron: buildRecurrenceCron(form.recurrence),
+			auto_reboot: form.recurrence.mode !== "none" && form.auto_reboot,
 		};
 		if (editingPolicy) {
 			updateMutation.mutate({ id: editingPolicy.id, data: payload });
@@ -1479,6 +1490,20 @@ function PoliciesTab() {
 
 	const setRecurrence = (patch) =>
 		setForm((f) => ({ ...f, recurrence: { ...f.recurrence, ...patch } }));
+
+	const toggleWeekday = (day) =>
+		setForm((f) => {
+			const days = f.recurrence.weekdays;
+			return {
+				...f,
+				recurrence: {
+					...f.recurrence,
+					weekdays: days.includes(day)
+						? days.filter((d) => d !== day)
+						: [...days, day].sort((a, b) => Number(a) - Number(b)),
+				},
+			};
+		});
 
 	return (
 		<div className="mt-4 space-y-4">
@@ -1562,6 +1587,7 @@ function PoliciesTab() {
 															policy.recurrence_cron,
 															orgTimezone,
 														)}
+														{policy.auto_reboot && " · reboots if needed"}
 														{policy.recurrence_next_run_at &&
 															` · next ${formatDate(policy.recurrence_next_run_at)}`}
 													</div>
@@ -1774,39 +1800,52 @@ function PoliciesTab() {
 										</p>
 									)}
 								</div>
-								{["weekly", "monthly"].includes(form.recurrence.mode) && (
+								{form.recurrence.mode === "weekly" && (
+									<fieldset>
+										<legend className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Days
+										</legend>
+										<div className="flex flex-wrap gap-2">
+											{WEEKDAYS.map((name, i) => {
+												const day = String(i);
+												const checked = form.recurrence.weekdays.includes(day);
+												return (
+													<label
+														key={name}
+														className={`flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-sm cursor-pointer select-none focus-within:ring-2 focus-within:ring-primary-500 ${
+															checked
+																? "border-primary-500 bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300"
+																: "border-secondary-300 dark:border-secondary-600 text-secondary-700 dark:text-secondary-300"
+														}`}
+													>
+														<input
+															type="checkbox"
+															checked={checked}
+															onChange={() => toggleWeekday(day)}
+															className="sr-only"
+														/>
+														{name.slice(0, 3)}
+													</label>
+												);
+											})}
+										</div>
+									</fieldset>
+								)}
+								{form.recurrence.mode === "monthly" && (
 									<div>
 										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-											{form.recurrence.mode === "weekly"
-												? "Day"
-												: "Day of month"}
+											Day of month
 										</label>
-										{form.recurrence.mode === "weekly" ? (
-											<select
-												value={form.recurrence.weekday}
-												onChange={(e) =>
-													setRecurrence({ weekday: e.target.value })
-												}
-												className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-											>
-												{WEEKDAYS.map((name, i) => (
-													<option key={name} value={String(i)}>
-														{name}
-													</option>
-												))}
-											</select>
-										) : (
-											<input
-												type="number"
-												min={1}
-												max={28}
-												value={form.recurrence.monthday}
-												onChange={(e) =>
-													setRecurrence({ monthday: e.target.value })
-												}
-												className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-											/>
-										)}
+										<input
+											type="number"
+											min={1}
+											max={28}
+											value={form.recurrence.monthday}
+											onChange={(e) =>
+												setRecurrence({ monthday: e.target.value })
+											}
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										/>
 									</div>
 								)}
 								{["daily", "weekly", "monthly"].includes(
@@ -1843,6 +1882,29 @@ function PoliciesTab() {
 											Minute and hour must be single numbers.
 										</p>
 									</div>
+								)}
+								{form.recurrence.mode !== "none" && (
+									<label className="flex items-start gap-2 text-sm text-secondary-700 dark:text-secondary-300">
+										<input
+											type="checkbox"
+											checked={form.auto_reboot}
+											onChange={(e) =>
+												setForm((f) => ({
+													...f,
+													auto_reboot: e.target.checked,
+												}))
+											}
+											className="mt-0.5"
+										/>
+										<span>
+											Reboot after patching if the host needs it
+											<span className="block text-xs text-secondary-500 dark:text-secondary-400">
+												Applies to scheduled runs only. The host reboots one
+												minute after a successful run, and only if it reports a
+												pending reboot. Needs an agent updated to this release.
+											</span>
+										</span>
+									</label>
 								)}
 								{form.recurrence.mode !== "none" && (
 									<p className="text-xs text-secondary-500 dark:text-secondary-400">

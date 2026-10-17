@@ -601,6 +601,7 @@ type Querier interface {
 	SetHostAwaitingPostPatchReport(ctx context.Context, arg SetHostAwaitingPostPatchReportParams) error
 	SetHostPatchRebootPending(ctx context.Context, arg SetHostPatchRebootPendingParams) error
 	SetNewsletterSubscribed(ctx context.Context, id string) error
+	SetPatchPolicyAutoReboot(ctx context.Context, arg SetPatchPolicyAutoRebootParams) error
 	// patch_policy recurrence (scheduled, recurring patch runs)
 	SetPatchPolicyRecurrence(ctx context.Context, arg SetPatchPolicyRecurrenceParams) error
 	SetPatchRunPolicySnapshot(ctx context.Context, arg SetPatchRunPolicySnapshotParams) error

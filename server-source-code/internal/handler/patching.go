@@ -1385,6 +1385,7 @@ func (h *PatchingHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 // addRecurrenceFields adds the recurring-schedule fields of a policy to its API response.
 func addRecurrenceFields(resp map[string]interface{}, p *db.PatchPolicy) {
 	resp["recurrence_cron"] = p.RecurrenceCron
+	resp["auto_reboot"] = p.AutoReboot
 	resp["recurrence_next_run_at"] = nil
 	resp["recurrence_last_run_at"] = nil
 	if p.RecurrenceCron != nil && p.RecurrenceNextRunAt.Valid {
@@ -1393,6 +1394,19 @@ func addRecurrenceFields(resp map[string]interface{}, p *db.PatchPolicy) {
 	if p.RecurrenceLastRunAt.Valid {
 		resp["recurrence_last_run_at"] = pgTimeToISO(p.RecurrenceLastRunAt)
 	}
+}
+
+// updateAutoReboot decides whether an update changes auto_reboot and to what.
+// Clearing the recurring schedule clears it too, because only scheduled runs
+// reboot; otherwise it changes only when the client sent a value.
+func updateAutoReboot(recurrencePresent bool, recurrence *string, requested *bool) (value, change bool) {
+	if recurrencePresent && recurrence == nil {
+		return false, true
+	}
+	if requested != nil {
+		return *requested, true
+	}
+	return false, false
 }
 
 // parseRecurrenceField reads the optional recurrence_cron request field.
@@ -1458,6 +1472,9 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		// RecurrenceCron makes the policy create patch_all runs on a schedule
 		// (5-field cron, read in the organisation timezone).
 		RecurrenceCron json.RawMessage `json:"recurrence_cron"`
+		// AutoReboot reboots hosts after a successful scheduled run when they
+		// report a pending reboot. Ignored for manual runs.
+		AutoReboot *bool `json:"auto_reboot"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
@@ -1491,6 +1508,13 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("patching: set policy recurrence error", "policy_id", id, "error", err)
 			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy recurrence"})
 			return
+		}
+		if body.AutoReboot != nil && *body.AutoReboot {
+			if err := h.patchPolicies.SetAutoReboot(r.Context(), id, true); err != nil {
+				h.log.Error("patching: set policy auto reboot error", "policy_id", id, "error", err)
+				JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy auto reboot"})
+				return
+			}
 		}
 	}
 	policy, _ := h.patchPolicies.GetByID(r.Context(), id)
@@ -1532,6 +1556,9 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		Timezone *string `json:"timezone"`
 		// RecurrenceCron: omitted keeps the stored schedule; null or "" clears it.
 		RecurrenceCron json.RawMessage `json:"recurrence_cron"`
+		// AutoReboot: omitted keeps the stored value. Clearing the schedule
+		// also clears it, since only scheduled runs reboot.
+		AutoReboot *bool `json:"auto_reboot"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
@@ -1560,6 +1587,13 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		if err := h.patchPolicies.SetRecurrence(r.Context(), id, recurrence, h.resolveOrgTimezone(r.Context())); err != nil {
 			h.log.Error("patching: set policy recurrence error", "policy_id", id, "error", err)
 			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy recurrence"})
+			return
+		}
+	}
+	if autoReboot, ok := updateAutoReboot(recurrencePresent, recurrence, body.AutoReboot); ok {
+		if err := h.patchPolicies.SetAutoReboot(r.Context(), id, autoReboot); err != nil {
+			h.log.Error("patching: set policy auto reboot error", "policy_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy auto reboot"})
 			return
 		}
 	}

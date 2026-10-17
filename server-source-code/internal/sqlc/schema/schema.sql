@@ -739,6 +739,7 @@ CREATE TABLE IF NOT EXISTS patch_policies (
     recurrence_cron TEXT,
     recurrence_next_run_at TIMESTAMP(3),
     recurrence_last_run_at TIMESTAMP(3),
+    auto_reboot BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP(3) NOT NULL
 );

@@ -2123,7 +2123,7 @@ Policies are empty until you assign them. A newly-created policy is inert and do
 
 ### Recurring Runs {#recurring-runs}
 
-A policy can carry a **recurring schedule** so that patching happens without anyone triggering it. Set **Repeat** on the policy form to **Every day**, **Every week**, **Every month**, or **Custom (cron)**, and pick the time.
+A policy can carry a **recurring schedule** so that patching happens without anyone triggering it. Set **Repeat** on the policy form to **Every day**, **Every week**, **Every month**, or **Custom (cron)**, and pick the time. For **Every week**, tick the days to run on (for example Mon, Wed and Fri).
 
 **What happens at each occurrence.** PatchMon starts a `patch_all` run (all outdated packages) on every host for which the policy is the [effective policy](#effective-policy-resolution), using the same rules as a manual run: direct assignments beat group assignments, and per-host exclusions are respected. The runs are applied directly, with no dry-run first, and are recorded with no user as the initiator. Run detail shows them as "Scheduled run" and keeps the policy snapshot.
 
@@ -2133,6 +2133,8 @@ A host is skipped for that occurrence when:
 - it already has a queued, validating or running patch run (the one-active-run-per-host rule still applies);
 - it runs Windows with an agent older than v2.1.4.
 
+**Rebooting after patching.** Tick **Reboot after patching if the host needs it** to have scheduled runs restart the host. After a run succeeds, the agent checks whether the host reports a pending reboot (the same check behind the "reboot required" flag on the host page) and, only if it does, schedules a reboot one minute later, with a notice to logged-in users. A run that fails, is stopped, or leaves nothing pending does not reboot. This applies only to runs the schedule starts; manual runs and dry-runs never reboot. It works on Linux, FreeBSD and Windows hosts. Agents older than the release that added this simply patch and do not reboot. Turning the schedule off also turns auto-reboot off.
+
 **Timing.**
 
 - The schedule is read in the organization timezone (the same resolution order as fixed-time policies). The cron minute and hour must be single numbers, so a policy patches at most once per day.
@@ -2141,7 +2143,7 @@ A host is skipped for that occurrence when:
 - A time that does not exist on a spring-forward day (for example `01:30` in London on the last Sunday of March) is skipped for that day.
 - Changing the organization timezone takes effect from the next occurrence after the one already scheduled. Re-save the policy to recompute it immediately.
 
-**API.** `POST /patching/policies` and `PUT /patching/policies/:id` accept `recurrence_cron` (a 5-field cron string, or `null` to turn it off). On `PUT`, leaving the field out keeps the stored schedule. Responses include `recurrence_cron`, `recurrence_next_run_at` and `recurrence_last_run_at`.
+**API.** `POST /patching/policies` and `PUT /patching/policies/:id` accept `recurrence_cron` (a 5-field cron string, or `null` to turn it off) and `auto_reboot` (boolean). On `PUT`, leaving a field out keeps its stored value. Responses include `recurrence_cron`, `recurrence_next_run_at`, `recurrence_last_run_at` and `auto_reboot`.
 
 ---
 

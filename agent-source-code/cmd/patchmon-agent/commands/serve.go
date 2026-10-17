@@ -524,6 +524,11 @@ func runServiceLoop(stopCh <-chan struct{}) error {
 					default:
 						logger.Info("run_patch completed successfully")
 					}
+					dryRun := msg.dryRun
+					if runtime.GOOS == "windows" {
+						dryRun = msg.windowsPatch.DryRun
+					}
+					maybeRebootAfterPatch(system.New(logger), msg.rebootIfRequired, dryRun, err)
 				}(m)
 			case "compliance_scan":
 				logger.WithFields(logutil.SanitizeMap(map[string]interface{}{
@@ -1416,7 +1421,10 @@ type wsMsg struct {
 	dryRun          bool
 	windowsPatch    packages.WindowsPatchRequest
 	patchParseError string
-	sshProxyData    string // SSH input data
+	// rebootIfRequired asks for a reboot after a successful run iff the host
+	// still reports a pending reboot (scheduled runs of an auto-reboot policy).
+	rebootIfRequired bool
+	sshProxyData     string // SSH input data
 	// RDP proxy fields
 	rdpProxySessionID string // Unique session ID for RDP proxy
 	rdpProxyHost      string // RDP target host (default localhost)
@@ -1908,14 +1916,15 @@ func connectOnce(out chan<- wsMsg, backoff *time.Duration) (connected bool, err 
 			Rows       int    `json:"rows"`        // Terminal rows
 			Data       string `json:"data"`        // SSH input data
 			// run_patch fields
-			PatchRunID     string                        `json:"patch_run_id"`
-			PatchType      string                        `json:"patch_type"`
-			PackageName    string                        `json:"package_name"`
-			PackageNames   []string                      `json:"package_names"`
-			DryRun         bool                          `json:"dry_run"`
-			Targets        []packages.WindowsPatchTarget `json:"targets"`
-			IncludeUpdates *bool                         `json:"include_updates"`
-			IncludeApps    *bool                         `json:"include_apps"`
+			PatchRunID       string                        `json:"patch_run_id"`
+			PatchType        string                        `json:"patch_type"`
+			PackageName      string                        `json:"package_name"`
+			PackageNames     []string                      `json:"package_names"`
+			DryRun           bool                          `json:"dry_run"`
+			RebootIfRequired bool                          `json:"reboot_if_required"`
+			Targets          []packages.WindowsPatchTarget `json:"targets"`
+			IncludeUpdates   *bool                         `json:"include_updates"`
+			IncludeApps      *bool                         `json:"include_apps"`
 		}
 		if err := json.Unmarshal(data, &payload); err != nil {
 			logger.WithError(err).WithField("message_bytes", len(data)).Warn("Failed to parse WebSocket message")
@@ -1972,12 +1981,13 @@ func connectOnce(out chan<- wsMsg, backoff *time.Duration) (connected bool, err 
 					"dry_run":         payload.DryRun,
 				})).Info("run_patch received")
 				dispatchWSMessage(out, wsMsg{
-					kind:            "run_patch",
-					patchRunID:      payload.PatchRunID,
-					patchType:       patchType,
-					dryRun:          payload.DryRun,
-					windowsPatch:    req,
-					patchParseError: parseErr,
+					kind:             "run_patch",
+					patchRunID:       payload.PatchRunID,
+					patchType:        patchType,
+					dryRun:           payload.DryRun,
+					windowsPatch:     req,
+					patchParseError:  parseErr,
+					rebootIfRequired: payload.RebootIfRequired,
 				})
 				continue
 			}
@@ -2010,6 +2020,7 @@ func connectOnce(out chan<- wsMsg, backoff *time.Duration) (connected bool, err 
 				"patch_type":    patchType,
 				"package_names": packageNames,
 				"dry_run":       payload.DryRun,
+				"reboot":        payload.RebootIfRequired,
 			})).Info("run_patch received")
 			dispatchWSMessage(out, wsMsg{
 				kind:         "run_patch",
@@ -2017,6 +2028,8 @@ func connectOnce(out chan<- wsMsg, backoff *time.Duration) (connected bool, err 
 				patchType:    patchType,
 				packageNames: packageNames,
 				dryRun:       payload.DryRun,
+
+				rebootIfRequired: payload.RebootIfRequired,
 			})
 		case "compliance_scan":
 			// Validate profile ID to prevent command injection

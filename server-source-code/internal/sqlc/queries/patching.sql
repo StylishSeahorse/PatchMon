@@ -333,6 +333,9 @@ UPDATE patch_policies
 SET recurrence_cron = sqlc.narg('recurrence_cron'), recurrence_next_run_at = sqlc.narg('recurrence_next_run_at'), updated_at = NOW()
 WHERE id = sqlc.arg('id');
 
+-- name: SetPatchPolicyAutoReboot :exec
+UPDATE patch_policies SET auto_reboot = sqlc.arg('auto_reboot'), updated_at = NOW() WHERE id = sqlc.arg('id');
+
 -- name: ListPatchPoliciesRecurrenceDue :many
 SELECT * FROM patch_policies
 WHERE recurrence_cron IS NOT NULL AND recurrence_next_run_at IS NOT NULL AND recurrence_next_run_at <= sqlc.arg('due_before')

@@ -143,6 +143,10 @@ type RunPatchPayload struct {
 	PackageName  *string  `json:"package_name,omitempty"`
 	PackageNames []string `json:"package_names,omitempty"`
 	DryRun       bool     `json:"dry_run,omitempty"`
+	// RebootIfRequired asks the agent to reboot the host after a successful run
+	// iff the host still reports a pending reboot. Set only by scheduled runs of
+	// a policy with auto_reboot; manual runs leave it false.
+	RebootIfRequired bool `json:"reboot_if_required,omitempty"`
 }
 
 // NewRunPatchTask creates a run_patch task.
@@ -910,6 +914,9 @@ func buildRunPatchMessage(p RunPatchPayload, run *db.GetPatchRunByIDRow, windows
 		"patch_run_id": p.PatchRunID,
 		"patch_type":   p.PatchType,
 		"dry_run":      p.DryRun,
+	}
+	if p.RebootIfRequired && !p.DryRun {
+		payload["reboot_if_required"] = true
 	}
 	if !windows {
 		if p.PackageName != nil {

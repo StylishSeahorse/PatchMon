@@ -91,3 +91,28 @@ func TestNoTargetsMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildRunPatchMessageRebootIfRequired(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		payload RunPatchPayload
+		windows bool
+		want    bool
+	}{
+		{"not requested", RunPatchPayload{PatchType: "patch_all"}, false, false},
+		{"requested on linux", RunPatchPayload{PatchType: "patch_all", RebootIfRequired: true}, false, true},
+		{"requested on windows", RunPatchPayload{PatchType: "patch_all", RebootIfRequired: true}, true, true},
+		{"never sent with a dry run", RunPatchPayload{PatchType: "patch_package", DryRun: true, RebootIfRequired: true}, false, false},
+	}
+	for _, c := range cases {
+		msg := buildRunPatchMessage(c.payload, &db.GetPatchRunByIDRow{}, c.windows, nil)
+		got, present := msg["reboot_if_required"]
+		if present != c.want {
+			t.Errorf("%s: reboot_if_required present=%v, want %v", c.name, present, c.want)
+		}
+		if present && got != true {
+			t.Errorf("%s: reboot_if_required = %v, want true", c.name, got)
+		}
+	}
+}

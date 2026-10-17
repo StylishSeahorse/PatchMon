@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"patchmon-agent/internal/logutil"
 	"patchmon-agent/internal/winexec"
@@ -544,4 +545,57 @@ func (d *Detector) resolveMetaPackage(metaPkg string) string {
 	}
 
 	return ""
+}
+
+// maxRebootDelayMinutes bounds the delay a caller can ask for.
+const maxRebootDelayMinutes = 60
+
+// rebootCommand returns the command that schedules a reboot delayMinutes from
+// now (clamped to 0-60) on goos, with reason shown to logged-in users.
+func rebootCommand(goos string, delayMinutes int, reason string) (string, []string) {
+	delayMinutes = min(max(delayMinutes, 0), maxRebootDelayMinutes)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "Triggered by PatchMon"
+	}
+	if goos == "windows" {
+		// /c comments are limited to 512 characters.
+		if len(reason) > 500 {
+			reason = reason[:500]
+		}
+		return "shutdown", []string{"/r", "/t", strconv.Itoa(delayMinutes * 60), "/c", reason}
+	}
+	when := "now"
+	if delayMinutes > 0 {
+		when = "+" + strconv.Itoa(delayMinutes)
+	}
+	return "shutdown", []string{"-r", when, reason}
+}
+
+// ExecuteReboot schedules a reboot delayMinutes from now (clamped to 0-60),
+// returning once it is scheduled. Where there is no shutdown command (some
+// minimal Linux images) it falls back to running reboot after the delay.
+func (d *Detector) ExecuteReboot(delayMinutes int, reason string) error {
+	name, args := rebootCommand(runtime.GOOS, delayMinutes, reason)
+	log := d.logger.WithField("delay_minutes", min(max(delayMinutes, 0), maxRebootDelayMinutes)).WithField("reason", logutil.Sanitize(reason))
+
+	if _, err := exec.LookPath(name); err != nil && runtime.GOOS != "windows" {
+		if _, rerr := exec.LookPath("reboot"); rerr != nil {
+			return fmt.Errorf("neither shutdown nor reboot found: %w", err)
+		}
+		delay := time.Duration(min(max(delayMinutes, 0), maxRebootDelayMinutes)) * time.Minute
+		time.AfterFunc(delay, func() {
+			if out, rerr := exec.Command("reboot").CombinedOutput(); rerr != nil {
+				d.logger.WithError(rerr).WithField("output", logutil.Sanitize(string(out))).Warn("reboot failed")
+			}
+		})
+		log.Info("Reboot scheduled via reboot after delay")
+		return nil
+	}
+
+	if out, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s %s failed: %w (%s)", name, strings.Join(args[:min(len(args), 2)], " "), err, strings.TrimSpace(string(out)))
+	}
+	log.Info("Reboot scheduled via shutdown")
+	return nil
 }
