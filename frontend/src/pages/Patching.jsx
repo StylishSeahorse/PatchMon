@@ -53,6 +53,13 @@ import { useToast } from "../contexts/ToastContext";
 import { searchWithoutTab, useTabParam } from "../hooks/useTabParam";
 import { adminHostsAPI, formatDate, hostGroupsAPI } from "../utils/api";
 import { patchingAPI } from "../utils/patchingApi";
+import {
+	buildRecurrenceCron,
+	DEFAULT_RECURRENCE,
+	describeRecurrence,
+	parseRecurrenceCron,
+	WEEKDAYS,
+} from "../utils/patchRecurrence";
 import { hasExtraDependencies } from "../utils/patchRun";
 
 const PATCHING_TABS = [
@@ -1356,6 +1363,7 @@ function PoliciesTab() {
 		patch_delay_type: "immediate",
 		delay_minutes: 60,
 		fixed_time_utc: "03:00",
+		recurrence: { ...DEFAULT_RECURRENCE },
 	});
 	const [expandedPolicyId, setExpandedPolicyId] = useState(null);
 
@@ -1416,6 +1424,7 @@ function PoliciesTab() {
 			patch_delay_type: "immediate",
 			delay_minutes: 60,
 			fixed_time_utc: "03:00",
+			recurrence: { ...DEFAULT_RECURRENCE },
 		});
 
 	const openCreate = () => {
@@ -1432,6 +1441,7 @@ function PoliciesTab() {
 			patch_delay_type: policy.patch_delay_type || "immediate",
 			delay_minutes: policy.delay_minutes ?? 60,
 			fixed_time_utc: policy.fixed_time_utc || "03:00",
+			recurrence: parseRecurrenceCron(policy.recurrence_cron),
 		});
 		setShowModal(true);
 	};
@@ -1446,6 +1456,7 @@ function PoliciesTab() {
 				form.patch_delay_type === "delayed" ? Number(form.delay_minutes) : null,
 			fixed_time_utc:
 				form.patch_delay_type === "fixed_time" ? form.fixed_time_utc : null,
+			recurrence_cron: buildRecurrenceCron(form.recurrence),
 		};
 		if (editingPolicy) {
 			updateMutation.mutate({ id: editingPolicy.id, data: payload });
@@ -1466,12 +1477,15 @@ function PoliciesTab() {
 		return label;
 	};
 
+	const setRecurrence = (patch) =>
+		setForm((f) => ({ ...f, recurrence: { ...f.recurrence, ...patch } }));
+
 	return (
 		<div className="mt-4 space-y-4">
 			<div className="flex items-center justify-between">
 				<p className="text-sm text-secondary-600 dark:text-secondary-400">
-					Patch policies control when patches run. Assign policies to hosts or
-					host groups.
+					Patch policies control when patches run, and can repeat on a schedule.
+					Assign policies to hosts or host groups.
 				</p>
 				<button
 					type="button"
@@ -1542,6 +1556,16 @@ function PoliciesTab() {
 													<Clock className="h-3.5 w-3.5" />
 													{formatSchedule(policy)}
 												</span>
+												{policy.recurrence_cron && (
+													<div className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+														{describeRecurrence(
+															policy.recurrence_cron,
+															orgTimezone,
+														)}
+														{policy.recurrence_next_run_at &&
+															` · next ${formatDate(policy.recurrence_next_run_at)}`}
+													</div>
+												)}
 											</td>
 											<td className="px-4 py-3 whitespace-nowrap text-sm">
 												<button
@@ -1725,6 +1749,110 @@ function PoliciesTab() {
 											Change it under Settings &rarr; General.
 										</p>
 									</div>
+								)}
+								<div>
+									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+										Repeat
+									</label>
+									<select
+										value={form.recurrence.mode}
+										onChange={(e) => setRecurrence({ mode: e.target.value })}
+										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+									>
+										<option value="none">
+											Never (run only when triggered)
+										</option>
+										<option value="daily">Every day</option>
+										<option value="weekly">Every week</option>
+										<option value="monthly">Every month</option>
+										<option value="custom">Custom (cron)</option>
+									</select>
+									{form.recurrence.mode === "none" && (
+										<p className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+											Runs are started by someone and this policy only decides
+											when they fire.
+										</p>
+									)}
+								</div>
+								{["weekly", "monthly"].includes(form.recurrence.mode) && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											{form.recurrence.mode === "weekly"
+												? "Day"
+												: "Day of month"}
+										</label>
+										{form.recurrence.mode === "weekly" ? (
+											<select
+												value={form.recurrence.weekday}
+												onChange={(e) =>
+													setRecurrence({ weekday: e.target.value })
+												}
+												className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+											>
+												{WEEKDAYS.map((name, i) => (
+													<option key={name} value={String(i)}>
+														{name}
+													</option>
+												))}
+											</select>
+										) : (
+											<input
+												type="number"
+												min={1}
+												max={28}
+												value={form.recurrence.monthday}
+												onChange={(e) =>
+													setRecurrence({ monthday: e.target.value })
+												}
+												className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+											/>
+										)}
+									</div>
+								)}
+								{["daily", "weekly", "monthly"].includes(
+									form.recurrence.mode,
+								) && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Time
+										</label>
+										<input
+											type="time"
+											value={form.recurrence.time}
+											onChange={(e) => setRecurrence({ time: e.target.value })}
+											required
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										/>
+									</div>
+								)}
+								{form.recurrence.mode === "custom" && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Cron expression
+										</label>
+										<input
+											type="text"
+											placeholder="0 3 * * 1-5"
+											value={form.recurrence.cron}
+											onChange={(e) => setRecurrence({ cron: e.target.value })}
+											required
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2 font-mono"
+										/>
+										<p className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+											Five fields: minute hour day-of-month month day-of-week.
+											Minute and hour must be single numbers.
+										</p>
+									</div>
+								)}
+								{form.recurrence.mode !== "none" && (
+									<p className="text-xs text-secondary-500 dark:text-secondary-400">
+										At each occurrence PatchMon patches every outdated package
+										on every connected host this policy applies to. Times are in
+										the organization timezone (
+										<span className="font-medium">{orgTimezone}</span>). An
+										occurrence missed for more than 30 minutes (for example
+										during downtime) is skipped.
+									</p>
 								)}
 								<div className="flex justify-end gap-2 pt-2">
 									<button

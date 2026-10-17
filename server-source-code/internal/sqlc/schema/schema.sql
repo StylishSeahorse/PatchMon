@@ -736,6 +736,9 @@ CREATE TABLE IF NOT EXISTS patch_policies (
     delay_minutes INTEGER,
     fixed_time_utc TEXT,
     timezone TEXT,
+    recurrence_cron TEXT,
+    recurrence_next_run_at TIMESTAMP(3),
+    recurrence_last_run_at TIMESTAMP(3),
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP(3) NOT NULL
 );

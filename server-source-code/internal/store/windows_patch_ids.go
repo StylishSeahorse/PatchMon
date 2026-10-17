@@ -3,6 +3,8 @@ package store
 import (
 	"regexp"
 	"strings"
+
+	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
 )
 
 // WUA update types the agent reports in wuaType.
@@ -30,4 +32,19 @@ func IsValidWUAGuid(id string) bool {
 // IsWindowsOSType applies the same Windows host test as the frontend.
 func IsWindowsOSType(osType string) bool {
 	return strings.Contains(strings.ToLower(osType), "windows")
+}
+
+// MinWindowsPatchAgentVersion is the oldest agent that may be sent a Windows patch run.
+const MinWindowsPatchAgentVersion = "2.1.4"
+
+// Lowest semver pre-release of the minimum, so 2.1.4-rc.N builds pass the gate.
+const minWindowsPatchAgentFloor = MinWindowsPatchAgentVersion + "-0"
+
+// WindowsAgentCanPatch reports whether the agent is new enough to be sent a Windows patch run.
+func WindowsAgentCanPatch(agentVersion *string) bool {
+	v := ""
+	if agentVersion != nil {
+		v = *agentVersion
+	}
+	return v != "" && util.CompareVersions(v, minWindowsPatchAgentFloor) >= 0
 }

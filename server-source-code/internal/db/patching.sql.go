@@ -24,6 +24,33 @@ func (q *Queries) ActivateScheduledPatchRun(ctx context.Context, id string) (int
 	return result.RowsAffected(), nil
 }
 
+const claimPatchPolicyRecurrence = `-- name: ClaimPatchPolicyRecurrence :execrows
+UPDATE patch_policies
+SET recurrence_next_run_at = $1, recurrence_last_run_at = $2
+WHERE id = $3 AND recurrence_next_run_at = $4
+`
+
+type ClaimPatchPolicyRecurrenceParams struct {
+	NextRunAt         pgtype.Timestamp `json:"next_run_at"`
+	LastRunAt         pgtype.Timestamp `json:"last_run_at"`
+	ID                string           `json:"id"`
+	ExpectedNextRunAt pgtype.Timestamp `json:"expected_next_run_at"`
+}
+
+// Compare-and-swap on the occurrence being fired so only one worker dispatches it.
+func (q *Queries) ClaimPatchPolicyRecurrence(ctx context.Context, arg ClaimPatchPolicyRecurrenceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimPatchPolicyRecurrence,
+		arg.NextRunAt,
+		arg.LastRunAt,
+		arg.ID,
+		arg.ExpectedNextRunAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearScheduledAt = `-- name: ClearScheduledAt :exec
 UPDATE patch_runs SET scheduled_at = NULL, updated_at = NOW() WHERE id = $1
 `
@@ -245,7 +272,7 @@ func (q *Queries) ExistsPatchPolicyExclusion(ctx context.Context, arg ExistsPatc
 }
 
 const getDirectPatchPolicyAssignment = `-- name: GetDirectPatchPolicyAssignment :one
-SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
+SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.recurrence_cron, pp.recurrence_next_run_at, pp.recurrence_last_run_at, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
 JOIN patch_policies pp ON ppa.patch_policy_id = pp.id
 WHERE ppa.target_type = 'host' AND ppa.target_id = $1
 ORDER BY ppa.created_at ASC
@@ -264,6 +291,9 @@ func (q *Queries) GetDirectPatchPolicyAssignment(ctx context.Context, targetID s
 		&i.DelayMinutes,
 		&i.FixedTimeUtc,
 		&i.Timezone,
+		&i.RecurrenceCron,
+		&i.RecurrenceNextRunAt,
+		&i.RecurrenceLastRunAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -313,7 +343,7 @@ func (q *Queries) GetPatchPolicyAssignmentByID(ctx context.Context, id string) (
 }
 
 const getPatchPolicyByGroupAssignment = `-- name: GetPatchPolicyByGroupAssignment :one
-SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
+SELECT pp.id, pp.name, pp.description, pp.patch_delay_type, pp.delay_minutes, pp.fixed_time_utc, pp.timezone, pp.recurrence_cron, pp.recurrence_next_run_at, pp.recurrence_last_run_at, pp.created_at, pp.updated_at FROM patch_policy_assignments ppa
 JOIN patch_policies pp ON ppa.patch_policy_id = pp.id
 WHERE ppa.target_type = 'host_group' AND ppa.target_id = $1
 ORDER BY ppa.created_at ASC
@@ -331,6 +361,9 @@ func (q *Queries) GetPatchPolicyByGroupAssignment(ctx context.Context, targetID 
 		&i.DelayMinutes,
 		&i.FixedTimeUtc,
 		&i.Timezone,
+		&i.RecurrenceCron,
+		&i.RecurrenceNextRunAt,
+		&i.RecurrenceLastRunAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -338,7 +371,7 @@ func (q *Queries) GetPatchPolicyByGroupAssignment(ctx context.Context, targetID 
 }
 
 const getPatchPolicyByID = `-- name: GetPatchPolicyByID :one
-SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, created_at, updated_at FROM patch_policies WHERE id = $1
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies WHERE id = $1
 `
 
 func (q *Queries) GetPatchPolicyByID(ctx context.Context, id string) (PatchPolicy, error) {
@@ -352,6 +385,9 @@ func (q *Queries) GetPatchPolicyByID(ctx context.Context, id string) (PatchPolic
 		&i.DelayMinutes,
 		&i.FixedTimeUtc,
 		&i.Timezone,
+		&i.RecurrenceCron,
+		&i.RecurrenceNextRunAt,
+		&i.RecurrenceLastRunAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -579,8 +615,32 @@ func (q *Queries) ListActivePatchRuns(ctx context.Context) ([]ListActivePatchRun
 	return items, nil
 }
 
+const listHostIDsInGroup = `-- name: ListHostIDsInGroup :many
+SELECT host_id FROM host_group_memberships WHERE host_group_id = $1
+`
+
+func (q *Queries) ListHostIDsInGroup(ctx context.Context, hostGroupID string) ([]string, error) {
+	rows, err := q.db.Query(ctx, listHostIDsInGroup, hostGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var host_id string
+		if err := rows.Scan(&host_id); err != nil {
+			return nil, err
+		}
+		items = append(items, host_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPatchPolicies = `-- name: ListPatchPolicies :many
-SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, created_at, updated_at FROM patch_policies ORDER BY name ASC
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies ORDER BY name ASC
 `
 
 // patch_policies
@@ -601,6 +661,85 @@ func (q *Queries) ListPatchPolicies(ctx context.Context) ([]PatchPolicy, error) 
 			&i.DelayMinutes,
 			&i.FixedTimeUtc,
 			&i.Timezone,
+			&i.RecurrenceCron,
+			&i.RecurrenceNextRunAt,
+			&i.RecurrenceLastRunAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPatchPoliciesRecurrenceDue = `-- name: ListPatchPoliciesRecurrenceDue :many
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies
+WHERE recurrence_cron IS NOT NULL AND recurrence_next_run_at IS NOT NULL AND recurrence_next_run_at <= $1
+ORDER BY recurrence_next_run_at ASC
+`
+
+func (q *Queries) ListPatchPoliciesRecurrenceDue(ctx context.Context, dueBefore pgtype.Timestamp) ([]PatchPolicy, error) {
+	rows, err := q.db.Query(ctx, listPatchPoliciesRecurrenceDue, dueBefore)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PatchPolicy
+	for rows.Next() {
+		var i PatchPolicy
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Description,
+			&i.PatchDelayType,
+			&i.DelayMinutes,
+			&i.FixedTimeUtc,
+			&i.Timezone,
+			&i.RecurrenceCron,
+			&i.RecurrenceNextRunAt,
+			&i.RecurrenceLastRunAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPatchPoliciesWithRecurrence = `-- name: ListPatchPoliciesWithRecurrence :many
+SELECT id, name, description, patch_delay_type, delay_minutes, fixed_time_utc, timezone, recurrence_cron, recurrence_next_run_at, recurrence_last_run_at, created_at, updated_at FROM patch_policies WHERE recurrence_cron IS NOT NULL
+`
+
+func (q *Queries) ListPatchPoliciesWithRecurrence(ctx context.Context) ([]PatchPolicy, error) {
+	rows, err := q.db.Query(ctx, listPatchPoliciesWithRecurrence)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PatchPolicy
+	for rows.Next() {
+		var i PatchPolicy
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Description,
+			&i.PatchDelayType,
+			&i.DelayMinutes,
+			&i.FixedTimeUtc,
+			&i.Timezone,
+			&i.RecurrenceCron,
+			&i.RecurrenceNextRunAt,
+			&i.RecurrenceLastRunAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -1713,6 +1852,34 @@ func (q *Queries) ListPatchRunsOrderByStatusDesc(ctx context.Context, arg ListPa
 	return items, nil
 }
 
+const listPatchableHostIDsByIDs = `-- name: ListPatchableHostIDsByIDs :many
+SELECT h.id FROM hosts h
+WHERE h.id = ANY($1::text[])
+  AND h.status = 'active'
+  AND EXISTS (SELECT 1 FROM host_packages hp WHERE hp.host_id = h.id AND hp.needs_update = true)
+`
+
+// Hosts that are connected and have at least one outdated package.
+func (q *Queries) ListPatchableHostIDsByIDs(ctx context.Context, dollar_1 []string) ([]string, error) {
+	rows, err := q.db.Query(ctx, listPatchableHostIDsByIDs, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRecentPatchRuns = `-- name: ListRecentPatchRuns :many
 SELECT pr.id, pr.host_id, pr.job_id, pr.patch_type, pr.package_name, pr.package_names, pr.status, pr.shell_output, pr.error_message, pr.started_at, pr.completed_at, pr.scheduled_at, pr.triggered_by_user_id, pr.approved_by_user_id, pr.dry_run, pr.packages_affected, pr.policy_id, pr.policy_name, pr.policy_snapshot, pr.validation_run_id, pr.created_at, pr.updated_at, pr.reboot_required, pr.windows_include_updates, pr.windows_include_apps, h.friendly_name AS host_friendly_name, h.hostname AS host_hostname, h.os_type AS host_os_type, u.username AS triggered_by_username
 FROM patch_runs pr
@@ -1991,6 +2158,24 @@ func (q *Queries) RequeuePatchRun(ctx context.Context, arg RequeuePatchRunParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setPatchPolicyRecurrence = `-- name: SetPatchPolicyRecurrence :exec
+UPDATE patch_policies
+SET recurrence_cron = $1, recurrence_next_run_at = $2, updated_at = NOW()
+WHERE id = $3
+`
+
+type SetPatchPolicyRecurrenceParams struct {
+	RecurrenceCron      *string          `json:"recurrence_cron"`
+	RecurrenceNextRunAt pgtype.Timestamp `json:"recurrence_next_run_at"`
+	ID                  string           `json:"id"`
+}
+
+// patch_policy recurrence (scheduled, recurring patch runs)
+func (q *Queries) SetPatchPolicyRecurrence(ctx context.Context, arg SetPatchPolicyRecurrenceParams) error {
+	_, err := q.db.Exec(ctx, setPatchPolicyRecurrence, arg.RecurrenceCron, arg.RecurrenceNextRunAt, arg.ID)
+	return err
 }
 
 const setPatchRunPolicySnapshot = `-- name: SetPatchRunPolicySnapshot :exec

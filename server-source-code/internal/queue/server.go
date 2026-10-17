@@ -85,6 +85,7 @@ func NewServer(opts asynq.RedisClientOpt, registry *agentregistry.Registry, db *
 			QueuePatching:                    2,
 			notifications.QueueNotifications: 2,
 			QueueScheduledReports:            1,
+			QueuePatchPolicySchedule:         1,
 			QueueMetricsSend:                 1,
 		},
 	})
@@ -154,6 +155,8 @@ func Mux(opts MuxOpts) *asynq.ServeMux {
 	mux.Handle(TypeInstallComplianceTools, wrap(TypeInstallComplianceTools, NewInstallComplianceToolsHandler(registry, db, opts.PoolCache, opts.RDB, opts.RedisCache, log)))
 	patchRunsStore := store.NewPatchRunsStore(&hostctx.DBResolver{Default: db})
 	mux.Handle(TypeRunPatch, wrap(TypeRunPatch, NewRunPatchHandler(registry, patchRunsStore, opts.PoolCache, opts.QueueClient, log)))
+	patchPoliciesStore := store.NewPatchPoliciesStore(&hostctx.DBResolver{Default: db})
+	mux.Handle(TypePatchPolicyScheduleDispatch, wrap(TypePatchPolicyScheduleDispatch, NewPatchPolicyScheduleHandler(db, opts.PoolCache, patchRunsStore, patchPoliciesStore, opts.QueueClient, log)))
 	mux.Handle(TypeMetricsSend, wrap(TypeMetricsSend, NewMetricsSendHandler(db, opts.PoolCache, opts.ServerVersion, log)))
 	return mux
 }
@@ -306,6 +309,19 @@ func NewScheduler(opts asynq.RedisClientOpt, db *database.DB, log *slog.Logger) 
 		asynq.Unique(updateThresholdUniqueWindow),
 		asynq.MaxRetry(0),
 		asynq.Retention(updateThresholdRetention)); err != nil {
+		return nil, err
+	}
+
+	// Recurring patch policies: every minute, start runs for policies whose
+	// schedule has come due. The dispatch is not retried; a missed minute is
+	// picked up by the next tick, and anything older than the catch-up window
+	// is deliberately skipped.
+	patchPolicyScheduleTask := asynq.NewTask(TypePatchPolicyScheduleDispatch, nil)
+	if _, err := scheduler.Register("* * * * *", patchPolicyScheduleTask,
+		asynq.Queue(QueuePatchPolicySchedule),
+		asynq.Unique(50*time.Second),
+		asynq.MaxRetry(0),
+		asynq.Retention(AutomationRetention)); err != nil {
 		return nil, err
 	}
 

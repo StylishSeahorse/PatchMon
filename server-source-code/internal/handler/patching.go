@@ -1322,6 +1322,7 @@ func (h *PatchingHandler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 			"updated_at":       pgTimeToISO(p.UpdatedAt),
 			"_count":           map[string]int{"assignments": len(assignments), "exclusions": len(exclusions)},
 		}
+		addRecurrenceFields(out[i], &policies[i])
 	}
 	JSON(w, http.StatusOK, out)
 }
@@ -1364,7 +1365,7 @@ func (h *PatchingHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 			"updated_at":  pgTimeToISO(a.UpdatedAt),
 		}
 	}
-	JSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"id":               policy.ID,
 		"name":             policy.Name,
 		"description":      policy.Description,
@@ -1376,7 +1377,44 @@ func (h *PatchingHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 		"updated_at":       pgTimeToISO(policy.UpdatedAt),
 		"assignments":      assignmentsResp,
 		"exclusions":       exclusions,
-	})
+	}
+	addRecurrenceFields(resp, policy)
+	JSON(w, http.StatusOK, resp)
+}
+
+// addRecurrenceFields adds the recurring-schedule fields of a policy to its API response.
+func addRecurrenceFields(resp map[string]interface{}, p *db.PatchPolicy) {
+	resp["recurrence_cron"] = p.RecurrenceCron
+	resp["recurrence_next_run_at"] = nil
+	resp["recurrence_last_run_at"] = nil
+	if p.RecurrenceCron != nil && p.RecurrenceNextRunAt.Valid {
+		resp["recurrence_next_run_at"] = pgTimeToISO(p.RecurrenceNextRunAt)
+	}
+	if p.RecurrenceLastRunAt.Valid {
+		resp["recurrence_last_run_at"] = pgTimeToISO(p.RecurrenceLastRunAt)
+	}
+}
+
+// parseRecurrenceField reads the optional recurrence_cron request field.
+// present is false when the client omitted it, so an update leaves the stored
+// schedule alone; null or an empty string clears the schedule (expr nil).
+// A non-empty msg is a 400 error.
+func parseRecurrenceField(raw json.RawMessage) (present bool, expr *string, msg string) {
+	if len(raw) == 0 {
+		return false, nil, ""
+	}
+	var v *string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return true, nil, "recurrence_cron must be a string or null"
+	}
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return true, nil, ""
+	}
+	norm := strings.Join(strings.Fields(*v), " ")
+	if err := store.ValidateRecurrenceCron(norm); err != nil {
+		return true, nil, err.Error()
+	}
+	return true, &norm, ""
 }
 
 // validatePolicyInput enforces shared rules for CreatePolicy and UpdatePolicy.
@@ -1417,12 +1455,20 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		// but ignored — fixed-time scheduling now uses the org-resolved
 		// timezone. The DB column is persisted as NULL.
 		Timezone *string `json:"timezone"`
+		// RecurrenceCron makes the policy create patch_all runs on a schedule
+		// (5-field cron, read in the organisation timezone).
+		RecurrenceCron json.RawMessage `json:"recurrence_cron"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
 	if msg := validatePolicyInput(body.Name, body.PatchDelayType, body.DelayMinutes, body.FixedTimeUtc); msg != "" {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	_, recurrence, msg := parseRecurrenceField(body.RecurrenceCron)
+	if msg != "" {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
@@ -1440,6 +1486,13 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create policy"})
 		return
 	}
+	if recurrence != nil {
+		if err := h.patchPolicies.SetRecurrence(r.Context(), id, recurrence, h.resolveOrgTimezone(r.Context())); err != nil {
+			h.log.Error("patching: set policy recurrence error", "policy_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy recurrence"})
+			return
+		}
+	}
 	policy, _ := h.patchPolicies.GetByID(r.Context(), id)
 	resp := map[string]interface{}{
 		"id":               id,
@@ -1455,6 +1508,7 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	if policy != nil {
 		resp["created_at"] = pgTimeToISO(policy.CreatedAt)
 		resp["updated_at"] = pgTimeToISO(policy.UpdatedAt)
+		addRecurrenceFields(resp, policy)
 	}
 	JSON(w, http.StatusCreated, resp)
 }
@@ -1476,12 +1530,19 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		// CreatePolicy. The DB column is overwritten with NULL on every
 		// update so the column eventually drains across the fleet.
 		Timezone *string `json:"timezone"`
+		// RecurrenceCron: omitted keeps the stored schedule; null or "" clears it.
+		RecurrenceCron json.RawMessage `json:"recurrence_cron"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
 	if msg := validatePolicyInput(body.Name, body.PatchDelayType, body.DelayMinutes, body.FixedTimeUtc); msg != "" {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	recurrencePresent, recurrence, msg := parseRecurrenceField(body.RecurrenceCron)
+	if msg != "" {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
@@ -1494,6 +1555,13 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("patching: update policy error", "error", err)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to update policy"})
 		return
+	}
+	if recurrencePresent {
+		if err := h.patchPolicies.SetRecurrence(r.Context(), id, recurrence, h.resolveOrgTimezone(r.Context())); err != nil {
+			h.log.Error("patching: set policy recurrence error", "policy_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy recurrence"})
+			return
+		}
 	}
 	policy, _ := h.patchPolicies.GetByID(r.Context(), id)
 	resp := map[string]interface{}{
@@ -1508,6 +1576,7 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	if policy != nil {
 		resp["created_at"] = pgTimeToISO(policy.CreatedAt)
 		resp["updated_at"] = pgTimeToISO(policy.UpdatedAt)
+		addRecurrenceFields(resp, policy)
 	}
 	JSON(w, http.StatusOK, resp)
 }

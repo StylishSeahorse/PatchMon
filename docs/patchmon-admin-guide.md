@@ -1058,7 +1058,7 @@ Groups are a **selector** across the product. Wherever a workflow asks "which ho
 
 - When you build a patch run, the target picker offers **Host** or **Host group** as the target type.
 - Choosing a host group expands the target to every current member at the time the run is queued.
-- Patch policies can be assigned to a host group, so a host added to the group automatically picks up that policy. The policy decides when a run someone triggers on that host actually executes; it does not start runs on its own.
+- Patch policies can be assigned to a host group, so a host added to the group automatically picks up that policy. The policy decides when a run someone triggers on that host actually executes. A policy with a [recurring schedule](#recurring-runs) also starts runs on its own, for every host the policy applies to.
 
 For the full patching flow, see the Patching chapter.
 
@@ -1497,7 +1497,7 @@ The server moves a run through these statuses, visible as badges in the Runs & H
 
 #### 2. Patch Policy
 
-A **patch policy** controls *when* an approved patch run actually fires. Policies are optional; a host with no policy attached gets the implicit "Default" policy, which runs patches immediately on trigger.
+A **patch policy** controls *when* an approved patch run actually fires, and can optionally repeat on a schedule (see [Recurring Runs](#recurring-runs)). Policies are optional; a host with no policy attached gets the implicit "Default" policy, which runs patches immediately on trigger.
 
 Each policy has a **delay type**:
 
@@ -2030,7 +2030,7 @@ PatchMon allows one queued, validating or running patch run per host at a time, 
 
 A **patch policy** controls *when* an approved patch run actually fires on a host. Policies let you carve out maintenance windows, build in a delay for "I might change my mind" runs, or force an immediate execution on anything that matters. Assignments and exclusions let you apply a policy broadly (to a host group) while still carving specific hosts out of it.
 
-A policy never starts a run by itself, and PatchMon has no recurring patch schedule. A policy only affects runs that a user triggers (from the Patching wizard, **Patch all** on a host, or the Packages page): it decides whether each run executes immediately, after a delay, or at the next fixed time. Assigning a policy with a fixed time of 01:00 to a host therefore does nothing until someone queues a run for that host.
+A policy does not start a run by itself unless it has a recurring schedule. Without one, a policy only affects runs that a user triggers (from the Patching wizard, **Patch all** on a host, or the Packages page): it decides whether each run executes immediately, after a delay, or at the next fixed time. Assigning a policy with a fixed time of 01:00 to a host therefore does nothing until someone queues a run for that host. To patch on a schedule with nobody triggering it, set **Repeat** on the policy; see [Recurring Runs](#recurring-runs).
 
 This page walks through the policy model, how effective policies are resolved, the Settings UI, and how policies interact with run triggers.
 
@@ -2114,9 +2114,34 @@ The policy form shows the resolved zone next to the time input so operators can 
 5. If you picked **Fixed time**:
     - Enter the time in `HH:MM` format. The form displays the organization timezone next to the field; the time is interpreted as local wall-clock time in that zone (see the timezone handling note above).
     - There is no per-policy timezone dropdown. Change the org-wide zone under **Settings → General → Timezone** if you need a different default for scheduling.
-6. Click **Create**. The policy appears in the list with `0 assignment(s)`.
+6. Optionally set **Repeat** to make the policy start runs on its own (see [Recurring Runs](#recurring-runs)). The default, **Never**, leaves the policy as a timing template only.
+7. Click **Create**. The policy appears in the list with `0 assignment(s)`.
 
-Policies are empty until you assign them. A newly-created policy is inert and does not automatically apply to any host.
+Policies are empty until you assign them. A newly-created policy is inert and does not automatically apply to any host, and a recurring schedule does nothing until the policy has at least one assignment.
+
+---
+
+### Recurring Runs {#recurring-runs}
+
+A policy can carry a **recurring schedule** so that patching happens without anyone triggering it. Set **Repeat** on the policy form to **Every day**, **Every week**, **Every month**, or **Custom (cron)**, and pick the time.
+
+**What happens at each occurrence.** PatchMon starts a `patch_all` run (all outdated packages) on every host for which the policy is the [effective policy](#effective-policy-resolution), using the same rules as a manual run: direct assignments beat group assignments, and per-host exclusions are respected. The runs are applied directly, with no dry-run first, and are recorded with no user as the initiator. Run detail shows them as "Scheduled run" and keeps the policy snapshot.
+
+A host is skipped for that occurrence when:
+
+- it is not connected (status is not active), or it has no outdated packages;
+- it already has a queued, validating or running patch run (the one-active-run-per-host rule still applies);
+- it runs Windows with an agent older than v2.1.4.
+
+**Timing.**
+
+- The schedule is read in the organization timezone (the same resolution order as fixed-time policies). The cron minute and hour must be single numbers, so a policy patches at most once per day.
+- The delay type of the policy (Immediate, Delayed, Fixed time) only applies to runs someone triggers. Runs started by the schedule begin at the scheduled time.
+- Occurrences are checked once a minute. If the server was down and an occurrence is more than 30 minutes late, it is skipped and the schedule moves to the next occurrence, so a nightly window never fires during working hours.
+- A time that does not exist on a spring-forward day (for example `01:30` in London on the last Sunday of March) is skipped for that day.
+- Changing the organization timezone takes effect from the next occurrence after the one already scheduled. Re-save the policy to recompute it immediately.
+
+**API.** `POST /patching/policies` and `PUT /patching/policies/:id` accept `recurrence_cron` (a 5-field cron string, or `null` to turn it off). On `PUT`, leaving the field out keeps the stored schedule. Responses include `recurrence_cron`, `recurrence_next_run_at` and `recurrence_last_run_at`.
 
 ---
 

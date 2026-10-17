@@ -103,6 +103,8 @@ type Querier interface {
 	// per-row round-trip — the alternative was a SELECT loop in Go.
 	BulkUpsertPackages(ctx context.Context, payload []byte) ([]BulkUpsertPackagesRow, error)
 	CancelActiveComplianceScansByHost(ctx context.Context, arg CancelActiveComplianceScansByHostParams) (int64, error)
+	// Compare-and-swap on the occurrence being fired so only one worker dispatches it.
+	ClaimPatchPolicyRecurrence(ctx context.Context, arg ClaimPatchPolicyRecurrenceParams) (int64, error)
 	ClearHostComplianceHashOnEnable(ctx context.Context, arg ClearHostComplianceHashOnEnableParams) error
 	// Force a fresh docker payload on next check-in by NULLing the hash whenever
 	// the operator re-enables docker. If the agent was already streaming docker
@@ -507,6 +509,7 @@ type Querier interface {
 	ListExistingHostApiIDs(ctx context.Context, dollar_1 []string) ([]string, error)
 	ListHostGroups(ctx context.Context) ([]HostGroup, error)
 	ListHostGroupsWithHostCount(ctx context.Context) ([]ListHostGroupsWithHostCountRow, error)
+	ListHostIDsInGroup(ctx context.Context, hostGroupID string) ([]string, error)
 	ListHostOptions(ctx context.Context, arg ListHostOptionsParams) ([]ListHostOptionsRow, error)
 	ListHosts(ctx context.Context) ([]Host, error)
 	ListHostsForComplianceDashboard(ctx context.Context) ([]ListHostsForComplianceDashboardRow, error)
@@ -527,6 +530,8 @@ type Querier interface {
 	ListPackageIDsByNames(ctx context.Context, names []string) ([]ListPackageIDsByNamesRow, error)
 	// patch_policies
 	ListPatchPolicies(ctx context.Context) ([]PatchPolicy, error)
+	ListPatchPoliciesRecurrenceDue(ctx context.Context, dueBefore pgtype.Timestamp) ([]PatchPolicy, error)
+	ListPatchPoliciesWithRecurrence(ctx context.Context) ([]PatchPolicy, error)
 	ListPatchPolicyAssignments(ctx context.Context, arg ListPatchPolicyAssignmentsParams) ([]PatchPolicyAssignment, error)
 	ListPatchPolicyAssignmentsByPolicy(ctx context.Context, patchPolicyID string) ([]PatchPolicyAssignment, error)
 	// patch_policy_exclusions
@@ -545,6 +550,8 @@ type Querier interface {
 	ListPatchRunsOrderByStartedAtAsc(ctx context.Context, arg ListPatchRunsOrderByStartedAtAscParams) ([]ListPatchRunsOrderByStartedAtAscRow, error)
 	ListPatchRunsOrderByStatus(ctx context.Context, arg ListPatchRunsOrderByStatusParams) ([]ListPatchRunsOrderByStatusRow, error)
 	ListPatchRunsOrderByStatusDesc(ctx context.Context, arg ListPatchRunsOrderByStatusDescParams) ([]ListPatchRunsOrderByStatusDescRow, error)
+	// Hosts that are connected and have at least one outdated package.
+	ListPatchableHostIDsByIDs(ctx context.Context, dollar_1 []string) ([]string, error)
 	ListPendingPatchRunItems(ctx context.Context, patchRunID string) ([]PatchRunItem, error)
 	ListRecentPatchRuns(ctx context.Context, arg ListRecentPatchRunsParams) ([]ListRecentPatchRunsRow, error)
 	ListRepositories(ctx context.Context, arg ListRepositoriesParams) ([]ListRepositoriesRow, error)
@@ -594,6 +601,8 @@ type Querier interface {
 	SetHostAwaitingPostPatchReport(ctx context.Context, arg SetHostAwaitingPostPatchReportParams) error
 	SetHostPatchRebootPending(ctx context.Context, arg SetHostPatchRebootPendingParams) error
 	SetNewsletterSubscribed(ctx context.Context, id string) error
+	// patch_policy recurrence (scheduled, recurring patch runs)
+	SetPatchPolicyRecurrence(ctx context.Context, arg SetPatchPolicyRecurrenceParams) error
 	SetPatchRunPolicySnapshot(ctx context.Context, arg SetPatchRunPolicySnapshotParams) error
 	SetPatchRunRebootRequired(ctx context.Context, arg SetPatchRunRebootRequiredParams) error
 	SetTemporaryPassword(ctx context.Context, arg SetTemporaryPasswordParams) error

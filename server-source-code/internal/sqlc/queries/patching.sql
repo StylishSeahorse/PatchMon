@@ -327,6 +327,36 @@ WHERE id = $1;
 -- name: DeletePatchPolicy :exec
 DELETE FROM patch_policies WHERE id = $1;
 
+-- patch_policy recurrence (scheduled, recurring patch runs)
+-- name: SetPatchPolicyRecurrence :exec
+UPDATE patch_policies
+SET recurrence_cron = sqlc.narg('recurrence_cron'), recurrence_next_run_at = sqlc.narg('recurrence_next_run_at'), updated_at = NOW()
+WHERE id = sqlc.arg('id');
+
+-- name: ListPatchPoliciesRecurrenceDue :many
+SELECT * FROM patch_policies
+WHERE recurrence_cron IS NOT NULL AND recurrence_next_run_at IS NOT NULL AND recurrence_next_run_at <= sqlc.arg('due_before')
+ORDER BY recurrence_next_run_at ASC;
+
+-- name: ListPatchPoliciesWithRecurrence :many
+SELECT * FROM patch_policies WHERE recurrence_cron IS NOT NULL;
+
+-- name: ClaimPatchPolicyRecurrence :execrows
+-- Compare-and-swap on the occurrence being fired so only one worker dispatches it.
+UPDATE patch_policies
+SET recurrence_next_run_at = sqlc.arg('next_run_at'), recurrence_last_run_at = sqlc.arg('last_run_at')
+WHERE id = sqlc.arg('id') AND recurrence_next_run_at = sqlc.arg('expected_next_run_at');
+
+-- name: ListHostIDsInGroup :many
+SELECT host_id FROM host_group_memberships WHERE host_group_id = $1;
+
+-- name: ListPatchableHostIDsByIDs :many
+-- Hosts that are connected and have at least one outdated package.
+SELECT h.id FROM hosts h
+WHERE h.id = ANY($1::text[])
+  AND h.status = 'active'
+  AND EXISTS (SELECT 1 FROM host_packages hp WHERE hp.host_id = h.id AND hp.needs_update = true);
+
 -- patch_policy_assignments
 -- name: GetDirectPatchPolicyAssignment :one
 SELECT pp.* FROM patch_policy_assignments ppa

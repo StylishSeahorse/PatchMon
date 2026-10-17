@@ -11,14 +11,10 @@ import (
 	"github.com/PatchMon/PatchMon/server-source-code/internal/db"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/models"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
-	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
 )
 
 // MinWindowsPatchAgentVersion is the oldest agent that may be sent a Windows patch run.
-const MinWindowsPatchAgentVersion = "2.1.4"
-
-// Lowest semver pre-release of the minimum, so 2.1.4-rc.N builds pass the gate.
-const minWindowsPatchAgentFloor = MinWindowsPatchAgentVersion + "-0"
+const MinWindowsPatchAgentVersion = store.MinWindowsPatchAgentVersion
 
 const (
 	maxPatchTargets          = 100
@@ -60,11 +56,7 @@ func badRunRequest(msg string) *runRequestError {
 }
 
 func windowsAgentVersionError(agentVersion *string) *runRequestError {
-	v := ""
-	if agentVersion != nil {
-		v = *agentVersion
-	}
-	if v != "" && util.CompareVersions(v, minWindowsPatchAgentFloor) >= 0 {
+	if store.WindowsAgentCanPatch(agentVersion) {
 		return nil
 	}
 	return badRunRequest("Update the PatchMon agent on this host to v" + MinWindowsPatchAgentVersion + " or later to patch Windows")
