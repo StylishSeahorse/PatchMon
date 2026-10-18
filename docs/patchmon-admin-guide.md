@@ -2123,7 +2123,7 @@ Policies are empty until you assign them. A newly-created policy is inert and do
 
 ### Recurring Runs {#recurring-runs}
 
-A policy can carry a **recurring schedule** so that patching happens without anyone triggering it. Set **Repeat** on the policy form to **Every day**, **Every week**, **Every month**, or **Custom (cron)**, and pick the time. For **Every week**, tick the days to run on (for example Mon, Wed and Fri).
+A policy can carry a **recurring schedule** so that patching happens without anyone triggering it. Set **Repeat** on the policy form to **Every day**, **Every week**, **Every month**, or **Custom (cron)**, and pick the time with the hour, minute and AM/PM buttons. For **Every week**, press the days to run on (for example Mon, Wed and Fri), or use the **Every day**, **Weekdays** and **Weekends** shortcuts. For **Every month**, press the day of the month (1 to 28).
 
 **What happens at each occurrence.** PatchMon starts a `patch_all` run (all outdated packages) on every host for which the policy is the [effective policy](#effective-policy-resolution), using the same rules as a manual run: direct assignments beat group assignments, and per-host exclusions are respected. The runs are applied directly, with no dry-run first, and are recorded with no user as the initiator. Run detail shows them as "Scheduled run" and keeps the policy snapshot.
 

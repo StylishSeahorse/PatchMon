@@ -35,6 +35,11 @@ import { CompactPackageSummary } from "../components/PackageListDisplay";
 import { PatchRunStatusBadge } from "../components/PatchRunStatusBadge";
 import PatchWizard from "../components/PatchWizard";
 import {
+	MonthdayButtons,
+	TimeButtons,
+	WeekdayButtons,
+} from "../components/patching/ScheduleButtons";
+import {
 	PatchingActivePolicies,
 	PatchingPendingApproval,
 	PatchingRecentRuns,
@@ -58,7 +63,6 @@ import {
 	DEFAULT_RECURRENCE,
 	describeRecurrence,
 	parseRecurrenceCron,
-	WEEKDAYS,
 } from "../utils/patchRecurrence";
 import { hasExtraDependencies } from "../utils/patchRun";
 
@@ -1491,20 +1495,6 @@ function PoliciesTab() {
 	const setRecurrence = (patch) =>
 		setForm((f) => ({ ...f, recurrence: { ...f.recurrence, ...patch } }));
 
-	const toggleWeekday = (day) =>
-		setForm((f) => {
-			const days = f.recurrence.weekdays;
-			return {
-				...f,
-				recurrence: {
-					...f.recurrence,
-					weekdays: days.includes(day)
-						? days.filter((d) => d !== day)
-						: [...days, day].sort((a, b) => Number(a) - Number(b)),
-				},
-			};
-		});
-
 	return (
 		<div className="mt-4 space-y-4">
 			<div className="flex items-center justify-between">
@@ -1801,68 +1791,24 @@ function PoliciesTab() {
 									)}
 								</div>
 								{form.recurrence.mode === "weekly" && (
-									<fieldset>
-										<legend className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-											Days
-										</legend>
-										<div className="flex flex-wrap gap-2">
-											{WEEKDAYS.map((name, i) => {
-												const day = String(i);
-												const checked = form.recurrence.weekdays.includes(day);
-												return (
-													<label
-														key={name}
-														className={`flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-sm cursor-pointer select-none focus-within:ring-2 focus-within:ring-primary-500 ${
-															checked
-																? "border-primary-500 bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300"
-																: "border-secondary-300 dark:border-secondary-600 text-secondary-700 dark:text-secondary-300"
-														}`}
-													>
-														<input
-															type="checkbox"
-															checked={checked}
-															onChange={() => toggleWeekday(day)}
-															className="sr-only"
-														/>
-														{name.slice(0, 3)}
-													</label>
-												);
-											})}
-										</div>
-									</fieldset>
+									<WeekdayButtons
+										value={form.recurrence.weekdays}
+										onChange={(weekdays) => setRecurrence({ weekdays })}
+									/>
 								)}
 								{form.recurrence.mode === "monthly" && (
-									<div>
-										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-											Day of month
-										</label>
-										<input
-											type="number"
-											min={1}
-											max={28}
-											value={form.recurrence.monthday}
-											onChange={(e) =>
-												setRecurrence({ monthday: e.target.value })
-											}
-											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-										/>
-									</div>
+									<MonthdayButtons
+										value={form.recurrence.monthday}
+										onChange={(monthday) => setRecurrence({ monthday })}
+									/>
 								)}
 								{["daily", "weekly", "monthly"].includes(
 									form.recurrence.mode,
 								) && (
-									<div>
-										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-											Time
-										</label>
-										<input
-											type="time"
-											value={form.recurrence.time}
-											onChange={(e) => setRecurrence({ time: e.target.value })}
-											required
-											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-										/>
-									</div>
+									<TimeButtons
+										value={form.recurrence.time}
+										onChange={(time) => setRecurrence({ time })}
+									/>
 								)}
 								{form.recurrence.mode === "custom" && (
 									<div>

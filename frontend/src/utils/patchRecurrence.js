@@ -22,6 +22,31 @@ export const DEFAULT_RECURRENCE = {
 	cron: "",
 };
 
+export const WEEKDAY_PRESETS = {
+	everyDay: ["0", "1", "2", "3", "4", "5", "6"],
+	weekdays: ["1", "2", "3", "4", "5"],
+	weekends: ["0", "6"],
+};
+
+/** True when two weekday lists hold the same days, in any order. */
+export function sameWeekdays(a, b) {
+	return a.length === b.length && a.every((d) => b.includes(d));
+}
+
+/** "HH:MM" (24-hour) as the 12-hour parts the time buttons show. */
+export function splitTime(time) {
+	const m = /^(\d{1,2}):(\d{2})$/.exec(time || "");
+	const h24 = m ? Number(m[1]) : 1;
+	const minute = m ? Number(m[2]) : 0;
+	return { hour12: h24 % 12 === 0 ? 12 : h24 % 12, minute, pm: h24 >= 12 };
+}
+
+/** The 24-hour "HH:MM" for 12-hour parts; 12 AM is 00:00 and 12 PM is 12:00. */
+export function joinTime(hour12, minute, pm) {
+	const h24 = (hour12 % 12) + (pm ? 12 : 0);
+	return `${String(h24).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
 const pad = (n) => String(n).padStart(2, "0");
 
 /** Cron expression for the recurrence form, or null when the policy does not repeat. */
