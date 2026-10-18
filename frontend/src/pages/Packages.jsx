@@ -28,11 +28,43 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import PatchWizard from "../components/PatchWizard";
+import ModalPortal from "../components/ui/ModalPortal";
+import Tooltip from "../components/ui/Tooltip";
 import { useAuth } from "../contexts/AuthContext";
 import { useToast } from "../contexts/ToastContext";
+import { usePageRefresh } from "../hooks/usePageRefresh";
 import { dashboardAPI, packagesAPI } from "../utils/api";
+import {
+	isPacmanHost,
+	PACMAN_SELECTED_PATCH_UNSUPPORTED,
+} from "../utils/patchSupport";
+import {
+	isPendingRestart,
+	RESTART_REQUIRED_BADGE,
+	windowsBadges,
+	windowsPatchInfo,
+	windowsSourceLabel,
+} from "../utils/windowsPatching";
+
+// The table, the stat cards and the host filter are three separate queries.
+const PACKAGES_REFRESH_KEYS = [
+	["packages"],
+	["dashboardStats"],
+	["packagesHostStats"],
+	["packageCategories"],
+];
 
 const PACKAGES_PAGE_SIZE_OPTIONS = [25, 50, 100, 200];
+
+// Mirrors the server-side sort whitelist (packageListSortKey /
+// packagesListSortColumn). Columns outside this set render without a sort
+// control because the backend would silently fall back to name.
+const PACKAGES_SORTABLE_COLUMNS = new Set([
+	"name",
+	"packageHosts",
+	"status",
+	"latestVersion",
+]);
 
 function formatRepoName(name) {
 	if (!name) return "\u2014";
@@ -40,6 +72,40 @@ function formatRepoName(name) {
 	if (name.startsWith("deb-")) return name.slice(4);
 	return name;
 }
+
+const PACKAGE_COLUMN_WIDTH = {
+	packageHosts: "w-28",
+	status: "w-56",
+	latestVersion: "w-40",
+	sourceRepos: "w-48",
+};
+
+const WindowsPackageTags = ({ info }) => {
+	const source = windowsSourceLabel(info);
+	const badges = windowsBadges(info).filter((b) => b.key !== "not-patchable");
+	if (!source && badges.length === 0) return null;
+	return (
+		<div className="flex flex-wrap items-center gap-1 mt-1">
+			{source && (
+				<span
+					className={
+						info.patchable || info.reason === "not_pending"
+							? "text-xs text-secondary-500 dark:text-secondary-300"
+							: "badge-secondary"
+					}
+					title={info.reasonText || undefined}
+				>
+					{source}
+				</span>
+			)}
+			{badges.map((b) => (
+				<span key={b.key} className={b.className} title={b.title}>
+					{b.label}
+				</span>
+			))}
+		</div>
+	);
+};
 
 const Packages = () => {
 	const navigate = useNavigate();
@@ -58,6 +124,7 @@ const Packages = () => {
 	const [showPatchPackageMultiHostModal, setShowPatchPackageMultiHostModal] =
 		useState(false);
 	const [selectedPackages, setSelectedPackages] = useState([]); // package names (pkg.name)
+	const [selectedPackageMeta, setSelectedPackageMeta] = useState({});
 	const [currentPage, setCurrentPage] = useState(1);
 	const [pageSize, setPageSize] = useState(() => {
 		const saved = localStorage.getItem("packages-page-size");
@@ -70,7 +137,7 @@ const Packages = () => {
 		}
 		return 25; // Default fallback
 	});
-	const [searchParams] = useSearchParams();
+	const [searchParams, setSearchParams] = useSearchParams();
 
 	// Debounce search for backend (avoid refetch on every keystroke)
 	const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -85,13 +152,14 @@ const Packages = () => {
 		};
 	}, [searchTerm]);
 
-	// Handle host filter from URL parameter
+	// The URL is the source of truth for these two filters. Each effect depends
+	// on its own param so writing one cannot reset the other.
+	const hostParam = searchParams.get("host");
+	const filterParam = searchParams.get("filter");
+
 	useEffect(() => {
-		const hostParam = searchParams.get("host");
-		if (hostParam) {
-			setHostFilter(hostParam);
-		}
-	}, [searchParams]);
+		setHostFilter(hostParam || "all");
+	}, [hostParam]);
 
 	// Column configuration
 	const [columnConfig, setColumnConfig] = useState(() => {
@@ -127,6 +195,13 @@ const Packages = () => {
 
 	// Handle hosts click (view hosts where package is installed)
 	const handlePackageHostsClick = async (pkg) => {
+		if (hostFilter && hostFilter !== "all") {
+			const params = new URLSearchParams();
+			params.set("selected", hostFilter);
+			params.set("filter", "selected");
+			navigate(`/hosts?${params.toString()}`);
+			return;
+		}
 		try {
 			const totalHosts = pkg.packageHostsCount || pkg.stats?.totalInstalls || 0;
 			// If many hosts: package detail has paginated list. URL length limits ~2k chars.
@@ -158,16 +233,17 @@ const Packages = () => {
 		}
 	};
 
-	// Handle URL filter parameters
 	useEffect(() => {
-		const filter = searchParams.get("filter");
-		if (filter === "outdated") {
+		if (filterParam === "outdated") {
 			setCategoryFilter("all");
 			setUpdateStatusFilter("needs-updates");
-		} else if (filter === "security" || filter === "security-updates") {
+		} else if (
+			filterParam === "security" ||
+			filterParam === "security-updates"
+		) {
 			setUpdateStatusFilter("security-updates");
 			setCategoryFilter("all");
-		} else if (filter === "regular") {
+		} else if (filterParam === "regular") {
 			setUpdateStatusFilter("regular-updates");
 			setCategoryFilter("all");
 		} else {
@@ -175,14 +251,13 @@ const Packages = () => {
 			setUpdateStatusFilter("all-packages");
 			setCategoryFilter("all");
 		}
-	}, [searchParams]);
+	}, [filterParam]);
 
 	const {
 		data: packagesResponse,
 		isLoading,
 		error,
 		refetch,
-		isFetching,
 	} = useQuery({
 		queryKey: [
 			"packages",
@@ -224,7 +299,6 @@ const Packages = () => {
 		},
 		placeholderData: keepPreviousData,
 		staleTime: 5 * 60 * 1000, // Data stays fresh for 5 minutes
-		refetchOnWindowFocus: false, // Don't refetch when window regains focus
 	});
 
 	// Extract packages from the response and normalise the data structure
@@ -249,24 +323,20 @@ const Packages = () => {
 	const endIndex = Math.min(startIndex + packages.length, totalPackages);
 
 	// Fetch dashboard stats for card counts (consistent with homepage)
-	const { data: dashboardStats, refetch: refetchDashboardStats } = useQuery({
+	const { data: dashboardStats } = useQuery({
 		queryKey: ["dashboardStats"],
 		queryFn: () => dashboardAPI.getStats().then((res) => res.data),
-		staleTime: 5 * 60 * 1000, // Data stays fresh for 5 minutes
-		refetchOnWindowFocus: false, // Don't refetch when window regains focus
 	});
 
 	const { data: categories = [] } = useQuery({
 		queryKey: ["packageCategories"],
 		queryFn: () => packagesAPI.getCategories().then((res) => res.data),
 		staleTime: 5 * 60 * 1000,
-		refetchOnWindowFocus: false,
 	});
 
-	// Handle refresh - refetch all related data
-	const handleRefresh = async () => {
-		await Promise.all([refetch(), refetchDashboardStats()]);
-	};
+	const { refresh: handleRefresh, isRefreshing } = usePageRefresh(
+		PACKAGES_REFRESH_KEYS,
+	);
 
 	// Post-submit UX for the Patch all wizard. The wizard now owns the server
 	// call; this handler only routes the user to the right place afterwards.
@@ -276,14 +346,32 @@ const Packages = () => {
 		queryClient.invalidateQueries({ queryKey: ["patching-runs"] });
 		const runs = info?.runs || [];
 		const immediate = runs.filter((r) => r.immediate);
-		if (immediate.length === 1) {
+		if (!info?.deferred && immediate.length === 1) {
 			navigate(`/patching/runs/${immediate[0].runId}`);
 			return;
 		}
 		toast.success("Patch all queued. View progress in Patching.");
 	};
 
-	const handleSelectPackage = (packageName) => {
+	const rememberMeta = (pkgs) => {
+		if (!isWindowsHostFilter) return;
+		setSelectedPackageMeta((prev) => {
+			const next = { ...prev };
+			for (const p of pkgs) {
+				const info = windowsInfoFor(p);
+				next[p.name] = {
+					source: info.source,
+					featureUpgrade: info.featureUpgrade,
+				};
+			}
+			return next;
+		});
+	};
+
+	const handleSelectPackage = (pkg) => {
+		if (!isPackageSelectable(pkg)) return;
+		const packageName = pkg.name;
+		if (!selectedPackages.includes(packageName)) rememberMeta([pkg]);
 		setSelectedPackages((prev) =>
 			prev.includes(packageName)
 				? prev.filter((n) => n !== packageName)
@@ -292,7 +380,9 @@ const Packages = () => {
 	};
 
 	const handleSelectAllOnPage = () => {
-		const namesOnPage = paginatedPackages.map((p) => p.name);
+		const selectable = paginatedPackages.filter(isPackageSelectable);
+		rememberMeta(selectable);
+		const namesOnPage = selectable.map((p) => p.name);
 		const allSelected = namesOnPage.every((n) => selectedPackages.includes(n));
 		if (allSelected) {
 			setSelectedPackages((prev) =>
@@ -320,18 +410,74 @@ const Packages = () => {
 		hosts?.find((h) => h.id === hostFilter)?.friendly_name ||
 		hosts?.find((h) => h.id === hostFilter)?.hostname;
 
+	// Whether the page is scoped to a single host. Drives both the heading and
+	// which figures the summary cards are allowed to show: mixing one host's
+	// table with fleet-wide cards is what made the numbers unreadable.
+	const isHostScoped = Boolean(hostFilter && hostFilter !== "all");
+
+	// Host-scoped card figures. The fleet numbers come from a periodic
+	// system_statistics snapshot and are never host-aware, so a single host
+	// needs its own live counts.
+	const { data: scopedHost } = useQuery({
+		queryKey: ["packagesHostStats", hostFilter],
+		queryFn: () =>
+			dashboardAPI
+				.getHostDetail(hostFilter, { limit: 1 })
+				.then((res) => res.data),
+		enabled: isHostScoped,
+		staleTime: 60 * 1000,
+	});
+
+	const selectHostFilter = (value) => {
+		const next = new URLSearchParams(searchParams);
+		if (value && value !== "all") {
+			next.set("host", value);
+		} else {
+			next.delete("host");
+		}
+		setSearchParams(next, { replace: true });
+	};
+
+	const clearHostFilter = () => {
+		setHostFilter("all");
+		setUpdateStatusFilter("all-packages");
+		setCategoryFilter("all");
+		const next = new URLSearchParams(searchParams);
+		next.delete("host");
+		next.delete("filter");
+		setSearchParams(next, { replace: true });
+	};
+
 	const isWindowsHostFilter =
 		hostFilter &&
 		hostFilter !== "all" &&
 		(hosts?.find((h) => h.id === hostFilter)?.os_type || "")
 			.toLowerCase()
 			.includes("windows");
+	const isPacmanHostFilter =
+		hostFilter &&
+		hostFilter !== "all" &&
+		isPacmanHost(hosts?.find((h) => h.id === hostFilter));
+
+	const windowsInfoFor = (pkg) =>
+		windowsPatchInfo(
+			pkg.packageHosts?.find((h) => h.hostId === hostFilter) || {
+				needsUpdate: (pkg.stats?.updatesNeeded || 0) > 0,
+			},
+		);
+
+	const isPackageSelectable = (pkg) =>
+		!isWindowsHostFilter || windowsInfoFor(pkg).patchable;
 
 	// Packages are filtered, sorted, and paginated by the backend.
 	const filteredAndSortedPackages = useMemo(() => {
 		return packages || [];
 	}, [packages]);
 	const paginatedPackages = filteredAndSortedPackages;
+	const selectableOnPage = paginatedPackages.filter(isPackageSelectable);
+	const allSelectableOnPageSelected =
+		selectableOnPage.length > 0 &&
+		selectableOnPage.every((p) => selectedPackages.includes(p.name));
 
 	// Reset to first page when filters or page size change
 	// biome-ignore lint/correctness/useExhaustiveDependencies: We want this effect to run when filter values or page size change to reset pagination
@@ -369,6 +515,7 @@ const Packages = () => {
 
 	// Sorting functions
 	const handleSort = (field) => {
+		if (!PACKAGES_SORTABLE_COLUMNS.has(field)) return;
 		if (sortField === field) {
 			setSortDirection(sortDirection === "asc" ? "desc" : "asc");
 		} else {
@@ -427,17 +574,23 @@ const Packages = () => {
 						<button
 							type="button"
 							onClick={() => navigate(`/packages/${pkg.id}`)}
-							className="flex items-center text-left hover:bg-secondary-100 dark:hover:bg-secondary-700 rounded p-2 -m-2 transition-colors group flex-1"
+							className="flex items-center text-left hover:bg-secondary-100 dark:hover:bg-secondary-700 rounded p-2 -m-2 transition-colors group flex-1 min-w-0"
 						>
 							<Package className="h-5 w-5 text-secondary-400 mr-3 flex-shrink-0" />
-							<div className="flex-1">
-								<div className="text-sm font-medium text-secondary-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400">
+							<div className="flex-1 min-w-0">
+								<div
+									className="text-sm font-medium text-secondary-900 dark:text-white group-hover:text-primary-600 dark:group-hover:text-primary-400 line-clamp-2 [overflow-wrap:anywhere]"
+									title={pkg.name}
+								>
 									{pkg.name}
 								</div>
 								{pkg.category && (
 									<div className="text-xs text-secondary-400 dark:text-white">
 										Category: {pkg.category}
 									</div>
+								)}
+								{isWindowsHostFilter && (
+									<WindowsPackageTags info={windowsInfoFor(pkg)} />
 								)}
 							</div>
 						</button>
@@ -497,7 +650,16 @@ const Packages = () => {
 				const needsUpdates = (pkg.stats?.updatesNeeded || 0) > 0;
 
 				if (!needsUpdates) {
-					return <span className="badge-success">Up to Date</span>;
+					return pkg.packageHosts?.some(isPendingRestart) ? (
+						<span
+							className={RESTART_REQUIRED_BADGE.className}
+							title={RESTART_REQUIRED_BADGE.title}
+						>
+							{RESTART_REQUIRED_BADGE.label}
+						</span>
+					) : (
+						<span className="badge-success">Up to Date</span>
+					);
 				}
 
 				return (pkg.stats?.securityUpdates || 0) > 0 ? (
@@ -512,7 +674,7 @@ const Packages = () => {
 			case "latestVersion":
 				return (
 					<div
-						className="text-sm text-secondary-900 dark:text-white max-w-xs truncate"
+						className="text-sm text-secondary-900 dark:text-white max-w-[10rem] mx-auto truncate"
 						title={pkg.latestVersion || "N/A"}
 					>
 						{pkg.latestVersion || "N/A"}
@@ -550,26 +712,30 @@ const Packages = () => {
 		}
 	};
 
-	// Calculate total packages installed
-	const totalPackagesCount = totalPackages;
+	// Card figures follow the heading: every number on screen describes the same
+	// scope. Host-scoped values are live per-host counts; fleet values come from
+	// the dashboard's system_statistics snapshot.
+	//
+	// Note these deliberately ignore the update-status filter. The cards are the
+	// fixed summary you navigate with, the table is the filtered view; making the
+	// summary move as you click through it is how "12" and "19" ended up side by
+	// side meaning different things.
+	const totalPackagesCount = isHostScoped
+		? (scopedHost?.stats?.total_packages ?? 0)
+		: totalPackages;
 
-	// Calculate total installations across all hosts
-	const totalInstallationsCount =
-		packages?.reduce((sum, pkg) => sum + (pkg.stats?.totalInstalls || 0), 0) ||
-		0;
+	// Backend aggregate across the whole filtered set, not just this page. Only
+	// meaningful fleet-wide: on one host every package is installed exactly once,
+	// so the card would just restate Packages.
+	const totalInstallationsCount = packagesResponse?.totalInstalls ?? 0;
 
-	// Derive outdated count from packages data (same source as table, includes all OSes e.g. Windows).
-	// When filtered by security-updates, we only have security packages in the list, so use dashboard for total outdated.
-	const outdatedPackagesCount =
-		dashboardStats?.cards?.totalOutdatedPackages ??
-		packages?.filter((p) => (p.stats?.updatesNeeded || 0) > 0).length ??
-		0;
+	const outdatedPackagesCount = isHostScoped
+		? (scopedHost?.stats?.outdated_packages ?? 0)
+		: (dashboardStats?.cards?.totalOutdatedPackages ?? 0);
 
-	// Derive security count from packages when we have all or security-filtered data.
-	const securityUpdatesCount =
-		dashboardStats?.cards?.securityUpdates ??
-		packages?.filter((p) => (p.stats?.securityUpdates || 0) > 0).length ??
-		0;
+	const securityUpdatesCount = isHostScoped
+		? (scopedHost?.stats?.security_updates ?? 0)
+		: (dashboardStats?.cards?.securityUpdates ?? 0);
 
 	if (isLoading) {
 		return (
@@ -607,21 +773,58 @@ const Packages = () => {
 	}
 
 	return (
-		<div className="min-h-0 flex flex-col md:h-[calc(100vh-7rem)] md:overflow-hidden">
+		<div className="min-h-0 flex flex-col md:h-[calc(100vh-var(--app-main-inset))] md:overflow-hidden">
 			{/* Page Header */}
 			<div className="flex items-center justify-between mb-6">
 				<div>
-					<h1 className="text-2xl font-semibold text-secondary-900 dark:text-white">
-						Packages
-					</h1>
+					<div className="flex flex-wrap items-center gap-2 sm:gap-3">
+						<h1 className="text-2xl font-semibold text-secondary-900 dark:text-white">
+							{isHostScoped
+								? `Packages for ${patchModalHostName || "this"} Host`
+								: "Packages on all Hosts"}
+						</h1>
+						{isHostScoped && (
+							<button
+								type="button"
+								onClick={clearHostFilter}
+								className="btn-outline flex items-center gap-1.5 px-3 py-1.5 min-h-[44px] sm:min-h-0 text-xs sm:text-sm"
+								title="Show packages across every host"
+							>
+								<X className="h-3.5 w-3.5" />
+								Clear filter
+							</button>
+						)}
+					</div>
 					<p className="text-sm text-secondary-600 dark:text-white mt-1">
-						Manage package updates and security patches
+						{isHostScoped
+							? "Every figure below counts this host only"
+							: "Manage package updates and security patches"}
 					</p>
 				</div>
 				<div className="flex items-center gap-3">
 					{selectedPackages.length > 0 &&
 						canManageHosts() &&
-						!isWindowsHostFilter && (
+						isPacmanHostFilter && (
+							<Tooltip content={PACMAN_SELECTED_PATCH_UNSUPPORTED}>
+								<span
+									// biome-ignore lint/a11y/noNoninteractiveTabindex: a disabled button cannot take focus, so the wrapper carries the explanation
+									tabIndex={0}
+									className="inline-flex"
+								>
+									<button
+										type="button"
+										disabled
+										className="btn-primary flex items-center gap-2 pointer-events-none disabled:opacity-50 disabled:cursor-not-allowed"
+									>
+										<Wrench className="h-4 w-4" />
+										Patch selected ({selectedPackages.length})
+									</button>
+								</span>
+							</Tooltip>
+						)}
+					{selectedPackages.length > 0 &&
+						canManageHosts() &&
+						!isPacmanHostFilter && (
 							<button
 								type="button"
 								onClick={() => setShowPatchPackageMultiHostModal(true)}
@@ -638,49 +841,61 @@ const Packages = () => {
 								Patch selected ({selectedPackages.length})
 							</button>
 						)}
-					{hostFilter &&
-						hostFilter !== "all" &&
-						canManageHosts() &&
-						!isWindowsHostFilter && (
-							<button
-								type="button"
-								onClick={() => setShowPatchConfirmModal(true)}
-								className="btn-primary flex items-center gap-2"
-								title="Run system package updates on this host"
-							>
-								<Wrench className="h-4 w-4" />
-								Patch all
-							</button>
-						)}
-					{hostFilter &&
-						hostFilter !== "all" &&
-						canManageHosts() &&
-						isWindowsHostFilter && (
-							<span
-								className="text-xs text-secondary-400 dark:text-secondary-300 italic"
-								title="Windows patching is managed through Windows Update or WinGet on the host"
-							>
-								Patching managed via Windows Update
-							</span>
-						)}
+					{hostFilter && hostFilter !== "all" && canManageHosts() && (
+						<button
+							type="button"
+							onClick={() => setShowPatchConfirmModal(true)}
+							className="btn-primary flex items-center gap-2"
+							title={
+								isWindowsHostFilter
+									? "Install pending Windows updates and winget app upgrades on this host"
+									: "Run system package updates on this host"
+							}
+						>
+							<Wrench className="h-4 w-4" />
+							Patch all
+						</button>
+					)}
 					<button
 						type="button"
-						onClick={handleRefresh}
-						disabled={isFetching}
+						onClick={() => handleRefresh()}
+						disabled={isRefreshing}
 						className="btn-outline flex items-center gap-2"
 						title="Refresh packages and statistics data"
 					>
 						<RefreshCw
-							className={`h-4 w-4 ${isFetching ? "animate-spin" : ""}`}
+							className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
 						/>
-						{isFetching ? "Refreshing..." : "Refresh"}
+						{isRefreshing ? "Refreshing..." : "Refresh"}
 					</button>
 				</div>
 			</div>
 
-			{/* Summary Stats */}
-			<div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-3 sm:gap-4 mb-6">
-				<div className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200">
+			{/* Summary Stats. Host-scoped drops Installations (one host installs
+			    each package once, so it duplicates Packages) and Outdated Hosts
+			    (a single host is not a fleet figure). */}
+			<div
+				className={`grid grid-cols-2 gap-3 sm:gap-4 mb-6 ${
+					isHostScoped ? "sm:grid-cols-3" : "sm:grid-cols-4 lg:grid-cols-5"
+				}`}
+			>
+				<button
+					type="button"
+					onClick={() => {
+						setUpdateStatusFilter("all-packages");
+						setCategoryFilter("all");
+						setSearchTerm("");
+						const next = new URLSearchParams(searchParams);
+						next.delete("filter");
+						setSearchParams(next, { replace: true });
+					}}
+					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full min-h-[44px]"
+					title={
+						isHostScoped
+							? "Click to show all of this host's packages"
+							: "Click to show all packages"
+					}
+				>
 					<div className="flex items-center">
 						<Package className="h-5 w-5 text-primary-600 mr-2" />
 						<div>
@@ -692,32 +907,37 @@ const Packages = () => {
 							</p>
 						</div>
 					</div>
-				</div>
+				</button>
 
-				<div className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200">
-					<div className="flex items-center">
-						<Package className="h-5 w-5 text-blue-600 mr-2" />
-						<div>
-							<p className="text-sm text-secondary-500 dark:text-white">
-								Installations
-							</p>
-							<p className="text-xl font-semibold text-secondary-900 dark:text-white">
-								{totalInstallationsCount}
-							</p>
+				{!isHostScoped && (
+					<div className="card p-4">
+						<div className="flex items-center">
+							<Package className="h-5 w-5 text-blue-600 mr-2" />
+							<div>
+								<p className="text-sm text-secondary-500 dark:text-white">
+									Installations
+								</p>
+								<p className="text-xl font-semibold text-secondary-900 dark:text-white">
+									{totalInstallationsCount}
+								</p>
+							</div>
 						</div>
 					</div>
-				</div>
+				)}
 
 				<button
 					type="button"
 					onClick={() => {
 						setUpdateStatusFilter("needs-updates");
 						setCategoryFilter("all");
-						setHostFilter("all");
 						setSearchTerm("");
 					}}
 					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full"
-					title="Click to filter packages that need updates"
+					title={
+						isHostScoped
+							? "Click to filter this host's packages that need updates"
+							: "Click to filter packages that need updates"
+					}
 				>
 					<div className="flex items-center">
 						<Package className="h-5 w-5 text-warning-600 mr-2" />
@@ -737,11 +957,14 @@ const Packages = () => {
 					onClick={() => {
 						setUpdateStatusFilter("security-updates");
 						setCategoryFilter("all");
-						setHostFilter("all");
 						setSearchTerm("");
 					}}
 					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full"
-					title="Click to filter packages with security updates"
+					title={
+						isHostScoped
+							? "Click to filter this host's packages with security updates"
+							: "Click to filter packages with security updates"
+					}
 				>
 					<div className="flex items-center">
 						<Shield className="h-5 w-5 text-danger-600 mr-2" />
@@ -756,24 +979,26 @@ const Packages = () => {
 					</div>
 				</button>
 
-				<button
-					type="button"
-					onClick={() => navigate("/hosts?filter=needsUpdates")}
-					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full"
-					title="Click to view hosts that need updates"
-				>
-					<div className="flex items-center">
-						<Server className="h-5 w-5 text-warning-600 mr-2" />
-						<div>
-							<p className="text-sm text-secondary-500 dark:text-white">
-								Outdated Hosts
-							</p>
-							<p className="text-xl font-semibold text-secondary-900 dark:text-white">
-								{dashboardStats?.cards?.hostsNeedingUpdates ?? 0}
-							</p>
+				{!isHostScoped && (
+					<button
+						type="button"
+						onClick={() => navigate("/hosts?filter=needsUpdates")}
+						className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full"
+						title="Click to view hosts that need updates"
+					>
+						<div className="flex items-center">
+							<Server className="h-5 w-5 text-warning-600 mr-2" />
+							<div>
+								<p className="text-sm text-secondary-500 dark:text-white">
+									Outdated Hosts
+								</p>
+								<p className="text-xl font-semibold text-secondary-900 dark:text-white">
+									{dashboardStats?.cards?.hostsNeedingUpdates ?? 0}
+								</p>
+							</div>
 						</div>
-					</div>
-				</button>
+					</button>
+				)}
 			</div>
 
 			{/* Packages List */}
@@ -852,7 +1077,7 @@ const Packages = () => {
 							<div className="sm:w-48">
 								<select
 									value={hostFilter}
-									onChange={(e) => setHostFilter(e.target.value)}
+									onChange={(e) => selectHostFilter(e.target.value)}
 									className="w-full px-3 py-2 border border-secondary-300 dark:border-secondary-600 rounded-md focus:ring-2 focus:ring-primary-500 focus:border-transparent bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white"
 								>
 									<option value="all">All Hosts</option>
@@ -913,8 +1138,15 @@ const Packages = () => {
 												<div className="flex items-center gap-2">
 													<button
 														type="button"
-														onClick={() => handleSelectPackage(pkg.name)}
-														className="flex-shrink-0 min-w-[44px] min-h-[44px] flex items-center justify-center"
+														onClick={() => handleSelectPackage(pkg)}
+														disabled={!isPackageSelectable(pkg)}
+														title={
+															isPackageSelectable(pkg)
+																? undefined
+																: windowsInfoFor(pkg).reasonText ||
+																	"Not patchable"
+														}
+														className="flex-shrink-0 min-w-[44px] min-h-[44px] flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
 													>
 														{isSelected ? (
 															<CheckSquare className="h-5 w-5 text-primary-600" />
@@ -925,12 +1157,22 @@ const Packages = () => {
 													<button
 														type="button"
 														onClick={() => navigate(`/packages/${pkg.id}`)}
-														className="text-left flex-1"
+														className="text-left flex-1 min-w-0"
 													>
 														<div className="flex items-center gap-3">
 															<Package className="h-5 w-5 text-secondary-400 flex-shrink-0" />
-															<div className="text-base font-semibold text-secondary-900 dark:text-white hover:text-primary-600 dark:hover:text-primary-400">
-																{pkg.name}
+															<div className="text-base font-semibold text-secondary-900 dark:text-white hover:text-primary-600 dark:hover:text-primary-400 min-w-0">
+																<span
+																	className="line-clamp-2 [overflow-wrap:anywhere]"
+																	title={pkg.name}
+																>
+																	{pkg.name}
+																</span>
+																{isWindowsHostFilter && (
+																	<WindowsPackageTags
+																		info={windowsInfoFor(pkg)}
+																	/>
+																)}
 															</div>
 														</div>
 													</button>
@@ -959,7 +1201,16 @@ const Packages = () => {
 															const needsUpdates =
 																(pkg.stats?.updatesNeeded || 0) > 0;
 															if (!needsUpdates) {
-																return (
+																return pkg.packageHosts?.some(
+																	isPendingRestart,
+																) ? (
+																	<span
+																		className={`${RESTART_REQUIRED_BADGE.className} text-xs`}
+																		title={RESTART_REQUIRED_BADGE.title}
+																	>
+																		{RESTART_REQUIRED_BADGE.label}
+																	</span>
+																) : (
 																	<span className="badge-success text-xs">
 																		Up to Date
 																	</span>
@@ -1062,18 +1313,14 @@ const Packages = () => {
 														type="button"
 														onClick={handleSelectAllOnPage}
 														className="flex items-center justify-center w-full"
+														disabled={selectableOnPage.length === 0}
 														title={
-															paginatedPackages.every((p) =>
-																selectedPackages.includes(p.name),
-															)
+															allSelectableOnPageSelected
 																? "Deselect all on page"
 																: "Select all on page"
 														}
 													>
-														{paginatedPackages.length > 0 &&
-														paginatedPackages.every((p) =>
-															selectedPackages.includes(p.name),
-														) ? (
+														{allSelectableOnPageSelected ? (
 															<CheckSquare className="h-5 w-5 text-primary-600" />
 														) : (
 															<Square className="h-5 w-5 text-secondary-400" />
@@ -1083,16 +1330,24 @@ const Packages = () => {
 												{visibleColumns.map((column) => (
 													<th
 														key={column.id}
-														className="px-4 py-2 text-center text-xs font-medium text-secondary-500 dark:text-white uppercase tracking-wider"
+														className={`px-4 py-2 text-center text-xs font-medium text-secondary-500 dark:text-white uppercase tracking-wider whitespace-nowrap ${
+															PACKAGE_COLUMN_WIDTH[column.id] || ""
+														}`}
 													>
-														<button
-															type="button"
-															onClick={() => handleSort(column.id)}
-															className="flex items-center gap-1 hover:text-secondary-700 dark:hover:text-secondary-200 transition-colors"
-														>
-															{column.label}
-															{getSortIcon(column.id)}
-														</button>
+														{PACKAGES_SORTABLE_COLUMNS.has(column.id) ? (
+															<button
+																type="button"
+																onClick={() => handleSort(column.id)}
+																className="flex items-center gap-1 hover:text-secondary-700 dark:hover:text-secondary-200 transition-colors"
+															>
+																{column.label}
+																{getSortIcon(column.id)}
+															</button>
+														) : (
+															<span className="flex items-center gap-1">
+																{column.label}
+															</span>
+														)}
 													</th>
 												))}
 											</tr>
@@ -1112,8 +1367,15 @@ const Packages = () => {
 														<td className="w-12 px-2 py-2">
 															<button
 																type="button"
-																onClick={() => handleSelectPackage(pkg.name)}
-																className="flex items-center justify-center w-full p-1"
+																onClick={() => handleSelectPackage(pkg)}
+																disabled={!isPackageSelectable(pkg)}
+																title={
+																	isPackageSelectable(pkg)
+																		? undefined
+																		: windowsInfoFor(pkg).reasonText ||
+																			"Not patchable"
+																}
+																className="flex items-center justify-center w-full p-1 disabled:opacity-40 disabled:cursor-not-allowed"
 															>
 																{isSelected ? (
 																	<CheckSquare className="h-5 w-5 text-primary-600" />
@@ -1125,7 +1387,11 @@ const Packages = () => {
 														{visibleColumns.map((column) => (
 															<td
 																key={column.id}
-																className="px-4 py-2 whitespace-nowrap text-center"
+																className={`px-4 py-2 text-center ${
+																	column.id === "name"
+																		? "min-w-[16rem]"
+																		: `whitespace-nowrap ${PACKAGE_COLUMN_WIDTH[column.id] || ""}`
+																}`}
 															>
 																{renderCellContent(column, pkg)}
 															</td>
@@ -1204,44 +1470,46 @@ const Packages = () => {
 
 			{/* Description Modal */}
 			{descriptionModal && (
-				<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-					<button
-						type="button"
-						onClick={() => setDescriptionModal(null)}
-						className="fixed inset-0 cursor-default"
-						aria-label="Close modal"
-					/>
-					<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-lg w-full mx-4 relative z-10">
-						<div className="px-6 py-4 border-b border-secondary-200 dark:border-secondary-600">
-							<div className="flex items-center justify-between">
-								<h3 className="text-lg font-medium text-secondary-900 dark:text-white">
-									{descriptionModal.packageName}
-								</h3>
+				<ModalPortal>
+					<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
+						<button
+							type="button"
+							onClick={() => setDescriptionModal(null)}
+							className="fixed inset-0 cursor-default"
+							aria-label="Close modal"
+						/>
+						<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-lg w-full mx-4 relative z-10">
+							<div className="px-6 py-4 border-b border-secondary-200 dark:border-secondary-600">
+								<div className="flex items-center justify-between">
+									<h3 className="text-lg font-medium text-secondary-900 dark:text-white">
+										{descriptionModal.packageName}
+									</h3>
+									<button
+										type="button"
+										onClick={() => setDescriptionModal(null)}
+										className="text-secondary-400 hover:text-secondary-600 dark:text-white dark:hover:text-secondary-300"
+									>
+										<X className="h-5 w-5" />
+									</button>
+								</div>
+							</div>
+							<div className="px-6 py-4">
+								<p className="text-sm text-secondary-700 dark:text-white whitespace-pre-wrap">
+									{descriptionModal.description}
+								</p>
+							</div>
+							<div className="px-6 py-4 border-t border-secondary-200 dark:border-secondary-600 flex justify-end">
 								<button
 									type="button"
 									onClick={() => setDescriptionModal(null)}
-									className="text-secondary-400 hover:text-secondary-600 dark:text-white dark:hover:text-secondary-300"
+									className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700"
 								>
-									<X className="h-5 w-5" />
+									Close
 								</button>
 							</div>
 						</div>
-						<div className="px-6 py-4">
-							<p className="text-sm text-secondary-700 dark:text-white whitespace-pre-wrap">
-								{descriptionModal.description}
-							</p>
-						</div>
-						<div className="px-6 py-4 border-t border-secondary-200 dark:border-secondary-600 flex justify-end">
-							<button
-								type="button"
-								onClick={() => setDescriptionModal(null)}
-								className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700"
-							>
-								Close
-							</button>
-						</div>
 					</div>
-				</div>
+				</ModalPortal>
 			)}
 
 			{/* Flow 3: Patch selected packages across chosen hosts.
@@ -1266,8 +1534,10 @@ const Packages = () => {
 										friendly_name: hosts?.find((h) => h.id === hostFilter)
 											?.friendly_name,
 										hostname: hosts?.find((h) => h.id === hostFilter)?.hostname,
+										os_type: hosts?.find((h) => h.id === hostFilter)?.os_type,
 									},
 								],
+								packageMeta: selectedPackageMeta,
 							}
 						: {})}
 					onSuccess={(mode, info) => {
@@ -1282,9 +1552,10 @@ const Packages = () => {
 									? "Submitted 1 run for approval"
 									: `Submitted ${runs.length} runs for approval`,
 							);
-							navigate("/patching?tab=runs");
+							if (!info?.deferred) navigate("/patching?tab=runs");
 							return;
 						}
+						if (info?.deferred) return;
 						const immediate = runs.filter((r) => r.immediate);
 						if (mode === "patch" && immediate.length === 1) {
 							navigate(`/patching/runs/${immediate[0].runId}`);
@@ -1303,7 +1574,13 @@ const Packages = () => {
 					mode="trigger"
 					patchType="patch_all"
 					lockHosts
-					presetHosts={[{ id: hostFilter, friendly_name: patchModalHostName }]}
+					presetHosts={[
+						{
+							id: hostFilter,
+							friendly_name: patchModalHostName,
+							os_type: hosts?.find((h) => h.id === hostFilter)?.os_type,
+						},
+					]}
 					onSuccess={handlePatchAllSuccess}
 				/>
 			)}
@@ -1339,8 +1616,12 @@ const ColumnSettingsModal = ({
 		setDraggedIndex(null);
 	};
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const handleDragEnd = () => {
+		setDraggedIndex(null);
+	};
+
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-md">
 				<div className="flex justify-between items-center mb-4">
 					<h3 className="text-lg font-medium text-secondary-900 dark:text-white">
@@ -1366,6 +1647,7 @@ const ColumnSettingsModal = ({
 							onDragStart={(e) => handleDragStart(e, index)}
 							onDragOver={handleDragOver}
 							onDrop={(e) => handleDrop(e, index)}
+							onDragEnd={handleDragEnd}
 							className={`flex items-center justify-between p-3 border rounded-lg cursor-move w-full ${
 								draggedIndex === index
 									? "opacity-50"
@@ -1419,6 +1701,8 @@ const ColumnSettingsModal = ({
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 export default Packages;

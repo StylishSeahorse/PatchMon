@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
-	"github.com/go-chi/chi/v5"
 )
 
 // PackagesHandler handles packages routes.
@@ -49,7 +48,7 @@ func (h *PackagesHandler) List(w http.ResponseWriter, r *http.Request) {
 		Sort:             q.Get("sort"),
 		Order:            q.Get("order"),
 	}
-	pkgs, total, err := h.packages.List(r.Context(), params)
+	pkgs, total, totalInstalls, err := h.packages.List(r.Context(), params)
 	if err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to load packages")
 		return
@@ -60,6 +59,8 @@ func (h *PackagesHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"packages": pkgs,
+		// Installs across the whole filtered set, not just this page.
+		"totalInstalls": totalInstalls,
 		"pagination": map[string]interface{}{
 			"page":  params.Page,
 			"limit": params.Limit,
@@ -71,7 +72,7 @@ func (h *PackagesHandler) List(w http.ResponseWriter, r *http.Request) {
 
 // GetByID handles GET /packages/:packageId.
 func (h *PackagesHandler) GetByID(w http.ResponseWriter, r *http.Request) {
-	packageID := chi.URLParam(r, "packageId")
+	packageID := decodedURLParam(r, "packageId")
 	if packageID == "" {
 		Error(w, http.StatusBadRequest, "packageId is required")
 		return
@@ -90,7 +91,7 @@ func (h *PackagesHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 
 // GetHosts handles GET /packages/:packageId/hosts.
 func (h *PackagesHandler) GetHosts(w http.ResponseWriter, r *http.Request) {
-	packageID := chi.URLParam(r, "packageId")
+	packageID := decodedURLParam(r, "packageId")
 	if packageID == "" {
 		Error(w, http.StatusBadRequest, "packageId is required")
 		return
@@ -144,7 +145,7 @@ func (h *PackagesHandler) GetHosts(w http.ResponseWriter, r *http.Request) {
 
 // GetActivity handles GET /packages/:packageId/activity.
 func (h *PackagesHandler) GetActivity(w http.ResponseWriter, r *http.Request) {
-	packageID := chi.URLParam(r, "packageId")
+	packageID := decodedURLParam(r, "packageId")
 	if packageID == "" {
 		Error(w, http.StatusBadRequest, "packageId is required")
 		return

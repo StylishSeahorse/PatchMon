@@ -12,12 +12,19 @@ UPDATE hosts SET
     ip = COALESCE(sqlc.narg('ip')::text, ip),
     architecture = COALESCE(sqlc.narg('architecture')::text, architecture),
     agent_version = COALESCE(sqlc.narg('agent_version')::text, agent_version),
+    -- An agent version without a config version is a pre-2.1.4 agent, which has none.
+    config_version = CASE
+        WHEN sqlc.narg('config_version')::text IS NOT NULL THEN sqlc.narg('config_version')::text
+        WHEN sqlc.narg('agent_version')::text IS NOT NULL THEN NULL
+        ELSE config_version
+    END,
+    reported_host_id = COALESCE(sqlc.narg('reported_host_id')::text, reported_host_id),
     cpu_model = COALESCE(sqlc.narg('cpu_model')::text, cpu_model),
     cpu_cores = COALESCE(sqlc.narg('cpu_cores')::int, cpu_cores),
     ram_installed = COALESCE(sqlc.narg('ram_installed')::double precision, ram_installed),
     swap_size = COALESCE(sqlc.narg('swap_size')::double precision, swap_size),
     disk_details = COALESCE(sqlc.narg('disk_details')::jsonb, disk_details),
-    gateway_ip = sqlc.narg('gateway_ip'),
+    gateway_ip = COALESCE(sqlc.narg('gateway_ip')::text, gateway_ip),
     dns_servers = COALESCE(sqlc.narg('dns_servers')::jsonb, dns_servers),
     network_interfaces = COALESCE(sqlc.narg('network_interfaces')::jsonb, network_interfaces),
     kernel_version = COALESCE(sqlc.narg('kernel_version')::text, kernel_version),
@@ -26,14 +33,23 @@ UPDATE hosts SET
     system_uptime = COALESCE(sqlc.narg('system_uptime')::text, system_uptime),
     boot_time = COALESCE(sqlc.narg('boot_time')::timestamptz, boot_time),
     load_average = COALESCE(sqlc.narg('load_average')::jsonb, load_average),
-    needs_reboot = COALESCE(sqlc.narg('needs_reboot')::boolean, needs_reboot),
+    -- A run that needed a restart pins needs_reboot until boot_time moves; 60s absorbs uptime jitter.
+    needs_reboot = COALESCE(sqlc.narg('needs_reboot')::boolean, needs_reboot) OR (patch_reboot_pending_boot_time IS NOT NULL
+            AND ABS(EXTRACT(EPOCH FROM (COALESCE(sqlc.narg('boot_time')::timestamptz, boot_time) - patch_reboot_pending_boot_time))) < 60),
     -- reboot_reason is only rewritten when this report also carries
     -- needs_reboot. A hash-gated partial report never carries either (the ping
     -- metrics path owns both fields), and reboot_reason has no COALESCE guard
     -- of its own, so without this CASE a partial would NULL out a reason the
     -- ping had just written correctly.
+    -- Second arm: a report asserting needs_reboot without a reason must not
+    -- blank a stored one; clearing the flag still clears both.
     reboot_reason = CASE
+        WHEN (patch_reboot_pending_boot_time IS NOT NULL
+                AND ABS(EXTRACT(EPOCH FROM (COALESCE(sqlc.narg('boot_time')::timestamptz, boot_time) - patch_reboot_pending_boot_time))) < 60)
+             AND NOT COALESCE(sqlc.narg('needs_reboot')::boolean, false) THEN 'Restart required to finish a patch run'
         WHEN sqlc.narg('needs_reboot')::boolean IS NULL THEN reboot_reason
+        WHEN sqlc.narg('needs_reboot')::boolean IS TRUE
+             AND sqlc.narg('reboot_reason')::text IS NULL THEN reboot_reason
         ELSE sqlc.narg('reboot_reason')::text
     END,
     package_manager = COALESCE(sqlc.narg('package_manager')::text, package_manager),
@@ -42,11 +58,18 @@ UPDATE hosts SET
     interfaces_hash = COALESCE(sqlc.narg('interfaces_hash')::text, interfaces_hash),
     hostname_hash = COALESCE(sqlc.narg('hostname_hash')::text, hostname_hash),
     last_full_report_at = COALESCE(sqlc.narg('last_full_report_at')::timestamp, last_full_report_at),
-    awaiting_post_patch_report_run_id = NULL
+    awaiting_post_patch_report_run_id = NULL,
+    patch_reboot_pending_boot_time = CASE WHEN (patch_reboot_pending_boot_time IS NOT NULL
+            AND ABS(EXTRACT(EPOCH FROM (COALESCE(sqlc.narg('boot_time')::timestamptz, boot_time) - patch_reboot_pending_boot_time))) < 60) THEN patch_reboot_pending_boot_time END
 WHERE id = sqlc.arg('id');
 
 -- name: DeleteHostPackagesByHostID :exec
 DELETE FROM host_packages WHERE host_id = $1;
+
+-- name: DeleteHostPackagesExceptWindowsUpdates :exec
+DELETE FROM host_packages hp
+WHERE hp.host_id = $1
+  AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.id = hp.package_id AND p.category = 'Windows Update');
 
 -- name: GetPackageByName :one
 SELECT id, name, description, category, latest_version, created_at, updated_at
@@ -79,17 +102,28 @@ FROM packages WHERE name = $1;
 --
 -- The DO UPDATE WHERE clause skips no-op updates: when the agent reports the
 -- same description/category/latest_version that's already stored, no row
--- update happens, no dead tuple is created, and no FOR NO KEY UPDATE row
--- lock is taken. Steady-state production workloads with mostly-stable package
--- catalogues see ~95% of upsert calls become no-ops, drastically reducing
--- WAL volume, vacuum pressure, AND the lock-conflict surface that produced
--- the deadlocks.
+-- update happens and no dead tuple is created. Steady-state production
+-- workloads with mostly-stable package catalogues see ~95% of upsert calls
+-- become no-ops, drastically reducing WAL volume and vacuum pressure.
+--
+-- It does NOT avoid the row lock: the ON CONFLICT arbiter takes its
+-- FOR NO KEY UPDATE lock on the conflicting tuple BEFORE evaluating this
+-- WHERE, and holds it to end of transaction whether or not the update
+-- fires. Deadlock freedom comes from the sorted lock acquisition above, not
+-- from this clause.
 --
 -- The UNION ALL fallback returns (id, name) for input rows that did NOT fire
--- DO UPDATE (i.e. the values are unchanged), so the caller's name → id map
--- is complete regardless of whether each row was newly inserted, updated, or
--- left unchanged. This is required: BulkInsertHostPackages depends on
--- knowing the package_id for every input package.
+-- DO UPDATE (i.e. the values are unchanged), covering the single-threaded
+-- case where every input name resolves to an id.
+--
+-- It is NOT complete under concurrency. The ON CONFLICT arbiter re-reads the
+-- conflicting row outside the statement snapshot, so it can see a row another
+-- transaction committed after this statement began; if that row's values are
+-- identical the skip-no-op WHERE suppresses RETURNING, while the fallback
+-- SELECT still reads `packages` at the (older) statement snapshot and cannot
+-- see the row either. That name is then absent from the result. The caller
+-- MUST detect missing names and resolve them with GetPackageIDsByNames, which
+-- runs as a separate statement and therefore takes a fresh snapshot.
 --
 -- The DO UPDATE intentionally touches only NON-KEY columns
 -- (description / category / latest_version / updated_at). The row lock taken
@@ -126,6 +160,19 @@ JOIN jsonb_to_recordset(sqlc.arg('payload')::jsonb)
     AS i(name text) USING (name)
 WHERE NOT EXISTS (SELECT 1 FROM upserted u WHERE u.name = i.name);
 
+-- name: GetPackageIDsByNames :many
+-- Off-fast-path resolver for names BulkUpsertPackages could not return (see
+-- the concurrency note there). Issued as its own statement so it reads at a
+-- fresh snapshot and observes rows committed by concurrent reports. Takes no
+-- row locks. The caller only runs this when a name is actually missing.
+--
+-- REQUIRES READ COMMITTED. Only under READ COMMITTED does a new statement take
+-- a new snapshot; at REPEATABLE READ or SERIALIZABLE this reuses the
+-- transaction snapshot, resolves nothing, and the race it exists to close
+-- silently returns. The pool sets no TxOptions, so the server default applies
+-- — do not raise it without revisiting this.
+SELECT id, name FROM packages WHERE name = ANY(sqlc.arg('names')::text[]);
+
 -- name: BulkInsertHostPackages :exec
 -- Bulk insert N host_packages rows in a single statement. Replaces the legacy
 -- InsertHostPackage and InsertHostPackageWithWUA per-row inserts — one path
@@ -160,6 +207,7 @@ INSERT INTO host_packages (
     needs_update, is_security_update, source_repository_id,
     wua_guid, wua_kb, wua_severity, wua_categories,
     wua_description, wua_support_url, wua_revision_number,
+    winget_id, winget_pinned, winget_store_app, wua_browse_only, wua_update_type,
     last_checked
 )
 SELECT
@@ -174,6 +222,11 @@ SELECT
     NULLIF(wua_description, '')          AS wua_description,
     NULLIF(wua_support_url, '')          AS wua_support_url,
     NULLIF(wua_revision_number, 0)       AS wua_revision_number,
+    NULLIF(winget_id, '')                AS winget_id,
+    winget_pinned,
+    winget_store_app,
+    wua_browse_only,
+    NULLIF(wua_update_type, '')          AS wua_update_type,
     NOW()
 FROM jsonb_to_recordset(sqlc.arg('payload')::jsonb)
     AS t(
@@ -184,7 +237,8 @@ FROM jsonb_to_recordset(sqlc.arg('payload')::jsonb)
         wua_guid text, wua_kb text, wua_severity text,
         wua_categories jsonb,
         wua_description text, wua_support_url text,
-        wua_revision_number int
+        wua_revision_number int,
+        winget_id text, winget_pinned boolean, winget_store_app boolean, wua_browse_only boolean, wua_update_type text
     )
 ORDER BY package_id;
 
@@ -205,3 +259,12 @@ VALUES (
     $6, $7, NOW(), $8, $9,
     $10, $11, $12, $13
 );
+
+-- name: CountHostWindowsUpdateRows :one
+SELECT
+    COUNT(*)::int AS total,
+    COUNT(*) FILTER (WHERE hp.needs_update)::int AS needs_update,
+    COUNT(*) FILTER (WHERE hp.is_security_update)::int AS security
+FROM host_packages hp
+JOIN packages p ON p.id = hp.package_id
+WHERE hp.host_id = $1 AND p.category = 'Windows Update';

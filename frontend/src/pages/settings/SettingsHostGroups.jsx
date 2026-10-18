@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Edit, Plus, Server, Trash2 } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import ModalPortal from "../../components/ui/ModalPortal";
 import { hostGroupsAPI } from "../../utils/api";
 
 const SettingsHostGroups = () => {
@@ -28,7 +29,7 @@ const SettingsHostGroups = () => {
 	const createMutation = useMutation({
 		mutationFn: (data) => hostGroupsAPI.create(data),
 		onSuccess: () => {
-			queryClient.invalidateQueries(["hostGroups"]);
+			queryClient.invalidateQueries({ queryKey: ["hostGroups"] });
 			setShowCreateModal(false);
 		},
 		onError: (error) => {
@@ -40,7 +41,7 @@ const SettingsHostGroups = () => {
 	const updateMutation = useMutation({
 		mutationFn: ({ id, data }) => hostGroupsAPI.update(id, data),
 		onSuccess: () => {
-			queryClient.invalidateQueries(["hostGroups"]);
+			queryClient.invalidateQueries({ queryKey: ["hostGroups"] });
 			setShowEditModal(false);
 			setSelectedGroup(null);
 		},
@@ -53,7 +54,7 @@ const SettingsHostGroups = () => {
 	const deleteMutation = useMutation({
 		mutationFn: (id) => hostGroupsAPI.delete(id),
 		onSuccess: () => {
-			queryClient.invalidateQueries(["hostGroups"]);
+			queryClient.invalidateQueries({ queryKey: ["hostGroups"] });
 			setShowDeleteModal(false);
 			setGroupToDelete(null);
 		},
@@ -358,8 +359,8 @@ const CreateHostGroupModal = ({ onClose, onSubmit, isLoading }) => {
 		});
 	};
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-md">
 				<h3 className="text-lg font-semibold text-secondary-900 dark:text-white mb-4">
 					Create Host Group
@@ -421,6 +422,7 @@ const CreateHostGroupModal = ({ onClose, onSubmit, isLoading }) => {
 							/>
 							<input
 								type="text"
+								name="color"
 								value={formData.color}
 								onChange={handleChange}
 								className="flex-1 px-3 py-2 border border-secondary-300 dark:border-secondary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white placeholder-secondary-500 dark:placeholder-secondary-400"
@@ -446,6 +448,8 @@ const CreateHostGroupModal = ({ onClose, onSubmit, isLoading }) => {
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 // Edit Host Group Modal
@@ -471,8 +475,8 @@ const EditHostGroupModal = ({ group, onClose, onSubmit, isLoading }) => {
 		});
 	};
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-md">
 				<h3 className="text-lg font-semibold text-secondary-900 dark:text-white mb-4">
 					Edit Host Group
@@ -534,6 +538,7 @@ const EditHostGroupModal = ({ group, onClose, onSubmit, isLoading }) => {
 							/>
 							<input
 								type="text"
+								name="color"
 								value={formData.color}
 								onChange={handleChange}
 								className="flex-1 px-3 py-2 border border-secondary-300 dark:border-secondary-600 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white placeholder-secondary-500 dark:placeholder-secondary-400"
@@ -582,6 +587,8 @@ const EditHostGroupModal = ({ group, onClose, onSubmit, isLoading }) => {
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 // Delete Confirmation Modal
@@ -595,8 +602,8 @@ const DeleteHostGroupModal = ({ group, onClose, onConfirm, isLoading }) => {
 
 	const hosts = hostsData || [];
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-md max-h-[90vh] overflow-y-auto">
 				<div className="flex items-center gap-3 mb-4">
 					<div className="w-10 h-10 bg-danger-100 rounded-full flex items-center justify-center">
@@ -668,6 +675,8 @@ const DeleteHostGroupModal = ({ group, onClose, onConfirm, isLoading }) => {
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 export default SettingsHostGroups;

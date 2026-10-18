@@ -2,11 +2,14 @@ package store
 
 import (
 	"context"
-	"fmt"
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
+	"strings"
 	"time"
 
 	hostctx "github.com/PatchMon/PatchMon/server-source-code/internal/context"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -14,17 +17,29 @@ const (
 	LoginFailedPrefix  = "login:failed:"
 )
 
+// failedAttemptScript arms the TTL whenever it is missing, not only on the first
+// increment, so a lost EXPIRE cannot leave a counter that never expires.
+var failedAttemptScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if redis.call('PTTL', KEYS[1]) < 0 then
+	redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`)
+
 // LoginLockoutStore manages login attempt tracking and lockout in Redis.
 // Uses identifier = IP + username to avoid cross-user lockout while still
 // limiting by IP for distributed attacks.
 type LoginLockoutStore struct {
 	rdb             *hostctx.RedisResolver
+	cfgResolver     *hostctx.ConfigResolver
 	maxAttempts     int
 	lockoutDuration time.Duration
 }
 
-// NewLoginLockoutStore creates a login lockout store.
-func NewLoginLockoutStore(rdb *hostctx.RedisResolver, maxAttempts int, lockoutDurationMinutes int) *LoginLockoutStore {
+// NewLoginLockoutStore creates a login lockout store. cfgResolver supplies the
+// calling context's thresholds; the passed values are the fallback.
+func NewLoginLockoutStore(rdb *hostctx.RedisResolver, cfgResolver *hostctx.ConfigResolver, maxAttempts int, lockoutDurationMinutes int) *LoginLockoutStore {
 	if maxAttempts <= 0 {
 		maxAttempts = 5
 	}
@@ -33,14 +48,33 @@ func NewLoginLockoutStore(rdb *hostctx.RedisResolver, maxAttempts int, lockoutDu
 	}
 	return &LoginLockoutStore{
 		rdb:             rdb,
+		cfgResolver:     cfgResolver,
 		maxAttempts:     maxAttempts,
 		lockoutDuration: time.Duration(lockoutDurationMinutes) * time.Minute,
 	}
 }
 
-// Identifier returns the lockout key identifier (IP + username).
+func (s *LoginLockoutStore) limits(ctx context.Context) (int, time.Duration) {
+	if rc := s.cfgResolver.Resolve(ctx); rc != nil {
+		dur := time.Duration(rc.LockoutDurationMin) * time.Minute
+		if rc.MaxLoginAttempts > 0 && dur > 0 {
+			return rc.MaxLoginAttempts, dur
+		}
+	}
+	return s.maxAttempts, s.lockoutDuration
+}
+
+// Identifier returns the lockout key identifier (IP + hashed username).
+//
+// The username is hashed rather than embedded, because a failed attempt for a
+// username that does not exist still creates a Redis key: interpolating the raw
+// value would let an unauthenticated caller store a key as large as the request
+// body limit allows. It is lowercased and trimmed first because the user lookup
+// matches with LOWER(), so admin/Admin/ADMIN are one account and must share one
+// counter rather than getting a fresh allowance each.
 func (s *LoginLockoutStore) Identifier(clientIP, username string) string {
-	return fmt.Sprintf("%s|%s", clientIP, username)
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(username))))
+	return clientIP + "|" + hex.EncodeToString(sum[:16])
 }
 
 // IsLocked returns whether the identifier is locked and remaining seconds.
@@ -64,17 +98,15 @@ func (s *LoginLockoutStore) RecordFailedAttempt(ctx context.Context, identifier 
 		return 0, false
 	}
 	key := hostctx.TenantKey(ctx, LoginFailedPrefix+identifier)
-	attempts64, err := rdb.Incr(ctx, key).Result()
+	maxAttempts, lockoutDuration := s.limits(ctx)
+	attempts64, err := failedAttemptScript.Run(ctx, rdb, []string{key}, lockoutDuration.Milliseconds()).Int64()
 	if err != nil {
 		return 0, false
 	}
 	attempts = int(attempts64)
-	if attempts == 1 {
-		_ = rdb.Expire(ctx, key, s.lockoutDuration)
-	}
-	if attempts >= s.maxAttempts {
+	if attempts >= maxAttempts {
 		lockKey := hostctx.TenantKey(ctx, LoginLockoutPrefix+identifier)
-		_ = rdb.Set(ctx, lockKey, strconv.FormatInt(time.Now().UnixMilli(), 10), s.lockoutDuration).Err()
+		_ = rdb.Set(ctx, lockKey, strconv.FormatInt(time.Now().UnixMilli(), 10), lockoutDuration).Err()
 		_ = rdb.Del(ctx, key).Err()
 		return attempts, true
 	}

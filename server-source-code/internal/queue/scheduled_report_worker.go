@@ -38,18 +38,8 @@ func NewScheduledReportsDispatchHandler(defaultDB *database.DB, poolCache *hostc
 	return &ScheduledReportsDispatchHandler{defaultDB: defaultDB, poolCache: poolCache, qc: qc, log: log}
 }
 
-func (h *ScheduledReportsDispatchHandler) resolveDB(ctx context.Context, payload []byte) *database.DB {
-	db := h.defaultDB
-	if len(payload) == 0 || h.poolCache == nil {
-		return db
-	}
-	var p AutomationPayload
-	if err := json.Unmarshal(payload, &p); err == nil && strings.TrimSpace(p.Host) != "" {
-		if resolved, err := h.poolCache.GetOrCreate(ctx, p.Host); err == nil && resolved != nil {
-			db = resolved
-		}
-	}
-	return db
+func (h *ScheduledReportsDispatchHandler) resolveDB(ctx context.Context, payload []byte) (context.Context, *database.DB, error) {
+	return resolveDBFromPayload(ctx, payload, h.defaultDB, h.poolCache)
 }
 
 func (h *ScheduledReportsDispatchHandler) processDB(ctx context.Context, d *database.DB, tenantHost string) {
@@ -76,7 +66,10 @@ func (h *ScheduledReportsDispatchHandler) processDB(ctx context.Context, d *data
 func (h *ScheduledReportsDispatchHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	payload := t.Payload()
 	if len(payload) > 0 {
-		d := h.resolveDB(ctx, payload)
+		ctx, d, err := h.resolveDB(ctx, payload)
+		if err != nil {
+			return err
+		}
 		h.processDB(ctx, d, tenantHostFromPayload(payload))
 		return nil
 	}
@@ -87,11 +80,11 @@ func (h *ScheduledReportsDispatchHandler) ProcessTask(ctx context.Context, t *as
 	h.processDB(ctx, h.defaultDB, "")
 	hosts := h.poolCache.ListHosts()
 	for _, host := range hosts {
-		d, err := h.poolCache.GetOrCreate(ctx, host)
-		if err != nil || d == nil {
+		hctx, d, _ := resolveDBForHost(ctx, host, nil, h.poolCache)
+		if d == nil {
 			continue
 		}
-		h.processDB(ctx, d, host)
+		h.processDB(hctx, d, host)
 	}
 	return nil
 }
@@ -150,18 +143,12 @@ func NewScheduledReportRunHandler(defaultDB *database.DB, poolCache *hostctx.Poo
 	return &ScheduledReportRunHandler{defaultDB: defaultDB, poolCache: poolCache, qc: qc, enc: enc, log: log}
 }
 
-func (h *ScheduledReportRunHandler) resolveDB(ctx context.Context, payload []byte) *database.DB {
-	db := h.defaultDB
-	if len(payload) == 0 || h.poolCache == nil {
-		return db
-	}
+func (h *ScheduledReportRunHandler) resolveDB(ctx context.Context, payload []byte) (context.Context, *database.DB, error) {
 	var p ScheduledReportRunPayload
-	if err := json.Unmarshal(payload, &p); err == nil && strings.TrimSpace(p.Host) != "" {
-		if resolved, err := h.poolCache.GetOrCreate(ctx, p.Host); err == nil && resolved != nil {
-			db = resolved
-		}
+	if len(payload) == 0 || json.Unmarshal(payload, &p) != nil {
+		return ctx, h.defaultDB, nil
 	}
-	return db
+	return resolveDBForHost(ctx, p.Host, h.defaultDB, h.poolCache)
 }
 
 // ProcessTask implements asynq.Handler.
@@ -170,7 +157,10 @@ func (h *ScheduledReportRunHandler) ProcessTask(ctx context.Context, t *asynq.Ta
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
 	}
-	d := h.resolveDB(ctx, t.Payload())
+	ctx, d, err := h.resolveDB(ctx, t.Payload())
+	if err != nil {
+		return err
+	}
 	rep, err := d.Queries.GetScheduledReportByID(ctx, p.ReportID)
 	if err != nil {
 		return nil
@@ -309,7 +299,7 @@ func sendScheduledWebhook(ctx context.Context, plain, subject, html, csv string)
 	switch {
 	case isDiscordWebhookURL(cfg.URL):
 		b, err = discordScheduledReportWebhookBody(subject, html, csv)
-	case isSlackIncomingWebhookURL(cfg.URL):
+	case isSlackIncomingWebhookURL(cfg.URL), isSlackCompatibleWebhookURL(cfg.URL):
 		b, err = slackScheduledReportWebhookBody(subject, html, csv)
 	default:
 		body := map[string]interface{}{
@@ -317,6 +307,7 @@ func sendScheduledWebhook(ctx context.Context, plain, subject, html, csv string)
 			"subject": subject,
 			"html":    html,
 			"csv":     csv,
+			"text":    genericScheduledReportText(subject, html),
 		}
 		b, err = json.Marshal(body)
 	}
@@ -339,7 +330,7 @@ func sendScheduledWebhook(ctx context.Context, plain, subject, html, csv string)
 		sig := hex.EncodeToString(mac.Sum(nil))
 		req.Header.Set("X-PatchMon-Signature", "sha256="+sig)
 	}
-	client := &http.Client{Timeout: 45 * time.Second}
+	client := outboundClient(45 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -362,8 +353,11 @@ type scheduledEmailConfig struct {
 	// UseTLS is the legacy boolean preserved for backward compatibility on rows
 	// written before TLSMode existed. New code should set TLSMode and let
 	// mailer.ResolveMode pick the effective policy.
-	UseTLS  bool   `json:"use_tls"`
+	UseTLS  *bool  `json:"use_tls"`
 	TLSMode string `json:"tls_mode"`
+	// AllowInsecureAuth permits PLAIN or LOGIN auth over cleartext. Only meaningful
+	// with tls_mode=none; see mailer.Config.AllowInsecureAuth.
+	AllowInsecureAuth bool `json:"allow_insecure_auth"`
 }
 
 func sendScheduledEmail(ctx context.Context, log *slog.Logger, plain, subject, html, _csv string) error {
@@ -378,7 +372,7 @@ func sendScheduledEmail(ctx context.Context, log *slog.Logger, plain, subject, h
 		cfg.SMTPPort = 587
 	}
 
-	mode := mailer.ResolveMode(cfg.TLSMode, &cfg.UseTLS, cfg.SMTPPort)
+	mode := mailer.ResolveMode(cfg.TLSMode, cfg.UseTLS, cfg.SMTPPort)
 	mc := mailer.Config{
 		Host:     cfg.SMTPHost,
 		Port:     cfg.SMTPPort,
@@ -387,6 +381,9 @@ func sendScheduledEmail(ctx context.Context, log *slog.Logger, plain, subject, h
 		From:     cfg.From,
 		FromName: cfg.FromName,
 		TLSMode:  mode,
+		// Only honoured for tls_mode=none; mailer.validate() rejects the
+		// combination when this is false.
+		AllowInsecureAuth: cfg.AllowInsecureAuth,
 	}
 	if err := mailer.Send(ctx, mc, mailer.Message{To: cfg.To, Subject: subject, HTMLBody: html}); err != nil {
 		var se *mailer.SendError
@@ -453,7 +450,7 @@ func sendScheduledNtfy(ctx context.Context, plain, subject, html, csv string) er
 		req.SetBasicAuth(cfg.Username, cfg.Password)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := outboundClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

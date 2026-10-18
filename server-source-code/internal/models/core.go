@@ -30,6 +30,19 @@ type User struct {
 	DiscordLinkedAt        *time.Time `db:"discord_linked_at"`
 	NewsletterSubscribed   bool       `db:"newsletter_subscribed"`
 	NewsletterSubscribedAt *time.Time `db:"newsletter_subscribed_at"`
+	TfaEnrolmentRequired   bool       `db:"tfa_enrolment_required"`
+	PasswordChangeRequired bool       `db:"password_change_required"`
+	PreviousPasswordHash   *string    `db:"previous_password_hash"`
+}
+
+// PasswordChangePending mirrors GetSessionAuthState.
+func (u *User) PasswordChangePending() bool {
+	return u.PasswordChangeRequired && u.PasswordHash != nil
+}
+
+// TfaEnrolmentPending mirrors GetSessionAuthState: IdP-linked and password-less accounts are exempt.
+func (u *User) TfaEnrolmentPending() bool {
+	return u.TfaEnrolmentRequired && u.PasswordHash != nil && u.OidcSub == nil && u.OidcProvider == nil
 }
 
 // UserSession matches user_sessions table.
@@ -160,6 +173,8 @@ type Settings struct {
 	OidcReadonlyGroup               *string    `db:"oidc_readonly_group"`
 	OidcUserGroup                   *string    `db:"oidc_user_group"`
 	OidcEnforceHTTPS                bool       `db:"oidc_enforce_https"`
+	OidcTrustUnverifiedEmail        bool       `db:"oidc_trust_unverified_email"`
+	OidcLocalAuthFallback           bool       `db:"oidc_local_auth_fallback"`
 	MaxLoginAttempts                *int       `db:"max_login_attempts"`
 	LockoutDurationMinutes          *int       `db:"lockout_duration_minutes"`
 	SessionInactivityTimeoutMinutes *int       `db:"session_inactivity_timeout_minutes"`
@@ -174,6 +189,8 @@ type Settings struct {
 	EnableHSTS                      *bool      `db:"enable_hsts"`
 	JSONBodyLimit                   *string    `db:"json_body_limit"`
 	AgentUpdateBodyLimit            *string    `db:"agent_update_body_limit"`
+	ComplianceBodyLimit             *string    `db:"compliance_body_limit"`
+	AgentPingBodyLimit              *string    `db:"agent_ping_body_limit"`
 	DBTransactionLongTimeout        *int       `db:"db_transaction_long_timeout"`
 	CorsOrigin                      *string    `db:"cors_origin"`
 	EnableLogging                   *bool      `db:"enable_logging"`

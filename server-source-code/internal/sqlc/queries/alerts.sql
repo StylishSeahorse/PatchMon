@@ -1,50 +1,3 @@
--- name: ListAlerts :many
-SELECT
-    a.id,
-    a.type,
-    a.severity,
-    a.title,
-    a.message,
-    a.metadata,
-    a.is_active,
-    a.assigned_to_user_id,
-    a.resolved_at,
-    a.resolved_by_user_id,
-    a.created_at,
-    a.updated_at,
-    u.id AS assigned_user_id,
-    u.username AS assigned_username,
-    u.email AS assigned_email,
-    u.first_name AS assigned_first_name,
-    u.last_name AS assigned_last_name
-FROM alerts a
-LEFT JOIN users u ON a.assigned_to_user_id = u.id
-ORDER BY a.created_at DESC;
-
--- name: ListAlertsAssignedTo :many
-SELECT
-    a.id,
-    a.type,
-    a.severity,
-    a.title,
-    a.message,
-    a.metadata,
-    a.is_active,
-    a.assigned_to_user_id,
-    a.resolved_at,
-    a.resolved_by_user_id,
-    a.created_at,
-    a.updated_at,
-    u.id AS assigned_user_id,
-    u.username AS assigned_username,
-    u.email AS assigned_email,
-    u.first_name AS assigned_first_name,
-    u.last_name AS assigned_last_name
-FROM alerts a
-LEFT JOIN users u ON a.assigned_to_user_id = u.id
-WHERE a.assigned_to_user_id = $1
-ORDER BY a.created_at DESC;
-
 -- name: GetAlertByID :one
 SELECT
     a.id,
@@ -119,7 +72,7 @@ WHERE type = $1
   AND (NOT $3 OR resolved_at IS NOT NULL);
 
 -- name: ListActiveAlertsByType :many
-SELECT id, type, metadata FROM alerts WHERE type = $1 AND is_active = true;
+SELECT id, type, metadata, created_at FROM alerts WHERE type = $1 AND is_active = true;
 
 -- name: GetAlertsToAutoResolve :many
 SELECT id, type, created_at FROM alerts

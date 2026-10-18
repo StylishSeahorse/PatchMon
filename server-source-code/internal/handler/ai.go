@@ -42,7 +42,7 @@ func (h *AIHandler) checkRateLimit(ctx context.Context, userID string) bool {
 	if rdb == nil || userID == "" {
 		return true
 	}
-	key := "ratelimit:ai:" + userID
+	key := hostctx.TenantKey(ctx, "ratelimit:ai:"+userID)
 	count, err := rdb.Incr(ctx, key).Result()
 	if err != nil {
 		return true // fail open
@@ -81,9 +81,13 @@ func (h *AIHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
 		apiKeyInvalid = !apiKeyValid
 	}
 
-	aiModel := s.AiModel
 	if s.AiProvider == "" {
 		s.AiProvider = "openrouter"
+	}
+	aiModel := s.AiModel
+	if aiModel != nil {
+		resolved := ai.ResolveModel(s.AiProvider, *aiModel)
+		aiModel = &resolved
 	}
 
 	JSON(w, http.StatusOK, map[string]interface{}{
@@ -338,8 +342,8 @@ func (h *AIHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	req.Input = strings.TrimSpace(req.Input)
-	if len(req.Input) < 2 || len(req.Input) > 500 {
+	req.Input = strings.TrimLeft(req.Input, " \t")
+	if len(strings.TrimSpace(req.Input)) < 2 || len(req.Input) > 500 {
 		Error(w, http.StatusBadRequest, "input must be 2-500 characters")
 		return
 	}

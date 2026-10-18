@@ -21,9 +21,14 @@ import {
 	riskLabel,
 } from "../../constants/permissionGroups";
 import { useAuth } from "../../contexts/AuthContext";
+import { useConfirm } from "../../contexts/ConfirmContext";
+import { useToast } from "../../contexts/ToastContext";
 import { permissionsAPI } from "../../utils/api";
+import ModalPortal from "../ui/ModalPortal";
 
 const RolesTab = () => {
+	const confirm = useConfirm();
+	const toast = useToast();
 	const [editingRole, setEditingRole] = useState(null);
 	const [showAddModal, setShowAddModal] = useState(false);
 	const queryClient = useQueryClient();
@@ -109,20 +114,24 @@ const RolesTab = () => {
 			await updateRoleMutation.mutateAsync({ role, permissions });
 		} catch (error) {
 			console.error("Failed to update permissions:", error);
+			toast.error(error.response?.data?.error || "Failed to update role");
 		}
 	};
 
 	const handleDeleteRole = async (role) => {
-		if (
-			window.confirm(
-				`Are you sure you want to delete the "${role}" role? This action cannot be undone.`,
-			)
-		) {
-			try {
-				await deleteRoleMutation.mutateAsync(role);
-			} catch (error) {
-				console.error("Failed to delete role:", error);
-			}
+		const confirmed = await confirm({
+			title: "Delete role",
+			message: `Are you sure you want to delete the "${role}" role?`,
+			confirmLabel: "Delete role",
+		});
+		if (!confirmed) return;
+
+		try {
+			await deleteRoleMutation.mutateAsync(role);
+			toast.success(`Role "${role}" deleted`);
+		} catch (error) {
+			console.error("Failed to delete role:", error);
+			toast.error(error.response?.data?.error || "Failed to delete role");
 		}
 	};
 
@@ -588,8 +597,8 @@ const AddRoleModal = ({ isOpen, onClose, onSuccess }) => {
 
 	if (!isOpen) return null;
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
 				<h3 className="text-lg font-medium text-secondary-900 dark:text-white mb-4">
 					Add New Role
@@ -752,6 +761,8 @@ const AddRoleModal = ({ isOpen, onClose, onSuccess }) => {
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 export default RolesTab;

@@ -75,6 +75,18 @@ type PackageHostRef struct {
 	AvailableVersion *string `json:"availableVersion"`
 	NeedsUpdate      bool    `json:"needsUpdate"`
 	IsSecurityUpdate bool    `json:"isSecurityUpdate"`
+	Patchability
+}
+
+// Patchability says whether a host-package pair can be patched and, on Windows, by which channel.
+type Patchability struct {
+	Patchable          bool   `json:"patchable"`
+	NotPatchableReason string `json:"notPatchableReason,omitempty"`
+	PatchSource        string `json:"patchSource,omitempty"`
+	WUABrowseOnly      bool   `json:"wuaBrowseOnly,omitempty"`
+	WUAUpdateType      string `json:"wuaUpdateType,omitempty"`
+	IsFeatureUpgrade   bool   `json:"isFeatureUpgrade,omitempty"`
+	PendingRestart     bool   `json:"pendingRestart,omitempty"`
 }
 
 // PackageStats holds package statistics.
@@ -84,8 +96,10 @@ type PackageStats struct {
 	SecurityUpdates int `json:"securityUpdates"`
 }
 
-// List returns packages with stats, supporting filters.
-func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithStats, int, error) {
+// List returns packages with stats, supporting filters. The third return
+// value is the total installs across the whole filtered set, not just the
+// returned page.
+func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithStats, int, int64, error) {
 	d := s.db.DB(ctx)
 	if p.Limit <= 0 {
 		p.Limit = 50
@@ -131,21 +145,22 @@ func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithSt
 	// still has to touch host_packages directly for the EXISTS / NOT
 	// EXISTS branches when those filters are active.
 	var total int32
+	var totalInstalls int64
 	var pkgs []listPackagesRow
 	if werr := withWorkMemTxRaw(ctx, s.db, func(_ *db.Queries, tx pgx.Tx) error {
 		var err error
-		total, err = runCountPackages(ctx, tx, filters)
+		total, totalInstalls, err = runCountPackages(ctx, tx, filters)
 		if err != nil {
 			return err
 		}
 		pkgs, err = runListPackages(ctx, tx, filters, sortKey, sortDir, safeconv.ClampToInt32(p.Limit), safeconv.ClampToInt32(offset))
 		return err
 	}); werr != nil {
-		return nil, 0, werr
+		return nil, 0, 0, werr
 	}
 
 	if len(pkgs) == 0 {
-		return []PackageWithStats{}, int(total), nil
+		return []PackageWithStats{}, int(total), totalInstalls, nil
 	}
 
 	ids := make([]string, len(pkgs))
@@ -164,7 +179,7 @@ func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithSt
 	}
 	hostRefs, err := d.Queries.GetHostRefsForPackageIDs(ctx, hostRefsArg)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	sourceRepoArg := db.GetSourceReposByPackageIDsParams{Column1: ids}
@@ -173,7 +188,7 @@ func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithSt
 	}
 	sourceRepoRows, err := d.Queries.GetSourceReposByPackageIDs(ctx, sourceRepoArg)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	reposByPkg := make(map[string][]PackageRepoRef)
 	for _, r := range sourceRepoRows {
@@ -196,15 +211,21 @@ func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithSt
 			AvailableVersion: r.AvailableVersion,
 			NeedsUpdate:      r.NeedsUpdate,
 			IsSecurityUpdate: r.IsSecurityUpdate,
+			Patchability: Patchability{
+				Patchable:          r.Patchable,
+				NotPatchableReason: r.NotPatchableReason,
+				PatchSource:        r.PatchSource,
+				WUABrowseOnly:      r.WuaBrowseOnly,
+				WUAUpdateType:      r.WuaUpdateType,
+				IsFeatureUpgrade:   r.IsFeatureUpgrade,
+				PendingRestart:     r.PendingRestart,
+			},
 		}
 		hostsByPkg[r.PackageID] = append(hostsByPkg[r.PackageID], ref)
 	}
 
 	out := make([]PackageWithStats, len(pkgs))
 	for i, p := range pkgs {
-		// Counters are global per-package as documented above (host filter
-		// in the table doesn't change the per-row footprint badge), and
-		// come straight from mv_package_stats via ListPackages.
 		totalInstalls := int(p.TotalInstalls)
 		updatesNeeded := int(p.UpdatesNeeded)
 		securityUpdates := int(p.SecurityUpdates)
@@ -225,7 +246,7 @@ func (s *PackagesStore) List(ctx context.Context, p ListParams) ([]PackageWithSt
 			SourceRepos: orEmptyRepos(reposByPkg[p.ID]),
 		}
 	}
-	return out, int(total), nil
+	return out, int(total), totalInstalls, nil
 }
 
 func packageListSortKey(sort string) string {
@@ -268,16 +289,23 @@ func (s *PackagesStore) GetByID(ctx context.Context, id string) (*PackageDetail,
 	var sourceRepos []PackageRepoRef
 	for i, r := range rows {
 		hostPackages[i] = HostPackageWithHost{
-			ID:               r.ID,
-			HostID:           r.HostID,
-			PackageID:        id,
-			CurrentVersion:   r.CurrentVersion,
-			AvailableVersion: r.AvailableVersion,
-			NeedsUpdate:      r.NeedsUpdate,
-			IsSecurityUpdate: r.IsSecurityUpdate,
-			LastChecked:      pgTime(r.LastChecked),
-			SourceRepoID:     r.SourceRepositoryID,
-			SourceRepoName:   r.SourceRepoName,
+			ID:                 r.ID,
+			HostID:             r.HostID,
+			PackageID:          id,
+			CurrentVersion:     r.CurrentVersion,
+			AvailableVersion:   r.AvailableVersion,
+			NeedsUpdate:        r.NeedsUpdate,
+			IsSecurityUpdate:   r.IsSecurityUpdate,
+			LastChecked:        pgTime(r.LastChecked),
+			SourceRepoID:       r.SourceRepositoryID,
+			SourceRepoName:     r.SourceRepoName,
+			Patchable:          r.Patchable,
+			NotPatchableReason: r.NotPatchableReason,
+			PatchSource:        r.PatchSource,
+			WUABrowseOnly:      r.WuaBrowseOnly,
+			WUAUpdateType:      r.WuaUpdateType,
+			IsFeatureUpgrade:   r.IsFeatureUpgrade,
+			PendingRestart:     r.PendingRestart,
 			Hosts: HostPackageHostRef{
 				ID:           r.HostID,
 				FriendlyName: r.HostFriendlyName,
@@ -364,17 +392,24 @@ type PackageDetail struct {
 
 // HostPackageWithHost is host_package with nested host.
 type HostPackageWithHost struct {
-	ID               string             `json:"id"`
-	HostID           string             `json:"host_id"`
-	PackageID        string             `json:"package_id"`
-	CurrentVersion   string             `json:"current_version"`
-	AvailableVersion *string            `json:"available_version"`
-	NeedsUpdate      bool               `json:"needs_update"`
-	IsSecurityUpdate bool               `json:"is_security_update"`
-	LastChecked      time.Time          `json:"last_checked"`
-	SourceRepoID     *string            `json:"source_repo_id"`
-	SourceRepoName   *string            `json:"source_repo_name"`
-	Hosts            HostPackageHostRef `json:"hosts"`
+	ID                 string             `json:"id"`
+	HostID             string             `json:"host_id"`
+	PackageID          string             `json:"package_id"`
+	CurrentVersion     string             `json:"current_version"`
+	AvailableVersion   *string            `json:"available_version"`
+	NeedsUpdate        bool               `json:"needs_update"`
+	IsSecurityUpdate   bool               `json:"is_security_update"`
+	LastChecked        time.Time          `json:"last_checked"`
+	SourceRepoID       *string            `json:"source_repo_id"`
+	SourceRepoName     *string            `json:"source_repo_name"`
+	Hosts              HostPackageHostRef `json:"hosts"`
+	Patchable          bool               `json:"patchable"`
+	NotPatchableReason string             `json:"not_patchable_reason,omitempty"`
+	PatchSource        string             `json:"patch_source,omitempty"`
+	WUABrowseOnly      bool               `json:"wua_browse_only,omitempty"`
+	WUAUpdateType      string             `json:"wua_update_type,omitempty"`
+	IsFeatureUpgrade   bool               `json:"is_feature_upgrade,omitempty"`
+	PendingRestart     bool               `json:"pending_restart,omitempty"`
 }
 
 // HostPackageHostRef has host fields for package detail.
@@ -430,6 +465,7 @@ type PackageHostEntry struct {
 	Hostname         *string   `json:"hostname"`
 	OSType           string    `json:"osType"`
 	OSVersion        string    `json:"osVersion"`
+	PackageManager   *string   `json:"packageManager"`
 	LastUpdate       time.Time `json:"lastUpdate"`
 	CurrentVersion   string    `json:"currentVersion"`
 	AvailableVersion *string   `json:"availableVersion"`
@@ -439,6 +475,7 @@ type PackageHostEntry struct {
 	NeedsReboot      *bool     `json:"needsReboot"`
 	RebootReason     *string   `json:"rebootReason"`
 	SourceRepoName   *string   `json:"sourceRepoName"`
+	Patchability
 }
 
 // GetHosts returns hosts where a package is installed.
@@ -498,6 +535,7 @@ func (s *PackagesStore) GetHosts(ctx context.Context, packageIDOrName string, p 
 			Hostname:         r.Hostname,
 			OSType:           r.OsType,
 			OSVersion:        r.OsVersion,
+			PackageManager:   r.PackageManager,
 			LastUpdate:       pgTime(r.LastUpdate),
 			CurrentVersion:   r.CurrentVersion,
 			AvailableVersion: r.AvailableVersion,
@@ -507,6 +545,15 @@ func (s *PackagesStore) GetHosts(ctx context.Context, packageIDOrName string, p 
 			NeedsReboot:      r.NeedsReboot,
 			RebootReason:     r.RebootReason,
 			SourceRepoName:   r.SourceRepoName,
+			Patchability: Patchability{
+				Patchable:          r.Patchable,
+				NotPatchableReason: r.NotPatchableReason,
+				PatchSource:        r.PatchSource,
+				WUABrowseOnly:      r.WuaBrowseOnly,
+				WUAUpdateType:      r.WuaUpdateType,
+				IsFeatureUpgrade:   r.IsFeatureUpgrade,
+				PendingRestart:     r.PendingRestart,
+			},
 		}
 	}
 	return out, int(total), nil

@@ -4,7 +4,9 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"time"
@@ -12,11 +14,13 @@ import (
 	"github.com/PatchMon/PatchMon/server-source-code/internal/database"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/db"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/pgtime"
+	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
-// ExtractIPFromInterface extracts the first inet (IPv4) address from the named interface in networkInterfaces JSON.
-// Returns empty string if not found or on parse error.
+// ExtractIPFromInterface returns the first global IPv4 address on the named interface in
+// networkInterfaces JSON, falling back to the first global IPv6. Empty if none or on parse error.
 func ExtractIPFromInterface(networkInterfaces []byte, interfaceName string) string {
 	if len(networkInterfaces) == 0 || interfaceName == "" {
 		return ""
@@ -34,21 +38,28 @@ func ExtractIPFromInterface(networkInterfaces []byte, interfaceName string) stri
 		if !ok {
 			return ""
 		}
+		var ipv6Fallback string
 		for _, a := range addrs {
 			addrMap, ok := a.(map[string]interface{})
 			if !ok {
 				continue
 			}
 			family, _ := addrMap["family"].(string)
-			if family != "inet" {
+			addr, _ := addrMap["address"].(string)
+			ip := net.ParseIP(addr)
+			if ip == nil || !ip.IsGlobalUnicast() {
 				continue
 			}
-			addr, _ := addrMap["address"].(string)
-			if addr != "" {
+			switch family {
+			case "inet":
 				return addr
+			case "inet6":
+				if ipv6Fallback == "" {
+					ipv6Fallback = addr
+				}
 			}
 		}
-		return ""
+		return ipv6Fallback
 	}
 	return ""
 }
@@ -80,6 +91,11 @@ type ReportPackage struct {
 	WUACategories     []string `json:"wuaCategories,omitempty"`
 	WUASupportURL     string   `json:"wuaSupportUrl,omitempty"`
 	WUARevisionNumber int32    `json:"wuaRevisionNumber,omitempty"`
+	WUABrowseOnly     bool     `json:"wuaBrowseOnly,omitempty"`
+	WUAType           string   `json:"wuaType,omitempty"`
+	WingetID          string   `json:"wingetId,omitempty"`
+	WingetPinned      bool     `json:"wingetPinned,omitempty"`
+	WingetStoreApp    bool     `json:"wingetStoreApp,omitempty"`
 }
 
 // ReportRepository is a single repository from the agent report.
@@ -104,6 +120,8 @@ type ReportPayload struct {
 	Architecture           string             `json:"architecture"`
 	AgentVersion           string             `json:"agentVersion"`
 	MachineID              string             `json:"machineId"`
+	HostID                 string             `json:"hostId,omitempty"`
+	ConfigVersion          string             `json:"configVersion,omitempty"`
 	KernelVersion          string             `json:"kernelVersion"`
 	InstalledKernelVersion string             `json:"installedKernelVersion"`
 	SELinuxStatus          string             `json:"selinuxStatus"`
@@ -138,6 +156,9 @@ type ReportPayload struct {
 	// stored on the matching update_history row so the Agent Activity UI can
 	// show "agent took N ms" alongside the server-processing duration.
 	AgentExecutionMs *int `json:"agentExecutionMs,omitempty"`
+	// WindowsUpdatesOmitted means the agent left its Windows Update rows out of this report
+	// (it could not scan during a patch run); the host's stored ones are kept.
+	WindowsUpdatesOmitted bool `json:"windowsUpdatesOmitted,omitempty"`
 }
 
 // ReportHashes is the four "main report" canonical hashes the agent ships
@@ -332,16 +353,17 @@ func sortReportInputs(payload *ReportPayload) {
 // COALESCE in the UpdateHostFromReport SQL).
 func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload *ReportPayload, sections ReportSections, hashes ReportHashes) (*ProcessReportResult, error) {
 	d := s.db.DB(ctx)
-	securityCount := 0
-	updatesCount := 0
-	for _, p := range payload.Packages {
-		if p.NeedsUpdate {
-			updatesCount++
-		}
-		if p.IsSecurityUpdate {
-			securityCount++
-		}
+	if payload.WindowsUpdatesOmitted {
+		payload.Packages = withoutWindowsUpdates(payload.Packages)
 	}
+	counts := countReportPackages(payload.Packages)
+	keptTotal := 0
+
+	// Strip NUL and invalid UTF-8 before anything touches a query parameter.
+	// Postgres cannot store either, and one bad byte from one Windows host
+	// aborts that host's whole report. See sanitizeReportPayload for why this
+	// sits here and not at the decode boundary.
+	sanitizeReportPayload(payload)
 
 	// Deterministic ordering eliminates cross-transaction lock-order
 	// inversion that caused 40P01 deadlocks. See sortReportInputs.
@@ -401,6 +423,12 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 	}
 	if payload.MachineID != "" {
 		params.MachineID = &payload.MachineID
+	}
+	if util.ValidConfigVersion(payload.ConfigVersion) {
+		params.ConfigVersion = &payload.ConfigVersion
+	}
+	if util.ValidHostID(payload.HostID) {
+		params.ReportedHostID = &payload.HostID
 	}
 	if payload.OSType != "" {
 		params.OsType = &payload.OSType
@@ -540,7 +568,17 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 	// packages section. Without this guard a partial report (e.g. interfaces
 	// only) would wipe the package list and reinsert nothing.
 	if sections.Packages {
-		if err := q.DeleteHostPackagesByHostID(ctx, hostID); err != nil {
+		if payload.WindowsUpdatesOmitted {
+			kept, err := q.CountHostWindowsUpdateRows(ctx, hostID)
+			if err != nil {
+				return nil, fmt.Errorf("CountHostWindowsUpdateRows: %w", err)
+			}
+			counts = counts.plus(reportCounts{updates: int(kept.NeedsUpdate), security: int(kept.Security)})
+			keptTotal = int(kept.Total)
+			if err := q.DeleteHostPackagesExceptWindowsUpdates(ctx, hostID); err != nil {
+				return nil, fmt.Errorf("DeleteHostPackagesExceptWindowsUpdates: %w", err)
+			}
+		} else if err := q.DeleteHostPackagesByHostID(ctx, hostID); err != nil {
 			return nil, fmt.Errorf("DeleteHostPackagesByHostID: %w", err)
 		}
 	}
@@ -605,7 +643,7 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 			// producing duplicate (url, distribution, components) rows — and
 			// also cost an extra network round-trip per repository.
 			desc := repoData.RepoType + " repository for " + repoData.Distribution
-			repoID, err := q.UpsertRepository(ctx, db.UpsertRepositoryParams{
+			repoID, err := upsertRepositoryResolvingID(ctx, q, db.UpsertRepositoryParams{
 				ID:           uuid.New().String(),
 				Name:         repoData.Name,
 				Url:          repoData.URL,
@@ -672,15 +710,28 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 		// Map name -> package ID for host_packages assembly. With the
 		// no-op-skip WHERE on BulkUpsertPackages, RETURNING only emits rows
 		// that actually fired DO UPDATE; the UNION ALL fallback returns
-		// (id, name) for rows whose values were unchanged. Either way we
-		// get exactly one (id, name) pair per distinct input name.
+		// (id, name) for rows whose values were unchanged.
 		// payload.Packages is deduped above so len(upserted) == len(packages).
 		nameToID := make(map[string]string, len(upserted))
 		for _, row := range upserted {
 			nameToID[row.Name] = row.ID
 		}
+		// Neither half of that statement can see a row a concurrent report
+		// committed after the statement's snapshot was taken, so a brand new
+		// package name reported by two hosts at once can come back missing.
+		// A separate statement reads at a fresh snapshot and resolves it.
+		// Off the fast path: only runs when something is actually missing.
+		if missing := missingPackageNames(payload.Packages, nameToID); len(missing) > 0 {
+			resolved, err := q.GetPackageIDsByNames(ctx, missing)
+			if err != nil {
+				return nil, fmt.Errorf("GetPackageIDsByNames: %w", err)
+			}
+			for _, row := range resolved {
+				nameToID[row.Name] = row.ID
+			}
+		}
 		// buildHostPackagesPayload below is the real correctness check: it
-		// errors if any payload.Packages name is missing from nameToID.
+		// errors if any payload.Packages name is still missing from nameToID.
 
 		hpPayload, err := buildHostPackagesPayload(hostID, payload.Packages, nameToID,
 			reposByName, reposByURLDistComp, reposByComponent)
@@ -692,7 +743,7 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 		}
 	}
 
-	totalPkg := int32(len(payload.Packages))
+	totalPkg := int32(len(payload.Packages) + keptTotal)
 	execTime := payload.ExecutionTime
 	// Discriminate full vs partial for the Agent Activity feed: a payload
 	// without a Sections list is a legacy/full report, anything that arrived
@@ -718,8 +769,8 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 	if err := q.InsertUpdateHistory(ctx, db.InsertUpdateHistoryParams{
 		ID:                uuid.New().String(),
 		HostID:            hostID,
-		PackagesCount:     int32(updatesCount),
-		SecurityCount:     int32(securityCount),
+		PackagesCount:     int32(counts.updates),
+		SecurityCount:     int32(counts.security),
 		TotalPackages:     &totalPkg,
 		PayloadSizeKb:     &payloadSizeKb,
 		ExecutionTime:     &execTime,
@@ -739,9 +790,110 @@ func (s *ReportStore) ProcessReport(ctx context.Context, hostID string, payload 
 
 	return &ProcessReportResult{
 		PackagesProcessed: len(payload.Packages),
-		UpdatesAvailable:  updatesCount,
-		SecurityUpdates:   securityCount,
+		UpdatesAvailable:  counts.updates,
+		SecurityUpdates:   counts.security,
 	}, nil
+}
+
+// upsertRepositoryResolvingID returns the canonical id for a reported
+// repository, running UpsertRepository only when the row is absent or a column
+// it would write actually differs.
+//
+// The read-first step is what keeps concurrent reports off each other. One
+// repository row is shared by every host on a distro, and ON CONFLICT locks
+// the conflicting tuple FOR NO KEY UPDATE before it evaluates the DO UPDATE
+// WHERE — so even a no-op upsert holds that lock for the rest of the report
+// transaction, which is where the host_packages delete and bulk insert happen.
+// A plain read takes no lock.
+//
+// The trailing lookup covers the other direction: when the upsert did run and
+// its skip-no-op WHERE suppressed RETURNING, because a concurrent report
+// committed the same values after this statement's snapshot was taken. It has
+// to be a separate statement to read at a fresh snapshot.
+func upsertRepositoryResolvingID(ctx context.Context, q *db.Queries, params db.UpsertRepositoryParams) (string, error) {
+	key := db.GetRepositoryByURLDistComponentsParams{
+		Url:          params.Url,
+		Distribution: params.Distribution,
+		Components:   params.Components,
+	}
+
+	// Trade-off of the lock-free fast path: an unchanged report never touches
+	// the repositories row, so nothing holds it for the rest of the
+	// transaction. The daily CleanupOrphaned worker deletes repositories with
+	// no host_repositories rows, so it can in principle remove this row between
+	// the read below and the host_repositories insert, surfacing as an FK
+	// violation. That needs a repository to be fleet-wide orphaned at the
+	// instant a report attaches to it; the old unconditional upsert blocked it
+	// by holding the row lock, at the cost of serialising the whole fleet.
+	existing, err := q.GetRepositoryByURLDistComponents(ctx, key)
+	switch {
+	case err == nil:
+		if repositoryRowMatches(existing, params) {
+			return existing.ID, nil
+		}
+	case !errors.Is(err, pgx.ErrNoRows):
+		return "", fmt.Errorf("pre-check: %w", err)
+	}
+
+	repoID, err := q.UpsertRepository(ctx, params)
+	if err == nil {
+		return repoID, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+
+	existing, err = q.GetRepositoryByURLDistComponents(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("resolve unchanged repository: %w", err)
+	}
+	return existing.ID, nil
+}
+
+// repositoryRowMatches reports whether every column UpsertRepository's DO
+// UPDATE would write already holds the reported value, applying the same
+// COALESCE semantics as the SET clause (a nil reported description leaves the
+// stored one alone, so it is not a difference).
+func repositoryRowMatches(row db.GetRepositoryByURLDistComponentsRow, params db.UpsertRepositoryParams) bool {
+	if row.Name != params.Name ||
+		row.RepoType != params.RepoType ||
+		row.IsActive != params.IsActive ||
+		row.IsSecure != params.IsSecure {
+		return false
+	}
+	if !equalPtr(row.Priority, params.Priority) {
+		return false
+	}
+	return params.Description == nil || equalPtr(row.Description, params.Description)
+}
+
+func equalPtr[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// missingPackageNames returns the distinct names in packages that have no
+// entry in nameToID, in input order. Allocates nothing when none are missing.
+func missingPackageNames(packages []ReportPackage, nameToID map[string]string) []string {
+	var missing []string
+	var seen map[string]struct{}
+	for i := range packages {
+		name := packages[i].Name
+		if _, ok := nameToID[name]; ok {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[string]struct{})
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		missing = append(missing, name)
+	}
+	return missing
 }
 
 // resolveSourceRepoID matches an agent's sourceRepository string to a repository ID
@@ -799,8 +951,15 @@ type packageUpsertRow struct {
 // by Name; this function only assembles the JSON.
 func buildPackageUpsertPayload(packages []ReportPackage) ([]byte, error) {
 	rows := make([]packageUpsertRow, 0, len(packages))
+	// Duplicate names abort the whole upsert with Postgres 21000. The agent
+	// should not send them, but the ingest must not be crashable by agent data.
+	seen := make(map[string]struct{}, len(packages))
 	for i := range packages {
 		p := &packages[i]
+		if _, dup := seen[p.Name]; dup {
+			continue
+		}
+		seen[p.Name] = struct{}{}
 		row := packageUpsertRow{
 			ID:   uuid.New().String(),
 			Name: p.Name,
@@ -848,6 +1007,11 @@ type hostPackageRow struct {
 	WUADescription     string   `json:"wua_description"`
 	WUASupportURL      string   `json:"wua_support_url"`
 	WUARevisionNumber  int32    `json:"wua_revision_number"`
+	WingetID           string   `json:"winget_id"`
+	WingetPinned       *bool    `json:"winget_pinned"`
+	WingetStoreApp     *bool    `json:"winget_store_app"`
+	WUABrowseOnly      *bool    `json:"wua_browse_only"`
+	WUAUpdateType      string   `json:"wua_update_type"`
 }
 
 // buildHostPackagesPayload encodes host_packages rows as a jsonb array suitable
@@ -862,8 +1026,15 @@ func buildHostPackagesPayload(
 	reposByName, reposByURLDistComp, reposByComponent map[string]string,
 ) ([]byte, error) {
 	rows := make([]hostPackageRow, 0, len(packages))
+	// As above: no ON CONFLICT here, so duplicates violate
+	// UNIQUE(host_id, package_id). Kept in step with the upsert payload.
+	seen := make(map[string]struct{}, len(packages))
 	for i := range packages {
 		p := &packages[i]
+		if _, dup := seen[p.Name]; dup {
+			continue
+		}
+		seen[p.Name] = struct{}{}
 		pkgID, ok := nameToID[p.Name]
 		if !ok {
 			return nil, fmt.Errorf("no upserted ID for package %q", p.Name)
@@ -888,6 +1059,17 @@ func buildHostPackagesPayload(
 			IsSecurityUpdate:   p.IsSecurityUpdate,
 			SourceRepositoryID: sourceRepoID,
 		}
+		if IsValidWingetID(p.WingetID) {
+			row.WingetID = p.WingetID
+			if p.WingetPinned {
+				pinned := true
+				row.WingetPinned = &pinned
+			}
+		}
+		if p.WingetStoreApp {
+			storeApp := true
+			row.WingetStoreApp = &storeApp
+		}
 
 		// Windows Update entries carry WUA metadata. The agent flags them by
 		// setting WUAGuid; we keep the same Go-side detection rule the
@@ -902,8 +1084,47 @@ func buildHostPackagesPayload(
 			if len(p.WUACategories) > 0 {
 				row.WUACategories = p.WUACategories
 			}
+			browseOnly := p.WUABrowseOnly
+			row.WUABrowseOnly = &browseOnly
+			if p.WUAType == WUAUpdateTypeSoftware || p.WUAType == WUAUpdateTypeDriver || p.WUAType == WUAUpdateTypeFeature {
+				row.WUAUpdateType = p.WUAType
+			}
 		}
 		rows = append(rows, row)
 	}
 	return json.Marshal(rows)
+}
+
+// windowsUpdateCategory is the package category the Windows agent gives every Windows Update row.
+const windowsUpdateCategory = "Windows Update"
+
+func withoutWindowsUpdates(pkgs []ReportPackage) []ReportPackage {
+	out := pkgs[:0]
+	for _, p := range pkgs {
+		if p.Category != windowsUpdateCategory {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+type reportCounts struct {
+	updates, security int
+}
+
+func (c reportCounts) plus(o reportCounts) reportCounts {
+	return reportCounts{updates: c.updates + o.updates, security: c.security + o.security}
+}
+
+func countReportPackages(pkgs []ReportPackage) reportCounts {
+	var c reportCounts
+	for _, p := range pkgs {
+		if p.NeedsUpdate {
+			c.updates++
+		}
+		if p.IsSecurityUpdate {
+			c.security++
+		}
+	}
+	return c
 }

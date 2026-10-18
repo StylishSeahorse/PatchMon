@@ -3,6 +3,7 @@ import { AlertCircle, CheckCircle, Save, Server } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import { settingsAPI } from "../../utils/api";
 import { FORM_INPUT_CLASS } from "../FormInput";
+import ServerUrlCorsWarning from "../ServerUrlCorsWarning";
 
 const ProtocolUrlTab = () => {
 	const protocolId = useId();
@@ -32,19 +33,18 @@ const ProtocolUrlTab = () => {
 		staleTime: 0, // Always fetch fresh data
 	});
 
-	// Update form data when settings are loaded
+	// Hydrate the form from the server, but never over unsaved edits: any
+	// refetch (returning to the tab, a sibling tab's save, a reconnect) would
+	// otherwise discard whatever the user had typed.
 	useEffect(() => {
-		if (settings) {
-			const newFormData = {
-				serverProtocol: settings.server_protocol || "http",
-				serverHost: settings.server_host || "localhost",
-				serverPort: settings.server_port || 3001,
-				ignoreSslSelfSigned: settings.ignore_ssl_self_signed === true,
-			};
-			setFormData(newFormData);
-			setIsDirty(false);
-		}
-	}, [settings]);
+		if (!settings || isDirty) return;
+		setFormData({
+			serverProtocol: settings.server_protocol || "http",
+			serverHost: settings.server_host || "localhost",
+			serverPort: settings.server_port || 3001,
+			ignoreSslSelfSigned: settings.ignore_ssl_self_signed === true,
+		});
+	}, [settings, isDirty]);
 
 	// Update settings mutation
 	const updateSettingsMutation = useMutation({
@@ -66,8 +66,9 @@ const ProtocolUrlTab = () => {
 			if (data?.settings) {
 				queryClient.setQueryData(["settings"], data.settings);
 			}
-			queryClient.invalidateQueries(["settings"]);
-			queryClient.invalidateQueries(["serverUrl"]);
+			queryClient.invalidateQueries({ queryKey: ["settings"] });
+			queryClient.invalidateQueries({ queryKey: ["serverUrl"] });
+			queryClient.invalidateQueries({ queryKey: ["serverUrlCorsCheck"] });
 			setIsDirty(false);
 			setErrors({});
 		},
@@ -257,6 +258,10 @@ const ProtocolUrlTab = () => {
 								</p>
 							)}
 						</div>
+					</div>
+
+					<div className="mt-4">
+						<ServerUrlCorsWarning />
 					</div>
 
 					<div className="mt-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-md">

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	hostctx "github.com/PatchMon/PatchMon/server-source-code/internal/context"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/db"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/middleware"
+	"github.com/PatchMon/PatchMon/server-source-code/internal/models"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/notifications"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/patchstream"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/queue"
@@ -29,7 +31,7 @@ import (
 
 const patchRunJobIDPrefix = "patch-run-"
 
-var packageNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.+-_]*$`)
+var packageNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._+\-]*$`)
 
 // deletablePatchRunStatuses are statuses where the run can be deleted (not yet executed or cancelled).
 var deletablePatchRunStatuses = map[string]bool{
@@ -40,6 +42,8 @@ var deletablePatchRunStatuses = map[string]bool{
 	"approved":           true,
 	"scheduled":          true,
 }
+
+const activePatchRunMessage = "A patch run is already queued or in progress on this host. Wait for it to finish, or cancel it, before starting another."
 
 // PatchingHandler handles patching endpoints.
 type PatchingHandler struct {
@@ -143,52 +147,76 @@ func isValidPackageName(s string) bool {
 	return len(s) > 0 && len(s) <= 256 && packageNameRegex.MatchString(s)
 }
 
-// ServePatchOutput handles POST /patching/runs/:id/output (agent-facing, API key auth).
-func (h *PatchingHandler) ServePatchOutput(w http.ResponseWriter, r *http.Request) {
+// authenticateAgent resolves the host behind X-API-ID / X-API-KEY, writing a 401 when it cannot.
+func (h *PatchingHandler) authenticateAgent(w http.ResponseWriter, r *http.Request) (*models.Host, bool) {
 	apiID := r.Header.Get("X-API-ID")
 	apiKey := r.Header.Get("X-API-KEY")
 	if apiID == "" || apiKey == "" {
 		JSON(w, http.StatusUnauthorized, map[string]string{"error": "API ID and Key required"})
-		return
+		return nil, false
 	}
 	host, err := h.hosts.GetByApiID(r.Context(), apiID)
 	if err != nil || host == nil {
 		JSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid API credentials"})
-		return
+		return nil, false
 	}
 	ok, err := util.VerifyAPIKey(apiKey, host.ApiKey)
 	if err != nil || !ok {
 		JSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid API credentials"})
-		return
+		return nil, false
 	}
+	return host, true
+}
 
+// agentRunFromRequest loads the run named in the URL and checks it belongs to the calling host.
+func (h *PatchingHandler) agentRunFromRequest(w http.ResponseWriter, r *http.Request, host *models.Host) (*db.GetPatchRunByIDRow, bool) {
 	patchRunID := chi.URLParam(r, "id")
 	if !isValidPatchUUID(patchRunID) {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid patch run ID"})
+		return nil, false
+	}
+	run, err := h.patchRuns.GetByID(r.Context(), patchRunID)
+	if err != nil || run == nil {
+		JSON(w, http.StatusNotFound, map[string]string{"error": "Patch run not found"})
+		return nil, false
+	}
+	if run.HostID != host.ID {
+		JSON(w, http.StatusForbidden, map[string]string{"error": "Patch run does not belong to this host"})
+		return nil, false
+	}
+	return run, true
+}
+
+// ServePatchOutput handles POST /patching/runs/:id/output (agent-facing, API key auth).
+func (h *PatchingHandler) ServePatchOutput(w http.ResponseWriter, r *http.Request) {
+	host, ok := h.authenticateAgent(w, r)
+	if !ok {
 		return
 	}
 
 	var body struct {
-		Stage        string `json:"stage"`
-		Output       string `json:"output"`
-		ErrorMessage string `json:"error_message"`
+		Stage          string `json:"stage"`
+		Output         string `json:"output"`
+		ErrorMessage   string `json:"error_message"`
+		RebootRequired *bool  `json:"reboot_required"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
-	run, err := h.patchRuns.GetByID(r.Context(), patchRunID)
-	if err != nil || run == nil {
-		JSON(w, http.StatusNotFound, map[string]string{"error": "Patch run not found"})
+	run, ok := h.agentRunFromRequest(w, r, host)
+	if !ok {
 		return
 	}
-	if run.HostID != host.ID {
-		JSON(w, http.StatusForbidden, map[string]string{"error": "Patch run does not belong to this host"})
-		return
-	}
+	patchRunID := run.ID
 
-	if err := h.patchRuns.UpdateOutput(r.Context(), patchRunID, host.OSType, body.Stage, body.Output, body.ErrorMessage); err != nil {
+	ended, err := h.patchRuns.UpdateOutput(r.Context(), patchRunID, host.OSType, body.Stage, body.Output, body.ErrorMessage)
+	if errors.Is(err, store.ErrHostHasActivePatchRun) {
+		h.log.Warn("patching: started report ignored, another patch run is active on this host", "patch_run_id", patchRunID)
+		err = nil
+	}
+	if err != nil {
 		h.log.Error("patching: failed to update output", "patch_run_id", patchRunID, "error", err)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to save patch output"})
 		return
@@ -232,7 +260,21 @@ func (h *PatchingHandler) ServePatchOutput(w http.ResponseWriter, r *http.Reques
 			})
 		}
 	}
-	if body.Stage == "completed" && !run.DryRun {
+	if ended && !run.DryRun && run.RebootRequired == nil {
+		required := body.RebootRequired
+		if store.IsWindowsOSType(host.OSType) && (required == nil || !*required) {
+			need, err := h.patchRuns.ItemsNeedReboot(r.Context(), run.ID)
+			if err != nil {
+				h.log.Error("patching: failed to read run items for reboot state", "patch_run_id", run.ID, "error", err)
+			} else if need {
+				required = &need
+			}
+		}
+		if required != nil {
+			h.recordRunRebootRequired(r.Context(), host, run, *required)
+		}
+	}
+	if ended && body.Stage == "completed" && !run.DryRun {
 		if err := h.hosts.SetAwaitingPostPatchReport(r.Context(), run.HostID, &patchRunID); err != nil {
 			h.log.Error("patching: failed to set awaiting post-patch report", "host_id", run.HostID, "patch_run_id", patchRunID, "error", err)
 		}
@@ -266,7 +308,7 @@ func (h *PatchingHandler) ServePatchOutput(w http.ResponseWriter, r *http.Reques
 			})
 		}
 	}
-	if h.notify != nil && (body.Stage == "completed" || body.Stage == "failed") {
+	if h.notify != nil && notifiesRunEnd(body.Stage, ended) {
 		if d := hostctx.DBFromContext(r.Context()); d != nil {
 			// Resolve host display name
 			hostName := ""
@@ -363,16 +405,94 @@ func (h *PatchingHandler) ServePatchOutput(w http.ResponseWriter, r *http.Reques
 	JSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// notifiesRunEnd reports whether a terminal report should notify; a replay against a finished run must not.
+func notifiesRunEnd(stage string, ended bool) bool {
+	return ended && (stage == "completed" || stage == "failed")
+}
+
+const patchRestartReason = "Restart required to finish a patch run"
+
+func (h *PatchingHandler) recordRunRebootRequired(ctx context.Context, host *models.Host, run *db.GetPatchRunByIDRow, required bool) {
+	if err := h.patchRuns.SetRebootRequired(ctx, run.ID, required); err != nil {
+		h.log.Error("patching: failed to record reboot_required", "patch_run_id", run.ID, "error", err)
+	}
+	if !required {
+		return
+	}
+	if err := h.hosts.SetPatchRebootPending(ctx, host.ID, patchRestartReason); err != nil {
+		h.log.Error("patching: failed to set host reboot status", "host_id", host.ID, "error", err)
+	}
+	if h.notify == nil {
+		return
+	}
+	d := hostctx.DBFromContext(ctx)
+	if d == nil {
+		return
+	}
+	hostName := host.FriendlyName
+	if hostName == "" && host.Hostname != nil {
+		hostName = *host.Hostname
+	}
+	h.notify.EmitEvent(ctx, d, hostctx.TenantHostKey(ctx), notifications.Event{
+		Type:          "patch_reboot_required",
+		Severity:      "warning",
+		Title:         "Reboot Required - " + hostName,
+		Message:       "Host \"" + hostName + "\" needs a restart to finish a patch run.",
+		ReferenceType: "host",
+		ReferenceID:   host.ID,
+		Metadata: map[string]interface{}{
+			"host_id":      host.ID,
+			"host_name":    hostName,
+			"patch_run_id": run.ID,
+		},
+	})
+}
+
+// ServePatchItems handles POST /patching/runs/:id/items (agent-facing, API key auth).
+func (h *PatchingHandler) ServePatchItems(w http.ResponseWriter, r *http.Request) {
+	host, ok := h.authenticateAgent(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Items []store.AgentItemReport `json:"items"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	run, ok := h.agentRunFromRequest(w, r, host)
+	if !ok {
+		return
+	}
+	res, err := h.patchRuns.RecordAgentItems(r.Context(), run.ID, host.ID, run.PatchType == "patch_all", body.Items)
+	if errors.Is(err, store.ErrRunNotAcceptingItems) {
+		JSON(w, http.StatusConflict, map[string]string{"error": "Patch run is not accepting item reports"})
+		return
+	}
+	var itemErr *store.ItemReportError
+	if errors.As(err, &itemErr) {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid item report: " + itemErr.Error()})
+		return
+	}
+	if err != nil {
+		h.log.Error("patching: failed to record items", "patch_run_id", run.ID, "error", err)
+		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to save patch items"})
+		return
+	}
+	JSON(w, http.StatusOK, map[string]interface{}{"ok": true, "updated": res.Updated, "inserted": res.Inserted, "ignored": res.Ignored})
+}
+
 // Dashboard returns GET /patching/dashboard.
 func (h *PatchingHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
-	total, byStatus, recent, active, err := h.patchRuns.GetDashboard(r.Context())
+	total, byStatus, recent, active, err := h.patchRuns.GetDashboard(r.Context(), nil)
 	if err != nil {
 		h.log.Error("patching: dashboard error", "error", err)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to load patching dashboard"})
 		return
 	}
 	statusCounts := map[string]int{
-		"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0,
+		"scheduled": 0, "queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0,
 		"timed_out": 0, "agent_disconnected": 0,
 		"pending_validation": 0, "pending_approval": 0, "validated": 0,
 	}
@@ -381,6 +501,7 @@ func (h *PatchingHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	summary := map[string]interface{}{
 		"total_runs":         total,
+		"scheduled":          statusCounts["scheduled"],
 		"queued":             statusCounts["queued"],
 		"running":            statusCounts["running"],
 		"completed":          statusCounts["completed"],
@@ -394,6 +515,7 @@ func (h *PatchingHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	recentResp := patchRunsToResponse(recent)
 	activeResp := patchRunsActiveToResponse(active)
+	h.attachPackageIDs(r.Context(), append(append([]map[string]interface{}{}, recentResp...), activeResp...))
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"summary":     summary,
 		"recent_runs": recentResp,
@@ -455,7 +577,9 @@ func (h *PatchingHandler) ActiveRuns(w http.ResponseWriter, r *http.Request) {
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to load active runs"})
 		return
 	}
-	JSON(w, http.StatusOK, map[string]interface{}{"runs": patchRunsActiveToResponse(runs)})
+	resp := patchRunsActiveToResponse(runs)
+	h.attachPackageIDs(r.Context(), resp)
+	JSON(w, http.StatusOK, map[string]interface{}{"runs": resp})
 }
 
 // ListRuns returns GET /patching/runs.
@@ -501,8 +625,10 @@ func (h *PatchingHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	if int(total)%limit > 0 {
 		pages++
 	}
+	runsResp := patchRunsListToResponse(runs)
+	h.attachPackageIDs(r.Context(), runsResp)
 	JSON(w, http.StatusOK, map[string]interface{}{
-		"runs": patchRunsListToResponse(runs),
+		"runs": runsResp,
 		"pagination": map[string]interface{}{
 			"total":  total,
 			"limit":  limit,
@@ -525,6 +651,14 @@ func (h *PatchingHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := patchRunToResponse(run)
+	items, err := h.patchRuns.ListItems(r.Context(), run.ID)
+	if err != nil {
+		h.log.Error("patching: failed to list run items", "patch_run_id", run.ID, "error", err)
+		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to load patch run"})
+		return
+	}
+	resp["items"] = patchRunItemsToResponse(items)
+	h.attachPackageIDs(r.Context(), []map[string]interface{}{resp})
 	if host, err := h.hosts.GetByID(r.Context(), run.HostID); err == nil && host != nil {
 		if hosts, ok := resp["hosts"].(map[string]interface{}); ok {
 			hosts["awaiting_post_patch_report_run_id"] = host.AwaitingPostPatchReportRunID
@@ -567,9 +701,12 @@ func (h *PatchingHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 	}
 
-	host, err := h.hosts.GetByID(r.Context(), valRun.HostID)
-	if err != nil || host == nil {
-		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Host not found for run"})
+	host, ok := loadHost(w, r, h.hosts, valRun.HostID)
+	if !ok {
+		return
+	}
+	if e := selectedPatchRefusal(host, valRun.PatchType); e != nil {
+		writeRunRequestError(w, e)
 		return
 	}
 
@@ -583,6 +720,35 @@ func (h *PatchingHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("patching: failed to unmarshal package_names for approval", "validation_run_id", validationID, "error", err)
 			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read package list for run"})
 			return
+		}
+	}
+
+	var approveOpts *store.CreateRunOpts
+	if store.IsWindowsOSType(host.OSType) {
+		if verr := windowsAgentVersionError(host.AgentVersion); verr != nil {
+			writeRunRequestError(w, verr)
+			return
+		}
+		if valRun.PatchType == "patch_package" {
+			valItems, err := h.patchRuns.ListItems(r.Context(), validationID)
+			if err != nil {
+				h.log.Error("patching: list validation items error", "validation_run_id", validationID, "error", err)
+				JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read package list for run"})
+				return
+			}
+			items := itemsForApproval(valRun.Status, valItems)
+			if len(items) == 0 {
+				JSON(w, http.StatusBadRequest, map[string]string{"error": "Nothing to install: the validation found no applicable updates on this host"})
+				return
+			}
+			pkgName = nil
+			pkgNames = itemTitles(items)
+			approveOpts = &store.CreateRunOpts{Items: items}
+		} else {
+			approveOpts = &store.CreateRunOpts{
+				WindowsIncludeUpdates: valRun.WindowsIncludeUpdates,
+				WindowsIncludeApps:    valRun.WindowsIncludeApps,
+			}
 		}
 	}
 
@@ -601,6 +767,9 @@ func (h *PatchingHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 	// Manual schedule override: "immediate" bypasses policy delay.
 	if body.ScheduleOverride == "immediate" {
 		delayMs = 0
+	}
+	if delayMs == 0 {
+		runAt = time.Now()
 	}
 
 	var policyID, policyNamePtr *string
@@ -658,34 +827,30 @@ func (h *PatchingHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 		approvedBy = &userID
 	}
 
-	// 1. Mark the validation run as "approved" (terminal - preserved with its output).
-	if err := h.patchRuns.MarkValidationApproved(r.Context(), validationID, approvedBy); err != nil {
-		h.log.Error("patching: mark validation approved error", "error", err)
-		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to approve validation run"})
-		return
-	}
-
-	// 2. Create the real patch run linked to the validation.
 	var schedAt *time.Time
 	if delayMs > 0 {
 		schedAt = &runAt
 	}
-	if _, err := h.patchRuns.CreateRun(r.Context(), newRunID, valRun.HostID, jobID, valRun.PatchType, pkgName, pkgNames, valRun.TriggeredByUserID, false, schedAt, policyID, policyNamePtr, policySnap, &store.CreateRunOpts{
-		ValidationRunID:  &validationID,
-		ApprovedByUserID: approvedBy,
-	}); err != nil {
-		h.log.Error("patching: create approved run error", "error", err)
-		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create patch run"})
+	if err := h.patchRuns.ApproveAndCreateRun(r.Context(), validationID, approvedBy, newRunID, valRun.HostID, jobID, valRun.PatchType, pkgName, pkgNames, valRun.TriggeredByUserID, schedAt, policyID, policyNamePtr, policySnap, approveOpts); err != nil {
+		switch {
+		case errors.Is(err, store.ErrValidationNotApprovable):
+			JSON(w, http.StatusConflict, map[string]string{"error": "This run has already been approved or is no longer awaiting approval"})
+		case errors.Is(err, store.ErrHostHasActivePatchRun):
+			JSON(w, http.StatusConflict, map[string]string{"error": activePatchRunMessage})
+		default:
+			h.log.Error("patching: approve and create run error", "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create patch run"})
+		}
 		return
 	}
 
-	// 3. Enqueue the task.
 	enqueueOpts := []asynq.Option{}
 	if delayMs > 0 {
 		enqueueOpts = append(enqueueOpts, asynq.ProcessIn(time.Duration(delayMs)*time.Millisecond))
 	}
 	if _, err := h.queueClient.Enqueue(task, enqueueOpts...); err != nil {
 		h.log.Error("patching: enqueue approve error", "error", err)
+		h.cancelOrphanedRun(r.Context(), newRunID)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to queue approved patch"})
 		return
 	}
@@ -727,6 +892,14 @@ func (h *PatchingHandler) ApproveRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// cancelOrphanedRun terminates a committed run whose task never reached the
+// queue; left queued it would block every later run on the host.
+func (h *PatchingHandler) cancelOrphanedRun(ctx context.Context, runID string) {
+	if _, err := h.patchRuns.Cancel(context.WithoutCancel(ctx), runID, "Failed to queue patch run"); err != nil {
+		h.log.Error("patching: failed to cancel orphaned run after enqueue error", "run_id", runID, "error", err)
+	}
+}
+
 // RetryValidation handles POST /patching/runs/:id/retry-validation.
 // Re-enqueues the dry-run task for a run stuck in pending_validation (e.g. host was offline).
 func (h *PatchingHandler) RetryValidation(w http.ResponseWriter, r *http.Request) {
@@ -744,18 +917,21 @@ func (h *PatchingHandler) RetryValidation(w http.ResponseWriter, r *http.Request
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Only pending-validation runs can be retried"})
 		return
 	}
-	// patch_all runs cannot be dry-run on the agent (no --dry-run support for
+	host, ok := loadHost(w, r, h.hosts, run.HostID)
+	if !ok {
+		return
+	}
+	if e := selectedPatchRefusal(host, run.PatchType); e != nil {
+		writeRunRequestError(w, e)
+		return
+	}
+	windows := store.IsWindowsOSType(host.OSType)
+	// patch_all runs cannot be dry-run on Linux/FreeBSD agents (no --dry-run support for
 	// the bulk upgrade path). Re-validation only makes sense for patch_package
 	// pending runs that stalled mid dry-run (e.g. host was offline). Pending
 	// approval patch_all runs are just waiting for approval, not validation.
-	if run.PatchType != "patch_package" {
+	if run.PatchType != "patch_package" && !windows {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Validation retry is only supported for patch_package runs"})
-		return
-	}
-
-	host, err := h.hosts.GetByID(r.Context(), run.HostID)
-	if err != nil || host == nil {
-		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Host not found for run"})
 		return
 	}
 
@@ -767,6 +943,29 @@ func (h *PatchingHandler) RetryValidation(w http.ResponseWriter, r *http.Request
 	if len(run.PackageNames) > 0 {
 		if err := json.Unmarshal(run.PackageNames, &pkgNames); err != nil {
 			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to read package list for run"})
+			return
+		}
+	}
+
+	if windows {
+		names := pkgNames
+		if len(names) == 0 && pkgName != nil {
+			names = []string{*pkgName}
+		}
+		scope := &windowsScope{Updates: run.WindowsIncludeUpdates, Apps: run.WindowsIncludeApps}
+		plan, reqErr, err := h.validateWindowsRun(r.Context(), host.ID, host.AgentVersion, run.PatchType, names, scope)
+		if err != nil {
+			h.log.Error("patching: resolve windows targets error", "host_id", host.ID, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to resolve patch targets"})
+			return
+		}
+		if reqErr != nil {
+			writeRunRequestError(w, reqErr)
+			return
+		}
+		if err := h.patchRuns.ReplaceItems(r.Context(), id, run.HostID, revalidationItems(run.PatchType, plan)); err != nil {
+			h.log.Error("patching: reset validation items error", "patch_run_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to reset patch targets"})
 			return
 		}
 	}
@@ -820,11 +1019,11 @@ func (h *PatchingHandler) DeleteRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Remove run_patch task(s) from queue if present.
-	// Original task: patch-run-{id}, retry task: patch-run-{id}-retry
 	if h.queueInspector != nil {
-		taskID := patchRunJobIDPrefix + id
-		_ = h.queueInspector.DeleteTask(queue.QueuePatching, taskID)
-		_ = h.queueInspector.DeleteTask(queue.QueuePatching, taskID+"-retry")
+		_ = h.queueInspector.DeleteTask(queue.QueuePatching, patchRunJobIDPrefix+id)
+		for _, retryID := range queue.RunPatchRetryTaskIDs(id) {
+			_ = h.queueInspector.DeleteTask(queue.QueuePatching, retryID)
+		}
 	}
 	if err := h.patchRuns.Delete(r.Context(), id); err != nil {
 		h.log.Error("patching: delete run error", "patch_run_id", id, "error", err)
@@ -872,8 +1071,9 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 		// enqueuing any work to the host. It's the "submit for approval" path:
 		// a second approver later calls ApproveRun to actually execute. Works
 		// for any patch_type (including patch_all, which cannot dry-run).
-		PendingApproval  bool   `json:"pending_approval"`
-		ScheduleOverride string `json:"schedule_override"` // "immediate" to bypass policy delay
+		PendingApproval  bool          `json:"pending_approval"`
+		ScheduleOverride string        `json:"schedule_override"` // "immediate" to bypass policy delay
+		WindowsScope     *windowsScope `json:"windows_scope"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
@@ -887,18 +1087,53 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "patch_type must be patch_all or patch_package"})
 		return
 	}
-	if body.DryRun && body.PatchType != "patch_package" {
-		JSON(w, http.StatusBadRequest, map[string]string{"error": "dry_run is only supported for patch_package"})
-		return
-	}
 	if body.DryRun && body.PendingApproval {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "dry_run and pending_approval are mutually exclusive"})
 		return
 	}
 
+	host, ok := loadHost(w, r, h.hosts, body.HostID)
+	if !ok {
+		return
+	}
+	if e := selectedPatchRefusal(host, body.PatchType); e != nil {
+		writeRunRequestError(w, e)
+		return
+	}
+	windows := store.IsWindowsOSType(host.OSType)
+
+	if body.DryRun && body.PatchType != "patch_package" && !windows {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": "dry_run is only supported for patch_package"})
+		return
+	}
+
 	var pkgName *string
 	var pkgNames []string
-	if body.PatchType == "patch_package" {
+	var createOpts *store.CreateRunOpts
+	if windows {
+		names := body.PackageNames
+		if len(names) == 0 && body.PackageName != "" {
+			names = []string{body.PackageName}
+		}
+		plan, reqErr, err := h.validateWindowsRun(r.Context(), host.ID, host.AgentVersion, body.PatchType, names, body.WindowsScope)
+		if err != nil {
+			h.log.Error("patching: resolve windows targets error", "host_id", host.ID, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to resolve patch targets"})
+			return
+		}
+		if reqErr != nil {
+			writeRunRequestError(w, reqErr)
+			return
+		}
+		if body.PatchType == "patch_package" {
+			pkgNames = itemTitles(plan.Items)
+		}
+		createOpts = &store.CreateRunOpts{
+			Items:                 plan.Items,
+			WindowsIncludeUpdates: plan.IncludeUpdates,
+			WindowsIncludeApps:    plan.IncludeApps,
+		}
+	} else if body.PatchType == "patch_package" {
 		if len(body.PackageNames) > 0 {
 			for _, n := range body.PackageNames {
 				if !isValidPackageName(n) {
@@ -906,7 +1141,7 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			if len(body.PackageNames) > 100 {
+			if len(body.PackageNames) > maxPatchTargets {
 				JSON(w, http.StatusBadRequest, map[string]string{"error": "package_names limited to 100 packages per run"})
 				return
 			}
@@ -917,12 +1152,6 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 			JSON(w, http.StatusBadRequest, map[string]string{"error": "Valid package_name or non-empty package_names is required for patch_package"})
 			return
 		}
-	}
-
-	host, err := h.hosts.GetByID(r.Context(), body.HostID)
-	if err != nil || host == nil {
-		JSON(w, http.StatusNotFound, map[string]string{"error": "Host not found"})
-		return
 	}
 
 	orgTZ := h.resolveOrgTimezone(r.Context())
@@ -945,6 +1174,9 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 	// Manual schedule override: "immediate" bypasses policy delay
 	if body.ScheduleOverride == "immediate" {
 		delayMs = 0
+	}
+	if delayMs == 0 {
+		runAt = time.Now()
 	}
 
 	patchRunID := uuid.New().String()
@@ -992,11 +1224,17 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 	// which implies an in-flight dry-run), they're just waiting for an
 	// approver to call ApproveRun, which builds the real execution run
 	// (same code path the approve wizard already uses).
-	var createOpts *store.CreateRunOpts
 	if body.PendingApproval {
-		createOpts = &store.CreateRunOpts{InitialStatus: "pending_approval"}
+		if createOpts == nil {
+			createOpts = &store.CreateRunOpts{}
+		}
+		createOpts.InitialStatus = "pending_approval"
 	}
-	_, err = h.patchRuns.CreateRun(r.Context(), patchRunID, body.HostID, jobID, body.PatchType, pkgName, pkgNames, triggeredBy, body.DryRun, scheduledAt, policyID, policyNamePtr, policySnapshot, createOpts)
+	_, err := h.patchRuns.CreateRun(r.Context(), patchRunID, body.HostID, jobID, body.PatchType, pkgName, pkgNames, triggeredBy, body.DryRun, scheduledAt, policyID, policyNamePtr, policySnapshot, createOpts)
+	if errors.Is(err, store.ErrHostHasActivePatchRun) {
+		JSON(w, http.StatusConflict, map[string]string{"error": activePatchRunMessage})
+		return
+	}
 	if err != nil {
 		h.log.Error("patching: create run error", "error", err)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create patch run"})
@@ -1029,6 +1267,7 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.log.Error("patching: create task error", "error", err)
+		h.cancelOrphanedRun(r.Context(), patchRunID)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Patch queue is not available"})
 		return
 	}
@@ -1038,6 +1277,7 @@ func (h *PatchingHandler) Trigger(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.queueClient.Enqueue(task, opts...); err != nil {
 		h.log.Error("patching: enqueue error", "error", err)
+		h.cancelOrphanedRun(r.Context(), patchRunID)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to queue patch"})
 		return
 	}
@@ -1082,6 +1322,7 @@ func (h *PatchingHandler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 			"updated_at":       pgTimeToISO(p.UpdatedAt),
 			"_count":           map[string]int{"assignments": len(assignments), "exclusions": len(exclusions)},
 		}
+		addRecurrenceFields(out[i], &policies[i])
 	}
 	JSON(w, http.StatusOK, out)
 }
@@ -1124,7 +1365,7 @@ func (h *PatchingHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 			"updated_at":  pgTimeToISO(a.UpdatedAt),
 		}
 	}
-	JSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"id":               policy.ID,
 		"name":             policy.Name,
 		"description":      policy.Description,
@@ -1136,7 +1377,58 @@ func (h *PatchingHandler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 		"updated_at":       pgTimeToISO(policy.UpdatedAt),
 		"assignments":      assignmentsResp,
 		"exclusions":       exclusions,
-	})
+	}
+	addRecurrenceFields(resp, policy)
+	JSON(w, http.StatusOK, resp)
+}
+
+// addRecurrenceFields adds the recurring-schedule fields of a policy to its API response.
+func addRecurrenceFields(resp map[string]interface{}, p *db.PatchPolicy) {
+	resp["recurrence_cron"] = p.RecurrenceCron
+	resp["auto_reboot"] = p.AutoReboot
+	resp["recurrence_next_run_at"] = nil
+	resp["recurrence_last_run_at"] = nil
+	if p.RecurrenceCron != nil && p.RecurrenceNextRunAt.Valid {
+		resp["recurrence_next_run_at"] = pgTimeToISO(p.RecurrenceNextRunAt)
+	}
+	if p.RecurrenceLastRunAt.Valid {
+		resp["recurrence_last_run_at"] = pgTimeToISO(p.RecurrenceLastRunAt)
+	}
+}
+
+// updateAutoReboot decides whether an update changes auto_reboot and to what.
+// Clearing the recurring schedule clears it too, because only scheduled runs
+// reboot; otherwise it changes only when the client sent a value.
+func updateAutoReboot(recurrencePresent bool, recurrence *string, requested *bool) (value, change bool) {
+	if recurrencePresent && recurrence == nil {
+		return false, true
+	}
+	if requested != nil {
+		return *requested, true
+	}
+	return false, false
+}
+
+// parseRecurrenceField reads the optional recurrence_cron request field.
+// present is false when the client omitted it, so an update leaves the stored
+// schedule alone; null or an empty string clears the schedule (expr nil).
+// A non-empty msg is a 400 error.
+func parseRecurrenceField(raw json.RawMessage) (present bool, expr *string, msg string) {
+	if len(raw) == 0 {
+		return false, nil, ""
+	}
+	var v *string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return true, nil, "recurrence_cron must be a string or null"
+	}
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return true, nil, ""
+	}
+	norm := strings.Join(strings.Fields(*v), " ")
+	if err := store.ValidateRecurrenceCron(norm); err != nil {
+		return true, nil, err.Error()
+	}
+	return true, &norm, ""
 }
 
 // validatePolicyInput enforces shared rules for CreatePolicy and UpdatePolicy.
@@ -1177,12 +1469,23 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		// but ignored — fixed-time scheduling now uses the org-resolved
 		// timezone. The DB column is persisted as NULL.
 		Timezone *string `json:"timezone"`
+		// RecurrenceCron makes the policy create patch_all runs on a schedule
+		// (5-field cron, read in the organisation timezone).
+		RecurrenceCron json.RawMessage `json:"recurrence_cron"`
+		// AutoReboot reboots hosts after a successful scheduled run when they
+		// report a pending reboot. Ignored for manual runs.
+		AutoReboot *bool `json:"auto_reboot"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
 	if msg := validatePolicyInput(body.Name, body.PatchDelayType, body.DelayMinutes, body.FixedTimeUtc); msg != "" {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	_, recurrence, msg := parseRecurrenceField(body.RecurrenceCron)
+	if msg != "" {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
@@ -1200,6 +1503,20 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to create policy"})
 		return
 	}
+	if recurrence != nil {
+		if err := h.patchPolicies.SetRecurrence(r.Context(), id, recurrence, h.resolveOrgTimezone(r.Context())); err != nil {
+			h.log.Error("patching: set policy recurrence error", "policy_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy recurrence"})
+			return
+		}
+		if body.AutoReboot != nil && *body.AutoReboot {
+			if err := h.patchPolicies.SetAutoReboot(r.Context(), id, true); err != nil {
+				h.log.Error("patching: set policy auto reboot error", "policy_id", id, "error", err)
+				JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy auto reboot"})
+				return
+			}
+		}
+	}
 	policy, _ := h.patchPolicies.GetByID(r.Context(), id)
 	resp := map[string]interface{}{
 		"id":               id,
@@ -1215,6 +1532,7 @@ func (h *PatchingHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	if policy != nil {
 		resp["created_at"] = pgTimeToISO(policy.CreatedAt)
 		resp["updated_at"] = pgTimeToISO(policy.UpdatedAt)
+		addRecurrenceFields(resp, policy)
 	}
 	JSON(w, http.StatusCreated, resp)
 }
@@ -1236,12 +1554,22 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		// CreatePolicy. The DB column is overwritten with NULL on every
 		// update so the column eventually drains across the fleet.
 		Timezone *string `json:"timezone"`
+		// RecurrenceCron: omitted keeps the stored schedule; null or "" clears it.
+		RecurrenceCron json.RawMessage `json:"recurrence_cron"`
+		// AutoReboot: omitted keeps the stored value. Clearing the schedule
+		// also clears it, since only scheduled runs reboot.
+		AutoReboot *bool `json:"auto_reboot"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
 	if msg := validatePolicyInput(body.Name, body.PatchDelayType, body.DelayMinutes, body.FixedTimeUtc); msg != "" {
+		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+		return
+	}
+	recurrencePresent, recurrence, msg := parseRecurrenceField(body.RecurrenceCron)
+	if msg != "" {
 		JSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
@@ -1254,6 +1582,20 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("patching: update policy error", "error", err)
 		JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to update policy"})
 		return
+	}
+	if recurrencePresent {
+		if err := h.patchPolicies.SetRecurrence(r.Context(), id, recurrence, h.resolveOrgTimezone(r.Context())); err != nil {
+			h.log.Error("patching: set policy recurrence error", "policy_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy recurrence"})
+			return
+		}
+	}
+	if autoReboot, ok := updateAutoReboot(recurrencePresent, recurrence, body.AutoReboot); ok {
+		if err := h.patchPolicies.SetAutoReboot(r.Context(), id, autoReboot); err != nil {
+			h.log.Error("patching: set policy auto reboot error", "policy_id", id, "error", err)
+			JSON(w, http.StatusInternalServerError, map[string]string{"error": "Failed to set policy auto reboot"})
+			return
+		}
 	}
 	policy, _ := h.patchPolicies.GetByID(r.Context(), id)
 	resp := map[string]interface{}{
@@ -1268,6 +1610,7 @@ func (h *PatchingHandler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 	if policy != nil {
 		resp["created_at"] = pgTimeToISO(policy.CreatedAt)
 		resp["updated_at"] = pgTimeToISO(policy.UpdatedAt)
+		addRecurrenceFields(resp, policy)
 	}
 	JSON(w, http.StatusOK, resp)
 }
@@ -1452,6 +1795,8 @@ func patchRunToResponse(r *db.GetPatchRunByIDRow) map[string]interface{} {
 		"validation_run_id":     r.ValidationRunID,
 		"policy_id":             r.PolicyID,
 		"policy_name":           r.PolicyName,
+		"reboot_required":       r.RebootRequired,
+		"windows_scope":         windowsScopeResponse(r.WindowsIncludeUpdates, r.WindowsIncludeApps),
 	}
 	if len(r.PolicySnapshot) > 0 {
 		var snap map[string]interface{}
@@ -1473,14 +1818,106 @@ func patchRunToResponse(r *db.GetPatchRunByIDRow) map[string]interface{} {
 		"id":            r.HostID,
 		"friendly_name": r.HostFriendlyName,
 		"hostname":      r.HostHostname,
+		"os_type":       r.HostOsType,
 	}
 	return m
+}
+
+func (h *PatchingHandler) attachPackageIDs(ctx context.Context, runs []map[string]interface{}) {
+	ids, err := h.patchRuns.PackageIDsByName(ctx, uniqueRunPackageNames(runs))
+	if err != nil {
+		h.log.Warn("patching: package ID lookup failed", "error", err)
+		return
+	}
+	setRunPackageIDs(runs, ids)
+}
+
+func uniqueRunPackageNames(runs []map[string]interface{}) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, m := range runs {
+		for _, n := range runPackageNames(m) {
+			if _, ok := seen[n]; !ok {
+				seen[n] = struct{}{}
+				names = append(names, n)
+			}
+		}
+	}
+	return names
+}
+
+func setRunPackageIDs(runs []map[string]interface{}, ids map[string]string) {
+	for _, m := range runs {
+		own := make(map[string]string)
+		for _, n := range runPackageNames(m) {
+			if id, ok := ids[n]; ok {
+				own[n] = id
+			}
+		}
+		m["package_ids"] = own
+	}
+}
+
+func runPackageNames(m map[string]interface{}) []string {
+	var out []string
+	if p, ok := m["package_name"].(*string); ok && p != nil && *p != "" {
+		out = append(out, *p)
+	}
+	for _, key := range []string{"package_names", "packages_affected"} {
+		if names, ok := m[key].([]string); ok {
+			out = append(out, names...)
+		}
+	}
+	return out
+}
+
+func windowsScopeResponse(updates, apps *bool) map[string]bool {
+	if updates == nil && apps == nil {
+		return nil
+	}
+	return map[string]bool{
+		"updates": updates == nil || *updates,
+		"apps":    apps == nil || *apps,
+	}
+}
+
+func pgTimeToISOPtr(t pgtype.Timestamp) *string {
+	if !t.Valid {
+		return nil
+	}
+	s := t.Time.UTC().Format(time.RFC3339)
+	return &s
+}
+
+func patchRunItemsToResponse(items []db.PatchRunItem) []map[string]interface{} {
+	out := make([]map[string]interface{}, len(items))
+	for i, it := range items {
+		out[i] = map[string]interface{}{
+			"id":              it.ID,
+			"kind":            it.Kind,
+			"identifier":      it.Identifier,
+			"revision_number": it.RevisionNumber,
+			"title":           it.Title,
+			"kb":              it.Kb,
+			"status":          it.Status,
+			"result_code":     it.ResultCode,
+			"hresult":         it.Hresult,
+			"exit_code":       it.ExitCode,
+			"reboot_required": it.RebootRequired,
+			"download_bytes":  it.DownloadBytes,
+			"message":         it.Message,
+			"started_at":      pgTimeToISOPtr(it.StartedAt),
+			"completed_at":    pgTimeToISOPtr(it.CompletedAt),
+			"updated_at":      pgTimeToISOPtr(it.UpdatedAt),
+		}
+	}
+	return out
 }
 
 func patchRunsToResponse(rows []db.ListRecentPatchRunsRow) []map[string]interface{} {
 	out := make([]map[string]interface{}, len(rows))
 	for i, r := range rows {
-		m := patchRunRowToMap(r.ID, r.HostID, r.JobID, r.PatchType, r.PackageName, r.PackageNames, r.Status, r.ShellOutput, r.ErrorMessage, r.StartedAt, r.CompletedAt, r.ScheduledAt, r.CreatedAt, r.UpdatedAt, r.HostFriendlyName, r.HostHostname, r.TriggeredByUsername)
+		m := patchRunRowToMap(r.ID, r.HostID, r.JobID, r.PatchType, r.PackageName, r.PackageNames, r.Status, r.ShellOutput, r.ErrorMessage, r.StartedAt, r.CompletedAt, r.ScheduledAt, r.CreatedAt, r.UpdatedAt, r.HostFriendlyName, r.HostHostname, r.HostOsType, r.TriggeredByUsername)
 		m["dry_run"] = r.DryRun
 		if len(r.PackagesAffected) > 0 {
 			var pkgs []string
@@ -1495,7 +1932,7 @@ func patchRunsToResponse(rows []db.ListRecentPatchRunsRow) []map[string]interfac
 func patchRunsActiveToResponse(rows []db.ListActivePatchRunsRow) []map[string]interface{} {
 	out := make([]map[string]interface{}, len(rows))
 	for i, r := range rows {
-		m := patchRunRowToMap(r.ID, r.HostID, r.JobID, r.PatchType, r.PackageName, r.PackageNames, r.Status, r.ShellOutput, r.ErrorMessage, r.StartedAt, r.CompletedAt, r.ScheduledAt, r.CreatedAt, r.UpdatedAt, r.HostFriendlyName, r.HostHostname, r.TriggeredByUsername)
+		m := patchRunRowToMap(r.ID, r.HostID, r.JobID, r.PatchType, r.PackageName, r.PackageNames, r.Status, r.ShellOutput, r.ErrorMessage, r.StartedAt, r.CompletedAt, r.ScheduledAt, r.CreatedAt, r.UpdatedAt, r.HostFriendlyName, r.HostHostname, r.HostOsType, r.TriggeredByUsername)
 		m["dry_run"] = r.DryRun
 		if len(r.PackagesAffected) > 0 {
 			var pkgs []string
@@ -1510,9 +1947,10 @@ func patchRunsActiveToResponse(rows []db.ListActivePatchRunsRow) []map[string]in
 func patchRunsListToResponse(rows []db.ListPatchRunsRow) []map[string]interface{} {
 	out := make([]map[string]interface{}, len(rows))
 	for i, r := range rows {
-		m := patchRunRowToMap(r.ID, r.HostID, r.JobID, r.PatchType, r.PackageName, r.PackageNames, r.Status, r.ShellOutput, r.ErrorMessage, r.StartedAt, r.CompletedAt, r.ScheduledAt, r.CreatedAt, r.UpdatedAt, r.HostFriendlyName, r.HostHostname, r.TriggeredByUsername)
+		m := patchRunRowToMap(r.ID, r.HostID, r.JobID, r.PatchType, r.PackageName, r.PackageNames, r.Status, r.ShellOutput, r.ErrorMessage, r.StartedAt, r.CompletedAt, r.ScheduledAt, r.CreatedAt, r.UpdatedAt, r.HostFriendlyName, r.HostHostname, r.HostOsType, r.TriggeredByUsername)
 		m["dry_run"] = r.DryRun
 		m["validation_run_id"] = r.ValidationRunID
+		m["windows_scope"] = windowsScopeResponse(r.WindowsIncludeUpdates, r.WindowsIncludeApps)
 		if len(r.PackagesAffected) > 0 {
 			var pkgs []string
 			_ = json.Unmarshal(r.PackagesAffected, &pkgs)
@@ -1523,7 +1961,7 @@ func patchRunsListToResponse(rows []db.ListPatchRunsRow) []map[string]interface{
 	return out
 }
 
-func patchRunRowToMap(id, hostID, jobID, patchType string, pkgName *string, pkgNames []byte, status, shellOutput string, errMsg *string, startedAt, completedAt, scheduledAt pgtype.Timestamp, createdAt, updatedAt pgtype.Timestamp, hostFriendly, hostHostname, triggeredByUsername *string) map[string]interface{} {
+func patchRunRowToMap(id, hostID, jobID, patchType string, pkgName *string, pkgNames []byte, status, shellOutput string, errMsg *string, startedAt, completedAt, scheduledAt pgtype.Timestamp, createdAt, updatedAt pgtype.Timestamp, hostFriendly, hostHostname, hostOSType, triggeredByUsername *string) map[string]interface{} {
 	m := map[string]interface{}{
 		"id":                    id,
 		"host_id":               hostID,
@@ -1543,6 +1981,7 @@ func patchRunRowToMap(id, hostID, jobID, patchType string, pkgName *string, pkgN
 			"id":            hostID,
 			"friendly_name": hostFriendly,
 			"hostname":      hostHostname,
+			"os_type":       hostOSType,
 		},
 	}
 	if len(pkgNames) > 0 {
@@ -1551,4 +1990,11 @@ func patchRunRowToMap(id, hostID, jobID, patchType string, pkgName *string, pkgN
 		m["package_names"] = names
 	}
 	return m
+}
+
+func selectedPatchRefusal(host *models.Host, patchType string) *runRequestError {
+	if store.RefusesSelectedPatch(host.PackageManager, patchType) {
+		return badRunRequest(store.PacmanSelectedPatchUnsupported)
+	}
+	return nil
 }

@@ -28,6 +28,7 @@ type OSReleaseInfo struct {
 	ID              string
 	IDLike          string
 	VersionCodename string
+	BuildID         string
 }
 
 // Detector handles system information detection
@@ -87,6 +88,8 @@ func (d *Detector) parseOSRelease() (*OSReleaseInfo, error) {
 			info.IDLike = value
 		case "VERSION_CODENAME":
 			info.VersionCodename = value
+		case "BUILD_ID":
+			info.BuildID = value
 		}
 	}
 
@@ -161,6 +164,32 @@ func (d *Detector) getFreeBSDInfo() (osType, osVersion string, err error) {
 	return osType, osVersion, nil
 }
 
+// gopsutil returns DisplayVersion as PlatformVersion, and it is absent before
+// Server 2022, so 2016 and 2019 LTSC need the ReleaseId fallback.
+func resolveWindowsOSVersion(platformVersion, releaseID, kernelVersion string) string {
+	for _, v := range []string{platformVersion, releaseID, kernelVersion} {
+		if v != "" {
+			return v
+		}
+	}
+	return "Unknown"
+}
+
+// Alpine has no VERSION, only VERSION_ID. Arch has BUILD_ID=rolling, and its container
+// images add a VERSION_ID that is only the image build date.
+func resolveLinuxOSVersion(info *OSReleaseInfo, alpineRelease string) string {
+	rolling := ""
+	if info.BuildID == "rolling" {
+		rolling = info.BuildID
+	}
+	for _, v := range []string{info.Version, rolling, info.VersionID, alpineRelease, info.BuildID} {
+		if v != "" {
+			return v
+		}
+	}
+	return "Unknown"
+}
+
 // DetectOS detects the operating system and version using /etc/os-release
 func (d *Detector) DetectOS() (osType, osVersion string, err error) {
 	// Check for Windows first (uses gopsutil)
@@ -171,11 +200,7 @@ func (d *Detector) DetectOS() (osType, osVersion string, err error) {
 		if infoErr != nil {
 			return "Windows", "Unknown", nil
 		}
-		osVer := info.PlatformVersion
-		if osVer == "" {
-			osVer = "Unknown"
-		}
-		return "Windows", osVer, nil
+		return "Windows", resolveWindowsOSVersion(info.PlatformVersion, windowsReleaseID(), info.KernelVersion), nil
 	}
 	// Check for FreeBSD first (doesn't have /etc/os-release)
 	if d.isFreeBSD() {
@@ -212,10 +237,15 @@ func (d *Detector) DetectOS() (osType, osVersion string, err error) {
 		osType = "Unknown"
 	}
 
-	// Use VERSION for OS version (e.g., "22.04 LTS", "12 (bookworm)", "10.0 (Red Quartz)")
-	osVersion = osReleaseInfo.Version
-	if osVersion == "" {
-		osVersion = "Unknown"
+	alpineRelease := ""
+	if osReleaseInfo.Version == "" && osReleaseInfo.VersionID == "" {
+		if data, err := os.ReadFile(alpineReleaseFile); err == nil {
+			alpineRelease = strings.TrimSpace(string(data))
+		}
+	}
+	osVersion = resolveLinuxOSVersion(osReleaseInfo, alpineRelease)
+	if release := ucsRelease(lsbReleaseFile); release != "" {
+		osType, osVersion = ucsOSType, release
 	}
 
 	d.logger.WithFields(logrus.Fields{
@@ -238,11 +268,14 @@ func (d *Detector) GetSystemInfo() models.SystemInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// Probed once so the uptime string and the boot time cannot disagree.
+	uptime, containerised := containerUptime()
+
 	info := models.SystemInfo{
 		KernelVersion: d.GetKernelVersion(),
 		SELinuxStatus: d.getSELinuxStatus(),
-		SystemUptime:  d.getSystemUptime(ctx),
-		BootTime:      d.getBootTime(ctx),
+		SystemUptime:  d.getSystemUptime(ctx, uptime, containerised),
+		BootTime:      d.getBootTime(ctx, uptime, containerised),
 		LoadAverage:   d.getLoadAverage(ctx),
 	}
 
@@ -284,6 +317,22 @@ func (d *Detector) GetHostname() (string, error) {
 	return info.Hostname, nil
 }
 
+func selectPrimaryIPAddress(ips []net.IP) string {
+	var ipv6Fallback string
+	for _, ip := range ips {
+		if !ip.IsGlobalUnicast() {
+			continue
+		}
+		if ip.To4() != nil {
+			return ip.String()
+		}
+		if ipv6Fallback == "" {
+			ipv6Fallback = ip.String()
+		}
+	}
+	return ipv6Fallback
+}
+
 // GetIPAddress gets the primary IP address using network interfaces
 func (d *Detector) GetIPAddress() string {
 	interfaces, err := net.Interfaces()
@@ -291,6 +340,8 @@ func (d *Detector) GetIPAddress() string {
 		d.logger.WithError(err).Warn("Failed to get network interfaces")
 		return ""
 	}
+
+	var ips []net.IP
 
 	for _, iface := range interfaces {
 		// Skip loopback and down interfaces
@@ -305,14 +356,12 @@ func (d *Detector) GetIPAddress() string {
 
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok {
-				if ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
-					return ipnet.IP.String()
-				}
+				ips = append(ips, ipnet.IP)
 			}
 		}
 	}
 
-	return ""
+	return selectPrimaryIPAddress(ips)
 }
 
 // GetKernelVersion gets the kernel version
@@ -373,15 +422,18 @@ func (d *Detector) getSELinuxStatus() string {
 	return constants.SELinuxDisabled
 }
 
-// getSystemUptime gets system uptime
-func (d *Detector) getSystemUptime(ctx context.Context) string {
-	info, err := host.InfoWithContext(ctx)
-	if err != nil {
-		d.logger.WithError(err).Warn("Failed to get uptime")
-		return "Unknown"
+// getSystemUptime gets system uptime. When containerised is set, uptime is the
+// container's own figure from containerUptime and is used in preference to the
+// host's, which is all gopsutil can report.
+func (d *Detector) getSystemUptime(ctx context.Context, uptime time.Duration, containerised bool) string {
+	if !containerised {
+		info, err := host.InfoWithContext(ctx)
+		if err != nil {
+			d.logger.WithError(err).Warn("Failed to get uptime")
+			return "Unknown"
+		}
+		uptime = time.Duration(info.Uptime) * time.Second
 	}
-
-	uptime := time.Duration(info.Uptime) * time.Second
 
 	days := int(uptime.Hours() / 24)
 	hours := int(uptime.Hours()) % 24
@@ -402,7 +454,15 @@ func (d *Detector) getSystemUptime(ctx context.Context) string {
 // instead of clobbering it with a sentinel. Companion to getSystemUptime,
 // which keeps shipping its pre-formatted string for back-compat with
 // pre-boot_time servers.
-func (d *Detector) getBootTime(ctx context.Context) *time.Time {
+//
+// Inside a container the boot instant is derived from the container's own
+// uptime, because gopsutil reports the host's.
+func (d *Detector) getBootTime(ctx context.Context, uptime time.Duration, containerised bool) *time.Time {
+	if containerised {
+		t := time.Now().Add(-uptime).UTC()
+		return &t
+	}
+
 	info, err := host.InfoWithContext(ctx)
 	if err != nil {
 		d.logger.WithError(err).Warn("Failed to get boot time")

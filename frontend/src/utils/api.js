@@ -1,4 +1,6 @@
 import axios from "axios";
+import { requestTokenRefresh } from "./sessionRefresh";
+import { consumeInteraction } from "./userActivity";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
 
@@ -42,6 +44,12 @@ api.interceptors.request.use(
 		}
 		config.headers["X-Device-ID"] = deviceId;
 
+		// Only requests that follow a real interaction slide the session
+		// inactivity window. Background polling deliberately goes unmarked.
+		if (consumeInteraction()) {
+			config.headers["X-User-Activity"] = "1";
+		}
+
 		return config;
 	},
 	(error) => {
@@ -49,24 +57,55 @@ api.interceptors.request.use(
 	},
 );
 
+// Endpoints whose own 401 means "these credentials are bad", not "this token
+// aged out", so retrying them behind a refresh would be pointless.
+const isSessionEndpoint = (url) =>
+	url.includes("/auth/login") ||
+	url.includes("/auth/refresh") ||
+	url.includes("/auth/logout");
+
 // Response interceptor
 api.interceptors.response.use(
 	(response) => response,
-	(error) => {
-		if (error.response?.status === 401) {
-			// Don't redirect if we're on the login page or if it's a TFA-related error
-			const currentPath = window.location.pathname;
-			const requestUrl = error.config?.url || "";
-			const isTfaError =
-				requestUrl.includes("/verify-tfa") || requestUrl.includes("/tfa/");
+	async (error) => {
+		if (error.response?.status !== 401) return Promise.reject(error);
 
-			if (currentPath !== "/login" && !isTfaError) {
-				// Dispatch event for AuthContext to handle - avoids race with React updates
-				// that could trigger ErrorBoundary "Something went wrong" before redirect
-				localStorage.removeItem("user");
-				window.dispatchEvent(new CustomEvent("auth:session-expired"));
+		// Don't redirect if we're on the login page or if it's a TFA-related error
+		const currentPath = window.location.pathname;
+		const config = error.config;
+		const requestUrl = config?.url || "";
+		const isTfaError =
+			requestUrl.includes("/verify-tfa") || requestUrl.includes("/tfa/");
+
+		if (currentPath === "/login" || isTfaError) {
+			return Promise.reject(error);
+		}
+
+		// Access tokens expire on a fixed schedule regardless of use, so most 401s
+		// here are an aged-out token rather than a dead session. Trade it for a
+		// fresh one and replay once; the session itself is only gone if that fails.
+		if (
+			config &&
+			!config._sessionRefreshAttempted &&
+			!isSessionEndpoint(requestUrl)
+		) {
+			config._sessionRefreshAttempted = true;
+			try {
+				await requestTokenRefresh();
+				return await api(config);
+			} catch (refreshError) {
+				// Only a 401 proves the session is gone. A network drop, a 5xx, or a
+				// rate limiter that is failing closed says nothing about the session,
+				// and signing the user out over it would turn a blip into a logout.
+				const status = refreshError?.response?.status;
+				if (status && status !== 401) return Promise.reject(error);
 			}
 		}
+
+		// Dispatch event for AuthContext to handle - avoids race with React updates
+		// that could trigger ErrorBoundary "Something went wrong" before redirect
+		localStorage.removeItem("user");
+		window.dispatchEvent(new CustomEvent("auth:session-expired"));
 		return Promise.reject(error);
 	},
 );
@@ -134,11 +173,13 @@ export const dashboardAPI = {
 // Admin Hosts API (for management interface)
 export const adminHostsAPI = {
 	create: (data) => api.post("/hosts/create", data),
-	list: () => api.get("/hosts/admin/list"),
+	list: (params = {}) => api.get("/hosts/admin/list", { params }),
 	delete: (hostId) => api.delete(`/hosts/${hostId}`),
 	deleteBulk: (hostIds) => api.delete("/hosts/bulk", { data: { hostIds } }),
 	regenerateCredentials: (hostId) =>
 		api.post(`/hosts/${hostId}/regenerate-credentials`),
+	dismissIdentityConflict: (hostId) =>
+		api.post(`/hosts/${hostId}/identity-conflict/dismiss`),
 	updateGroup: (hostId, hostGroupId) =>
 		api.put(`/hosts/${hostId}/group`, { hostGroupId }),
 	updateGroups: (hostId, groupIds) =>
@@ -183,6 +224,8 @@ export const adminHostsAPI = {
 	requestComplianceStatus: (hostId) =>
 		api.post(`/hosts/${hostId}/integrations/compliance/request-status`),
 	refreshDocker: (hostId) => api.post(`/hosts/${hostId}/refresh-docker`),
+	checkDockerImages: (hostId) =>
+		api.post(`/hosts/${hostId}/docker-image-check`),
 	setComplianceMode: (hostId, mode) =>
 		api.post(`/hosts/${hostId}/integrations/compliance/mode`, {
 			mode: mode,
@@ -195,6 +238,10 @@ export const adminHostsAPI = {
 		api.post(`/hosts/${hostId}/compliance/on-demand-only`, {
 			on_demand_only: onDemandOnly,
 		}),
+};
+
+export const dockerAPI = {
+	runImageChecks: () => api.post("/docker/image-checks/run"),
 };
 
 // Host Groups API
@@ -217,15 +264,23 @@ export const adminUsersAPI = {
 	delete: (userId) => api.delete(`/auth/admin/users/${userId}`),
 	resetPassword: (userId, newPassword) =>
 		api.post(`/auth/admin/users/${userId}/reset-password`, { newPassword }),
+	unlinkOidc: (userId) => api.post(`/auth/admin/users/${userId}/unlink-oidc`),
+	resetTfa: (userId, { password, tfaToken, newPassword }) =>
+		api.post(`/auth/admin/users/${userId}/reset-tfa`, {
+			password,
+			tfaToken,
+			newPassword,
+		}),
 };
 
 // Permissions API (for role management)
 export const permissionsAPI = {
 	getRoles: () => api.get("/permissions/roles"),
-	getRole: (role) => api.get(`/permissions/roles/${role}`),
+	getRole: (role) => api.get(`/permissions/roles/${encodeURIComponent(role)}`),
 	updateRole: (role, permissions) =>
-		api.put(`/permissions/roles/${role}`, permissions),
-	deleteRole: (role) => api.delete(`/permissions/roles/${role}`),
+		api.put(`/permissions/roles/${encodeURIComponent(role)}`, permissions),
+	deleteRole: (role) =>
+		api.delete(`/permissions/roles/${encodeURIComponent(role)}`),
 	getUserPermissions: () => api.get("/permissions/user-permissions"),
 };
 
@@ -235,6 +290,7 @@ export const settingsAPI = {
 	getPublic: () => api.get("/settings/public"), // Public endpoint for read-only settings (auto_update, etc.)
 	update: (settings) => api.put("/settings", settings),
 	getServerUrl: () => api.get("/settings/server-url"),
+	checkServerUrlCors: () => api.get("/settings/server-url/cors-check"),
 	getCurrentUrl: () => api.get("/settings/current-url"),
 	getEnvConfig: () => api.get("/settings/env-config"),
 	getEnvironmentConfig: () => api.get("/settings/environment"),
@@ -374,13 +430,14 @@ export const hostsAPI = {
 // Packages API
 export const packagesAPI = {
 	getAll: (params = {}) => api.get("/packages", { params }),
-	getById: (packageId) => api.get(`/packages/${packageId}`),
+	getById: (packageId) => api.get(`/packages/${encodeURIComponent(packageId)}`),
 	getCategories: () => api.get("/packages/categories/list"),
 	getHosts: (packageId, params = {}) =>
-		api.get(`/packages/${packageId}/hosts`, { params }),
+		api.get(`/packages/${encodeURIComponent(packageId)}/hosts`, { params }),
 	getActivity: (packageId, params = {}) =>
-		api.get(`/packages/${packageId}/activity`, { params }).then((r) => r.data),
-	update: (packageId, data) => api.put(`/packages/${packageId}`, data),
+		api
+			.get(`/packages/${encodeURIComponent(packageId)}/activity`, { params })
+			.then((r) => r.data),
 };
 
 // Utility functions
@@ -551,16 +608,23 @@ export const agentVersionAPI = {
 };
 
 // RDP API (in-browser RDP for Windows hosts via guacd)
+// Must exceed the server's 12s agent handshake so its agent_timeout reply reaches the UI.
 export const rdpAPI = {
-	createTicket: (data) => api.post("/auth/rdp-ticket", data),
+	createTicket: (data) =>
+		api.post("/auth/rdp-ticket", data, { timeout: 20000 }),
 };
 
 // Auth API
 export const authAPI = {
 	login: (username, password) =>
 		api.post("/auth/login", { username, password }),
-	verifyTfa: (username, token, remember_me = false) =>
-		api.post("/auth/verify-tfa", { username, token, remember_me }),
+	verifyTfa: (username, token, remember_me = false, tfa_ticket = "") =>
+		api.post("/auth/verify-tfa", {
+			username,
+			token,
+			remember_me,
+			tfa_ticket,
+		}),
 	signup: (username, email, password, firstName, lastName) =>
 		api.post("/auth/signup", {
 			username,
@@ -570,6 +634,9 @@ export const authAPI = {
 			lastName,
 		}),
 	subscribeNewsletter: () => api.post("/auth/subscribe-newsletter"),
+	// Carries X-User-Activity when the user has interacted since the last beat.
+	// The auth middleware does the work; the response body is empty.
+	heartbeat: () => api.post("/auth/heartbeat"),
 };
 
 // TFA API
@@ -696,6 +763,7 @@ export const alertsAPI = {
 		return api.get(url);
 	},
 	getAlertStats: () => api.get("/alerts/stats"),
+	getAlertTypes: () => api.get("/alerts/types"),
 	getAlert: (id) => api.get(`/alerts/${id}`),
 	getAlertHistory: (id) => api.get(`/alerts/${id}/history`),
 	getAvailableActions: () => api.get("/alerts/actions"),

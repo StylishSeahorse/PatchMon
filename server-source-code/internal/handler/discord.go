@@ -85,8 +85,22 @@ func (h *DiscordHandler) loadDiscordConfig(ctx context.Context) (*discord.Config
 	}, nil
 }
 
+// blockedByLocalAuth reports whether "Disable local auth" is in force, which
+// leaves SSO as the only way in, so Discord sign-in is refused too.
+func (h *DiscordHandler) blockedByLocalAuth(ctx context.Context) bool {
+	if h.auth == nil {
+		return false
+	}
+	off, fallback := h.auth.localAuthDecision(ctx)
+	return off || fallback != ""
+}
+
 // Config handles GET /api/v1/auth/discord/config.
 func (h *DiscordHandler) Config(w http.ResponseWriter, r *http.Request) {
+	if h.blockedByLocalAuth(r.Context()) {
+		JSON(w, http.StatusOK, map[string]interface{}{"enabled": false, "buttonText": "Login with Discord"})
+		return
+	}
 	cfg, _ := h.loadDiscordConfig(r.Context())
 	enabled := cfg != nil
 	buttonText := "Login with Discord"
@@ -104,6 +118,10 @@ func (h *DiscordHandler) Config(w http.ResponseWriter, r *http.Request) {
 
 // Login handles GET /api/v1/auth/discord/login.
 func (h *DiscordHandler) Login(w http.ResponseWriter, r *http.Request) {
+	if h.blockedByLocalAuth(r.Context()) {
+		Error(w, http.StatusForbidden, "Discord sign-in is disabled because local authentication is disabled. Please use SSO.")
+		return
+	}
 	if h.discordStore == nil {
 		Error(w, http.StatusServiceUnavailable, "Discord authentication is not available")
 		return
@@ -190,8 +208,11 @@ func (h *DiscordHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		redirectTo("/login?error=Invalid+authentication+response")
 		return
 	}
-	cookieState, _ := r.Cookie("discord_state")
-	if cookieState != nil && cookieState.Value != state {
+	// A missing cookie must be rejected too: the server-side state is single-use
+	// but is not bound to the victim's browser, so accepting nil allows a
+	// login CSRF.
+	cookieState, err := r.Cookie("discord_state")
+	if err != nil || cookieState == nil || cookieState.Value != state {
 		redirectTo("/login?error=Invalid+authentication+response")
 		return
 	}
@@ -201,6 +222,13 @@ func (h *DiscordHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "discord_state", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: isSecureRequest(r)})
+	if sessionData.Mode != "link" && h.blockedByLocalAuth(r.Context()) {
+		if h.log != nil {
+			h.log.Warn("discord login refused: local authentication is disabled")
+		}
+		redirectTo("/login?error=Discord+sign-in+is+disabled.+Please+use+SSO.")
+		return
+	}
 	cfg, err := h.loadDiscordConfig(r.Context())
 	if err != nil || cfg == nil {
 		redirectTo("/login?error=Discord+not+configured")
@@ -255,6 +283,29 @@ func (h *DiscordHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	user, _ := h.users.GetByDiscordIDOrEmail(r.Context(), discordUser.ID, discordUser.Email)
 	s, _ := h.settings.GetFirst(r.Context())
 
+	// The lookup matches on discord_id OR email, so a row can come back purely
+	// because Discord asserted an address. Discord is a public IdP: an
+	// unverified address proves nothing.
+	matchedByDiscordID := user != nil && user.DiscordID != nil && *user.DiscordID == discordUser.ID
+	if !matchedByDiscordID {
+		if !discordUser.Verified || discordUser.Email == "" {
+			if h.log != nil {
+				h.log.Warn("discord login rejected: unverified email",
+					"discord_id", discordUser.ID)
+			}
+			redirectTo("/login?error=Unable+to+sign+in+with+this+account")
+			return
+		}
+		if user != nil && user.DiscordID != nil {
+			if h.log != nil {
+				h.log.Error("discord login rejected: account is linked to a different discord id",
+					"discord_id", discordUser.ID)
+			}
+			redirectTo("/login?error=Unable+to+sign+in+with+this+account")
+			return
+		}
+	}
+
 	// Auto-create user if signup enabled
 	if user == nil && s != nil && s.SignupEnabled {
 		baseUsername := usernameSanitize.ReplaceAllString(discordUser.Username, "")
@@ -308,11 +359,22 @@ func (h *DiscordHandler) Callback(w http.ResponseWriter, r *http.Request) {
 			DiscordUsername: &discordUser.Username,
 			DiscordAvatar:   avatarPtr,
 		}
-		AutoSubscribeIfHosted(h.cfg != nil && h.cfg.AdminMode, h.users, h.log, user)
+		AutoSubscribeIfHosted(r.Context(), h.cfg != nil && h.cfg.AdminMode, h.users, h.log, user)
 	}
 
-	// Auto-link by email if verified
+	// Never adopt an account that already holds a credential: mailbox control
+	// would otherwise be enough to take it over, and PatchMon has no
+	// self-service password reset. Those users link from Settings instead.
 	if user != nil && user.DiscordID == nil && discordUser.Verified && discordUser.Email != "" {
+		hasOtherCredential := user.TfaEnabled || user.PasswordHash != nil
+		if hasOtherCredential {
+			if h.log != nil {
+				h.log.Warn("discord auto-link refused: account already has its own credential",
+					"user_id", user.ID, "discord_id", discordUser.ID)
+			}
+			redirectTo("/login?error=An+account+with+this+email+already+exists.+Sign+in+and+link+Discord+from+Settings.")
+			return
+		}
 		existing, _ := h.users.GetByDiscordID(r.Context(), discordUser.ID)
 		if existing == nil {
 			_ = h.users.UpdateDiscordLink(r.Context(), user.ID, discordUser.ID, discordUser.Username, avatarPtr)
@@ -323,7 +385,7 @@ func (h *DiscordHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if user == nil {
-		redirectTo("/login?error=User+not+found")
+		redirectTo("/login?error=Unable+to+sign+in+with+this+account")
 		return
 	}
 	if !user.IsActive {

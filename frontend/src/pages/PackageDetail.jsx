@@ -1,4 +1,8 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	keepPreviousData,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import {
 	AlertTriangle,
 	ArrowLeft,
@@ -17,12 +21,28 @@ import {
 	Square,
 	Wrench,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import PatchWizard from "../components/PatchWizard";
+import Tooltip from "../components/ui/Tooltip";
 import { useAuth } from "../contexts/AuthContext";
 import { useToast } from "../contexts/ToastContext";
+import { usePageRefresh } from "../hooks/usePageRefresh";
 import { formatRelativeTime, packagesAPI } from "../utils/api";
+import {
+	isPacmanHost,
+	PACMAN_SELECTED_PATCH_UNSUPPORTED,
+} from "../utils/patchSupport";
+import {
+	hostOsType,
+	isBlockedUpdateReason,
+	isPendingRestart,
+	isWindowsOs,
+	RESTART_REQUIRED_BADGE,
+	windowsBadges,
+	windowsPatchInfo,
+	windowsSourceLabel,
+} from "../utils/windowsPatching";
 
 function formatRepoName(name) {
 	if (!name) return "\u2014";
@@ -31,15 +51,108 @@ function formatRepoName(name) {
 	return name;
 }
 
-// A host is "patchable" for a specific package if it has a pending update
-// and isn't running Windows (Windows patching is not supported by the agent).
-const isHostPatchable = (host) =>
-	!!host.needsUpdate &&
-	!(host.osType || host.os_type || "").toLowerCase().includes("windows");
+const isWindowsHost = (host) => isWindowsOs(hostOsType(host));
+
+const isHostPatchable = (host) => {
+	if (isPacmanHost(host)) return false;
+	return isWindowsHost(host)
+		? windowsPatchInfo(host).patchable
+		: !!host.needsUpdate;
+};
+
+const WindowsBadges = ({ host }) => {
+	if (!isWindowsHost(host)) return null;
+	const badges = windowsBadges(windowsPatchInfo(host)).filter(
+		(b) => b.key !== "not-patchable" && b.key !== "security",
+	);
+	return badges.map((b) => (
+		<span key={b.key} className={`${b.className} w-fit`} title={b.title}>
+			{b.label}
+		</span>
+	));
+};
+
+const SourceCell = ({ host }) => {
+	if (isWindowsHost(host)) {
+		const info = windowsPatchInfo(host);
+		const label = windowsSourceLabel(info);
+		if (label) {
+			return (
+				<span className="badge-secondary text-xs" title={info.reasonText}>
+					{label}
+				</span>
+			);
+		}
+	}
+	if (host.sourceRepoName) {
+		return (
+			<span className="badge-secondary text-xs">
+				{formatRepoName(host.sourceRepoName)}
+			</span>
+		);
+	}
+	return null;
+};
+
+const UpToDateBadge = ({ host, className = "" }) =>
+	isPendingRestart(host) ? (
+		<span
+			className={`${RESTART_REQUIRED_BADGE.className} ${className}`}
+			title={RESTART_REQUIRED_BADGE.title}
+		>
+			{RESTART_REQUIRED_BADGE.label}
+		</span>
+	) : (
+		<span className={`badge-success ${className}`}>Up to Date</span>
+	);
+
+const NotPatchableTag = ({ host }) => {
+	if (isPacmanHost(host) && host.needsUpdate) {
+		return (
+			<Tooltip content={PACMAN_SELECTED_PATCH_UNSUPPORTED}>
+				<span
+					// biome-ignore lint/a11y/noNoninteractiveTabindex: focus opens the explanation for keyboard users
+					tabIndex={0}
+					className="badge-secondary w-fit"
+				>
+					Patch all only
+				</span>
+			</Tooltip>
+		);
+	}
+	if (!isWindowsHost(host) || !host.needsUpdate) return null;
+	const info = windowsPatchInfo(host);
+	if (info.patchable || isBlockedUpdateReason(info.reason)) return null;
+	return (
+		<span className="badge-secondary w-fit" title={info.reasonText}>
+			Not patchable
+		</span>
+	);
+};
+
+const PackageNotFound = () => (
+	<div className="card p-6">
+		<div className="text-center py-8">
+			<Package className="h-12 w-12 text-secondary-400 mx-auto mb-4" />
+			<p className="text-secondary-500 dark:text-white">Package not found</p>
+			<p className="text-sm text-secondary-400 dark:text-white mt-2">
+				This package is not in the package inventory. For example, Windows
+				updates leave the inventory once they are installed.
+			</p>
+			<Link
+				to="/packages"
+				className="btn-outline inline-flex items-center gap-2 mt-6 min-h-[44px]"
+			>
+				<ArrowLeft className="h-4 w-4" />
+				Back to Packages
+			</Link>
+		</div>
+	</div>
+);
 
 const PackageDetail = () => {
 	const { packageId } = useParams();
-	const decodedPackageId = decodeURIComponent(packageId || "");
+	const decodedPackageId = packageId ?? "";
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const toast = useToast();
@@ -56,6 +169,19 @@ const PackageDetail = () => {
 	// shows "Queuing…" / is disabled. Mutation.isPending alone is shared across
 	// every row and would disable the whole table on a single click.
 	const [patchingHostId, setPatchingHostId] = useState(null);
+
+	// Debounce search for backend (avoid refetch on every keystroke)
+	const [debouncedSearch, setDebouncedSearch] = useState("");
+	const searchDebounceRef = useRef(null);
+	useEffect(() => {
+		if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+		searchDebounceRef.current = setTimeout(() => {
+			setDebouncedSearch(searchTerm.trim());
+		}, 400);
+		return () => {
+			if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+		};
+	}, [searchTerm]);
 
 	// Shared post-submit handler for both per-host and multi-host wizards.
 	// The wizard owns the server call; we only deal with UX after.
@@ -82,7 +208,7 @@ const PackageDetail = () => {
 			return;
 		}
 		const immediate = runs.filter((r) => r.immediate);
-		if (mode === "patch" && immediate.length === 1) {
+		if (mode === "patch" && !info?.deferred && immediate.length === 1) {
 			navigate(`/patching/runs/${immediate[0].runId}`);
 			return;
 		}
@@ -101,9 +227,8 @@ const PackageDetail = () => {
 		queryKey: ["package", decodedPackageId],
 		queryFn: () =>
 			packagesAPI.getById(decodedPackageId).then((res) => res.data),
-		staleTime: 5 * 60 * 1000,
-		refetchOnWindowFocus: false,
 		enabled: !!decodedPackageId,
+		retry: (count, err) => err?.response?.status !== 404 && count < 1,
 	});
 
 	// Fetch hosts that have this package (backend filters by search, paginates)
@@ -111,12 +236,11 @@ const PackageDetail = () => {
 		data: hostsData,
 		isLoading: isLoadingHosts,
 		error: hostsError,
-		refetch: refetchHosts,
 	} = useQuery({
 		queryKey: [
 			"package-hosts",
 			decodedPackageId,
-			searchTerm,
+			debouncedSearch,
 			currentPage,
 			pageSize,
 			onlyPending,
@@ -124,14 +248,13 @@ const PackageDetail = () => {
 		queryFn: () =>
 			packagesAPI
 				.getHosts(decodedPackageId, {
-					search: searchTerm,
+					search: debouncedSearch,
 					page: currentPage,
 					limit: pageSize,
 					...(onlyPending ? { needsUpdate: true } : {}),
 				})
 				.then((res) => res.data),
-		staleTime: 5 * 60 * 1000,
-		refetchOnWindowFocus: false,
+		placeholderData: keepPreviousData,
 		enabled: !!decodedPackageId,
 	});
 
@@ -157,11 +280,17 @@ const PackageDetail = () => {
 		selectedHostIds.has(h.hostId),
 	);
 
+	// Reset to first page when the search changes
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reset when the debounced search changes
+	useEffect(() => {
+		setCurrentPage(1);
+	}, [debouncedSearch]);
+
 	// Reset selection when filter / search / page changes - the visible set changed
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally reset when these change
 	useEffect(() => {
 		setSelectedHostIds(new Set());
-	}, [searchTerm, currentPage, pageSize, onlyPending, decodedPackageId]);
+	}, [debouncedSearch, currentPage, pageSize, onlyPending, decodedPackageId]);
 
 	const toggleHost = (hostId) => {
 		setSelectedHostIds((prev) => {
@@ -188,10 +317,16 @@ const PackageDetail = () => {
 		navigate(`/hosts/${hostId}`);
 	};
 
-	const handleRefresh = () => {
-		refetchPackage();
-		refetchHosts();
-	};
+	const packageRefreshKeys = useMemo(
+		() => [
+			["package", decodedPackageId],
+			["package-hosts", decodedPackageId],
+			["package-activity", decodedPackageId],
+		],
+		[decodedPackageId],
+	);
+	const { refresh: handleRefresh, isRefreshing } =
+		usePageRefresh(packageRefreshKeys);
 
 	if (isLoadingPackage) {
 		return (
@@ -199,6 +334,10 @@ const PackageDetail = () => {
 				<RefreshCw className="h-8 w-8 animate-spin text-primary-600" />
 			</div>
 		);
+	}
+
+	if (packageError?.response?.status === 404) {
+		return <PackageNotFound />;
 	}
 
 	if (packageError) {
@@ -229,16 +368,7 @@ const PackageDetail = () => {
 	}
 
 	if (!packageData) {
-		return (
-			<div className="space-y-6">
-				<div className="text-center py-8">
-					<Package className="h-12 w-12 text-secondary-400 mx-auto mb-4" />
-					<p className="text-secondary-500 dark:text-white">
-						Package not found
-					</p>
-				</div>
-			</div>
-		);
+		return <PackageNotFound />;
 	}
 
 	const pkg = packageData;
@@ -271,20 +401,25 @@ const PackageDetail = () => {
 						) : (
 							<span className="badge-warning">Update Available</span>
 						)
+					) : (packageData.host_packages || []).some(isPendingRestart) ? (
+						<span
+							className={RESTART_REQUIRED_BADGE.className}
+							title={RESTART_REQUIRED_BADGE.title}
+						>
+							{RESTART_REQUIRED_BADGE.label}
+						</span>
 					) : (
 						<span className="badge-success">Up to Date</span>
 					)}
 				</div>
 				<button
 					type="button"
-					onClick={handleRefresh}
-					disabled={isLoadingPackage || isLoadingHosts}
+					onClick={() => handleRefresh()}
+					disabled={isRefreshing}
 					className="btn-outline flex items-center gap-2 text-sm sm:text-base self-start sm:self-auto"
 				>
 					<RefreshCw
-						className={`h-4 w-4 ${
-							isLoadingPackage || isLoadingHosts ? "animate-spin" : ""
-						}`}
+						className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
 					/>
 					Refresh
 				</button>
@@ -432,10 +567,7 @@ const PackageDetail = () => {
 									type="text"
 									placeholder="Search hosts..."
 									value={searchTerm}
-									onChange={(e) => {
-										setSearchTerm(e.target.value);
-										setCurrentPage(1);
-									}}
+									onChange={(e) => setSearchTerm(e.target.value)}
 									className="w-full pl-10 pr-4 py-2 border border-secondary-300 dark:border-secondary-600 rounded-md focus:ring-2 focus:ring-primary-500 focus:border-transparent bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white placeholder-secondary-500 dark:placeholder-secondary-400 text-sm sm:text-base"
 								/>
 							</div>
@@ -491,7 +623,7 @@ const PackageDetail = () => {
 								<div className="text-center py-8">
 									<Server className="h-12 w-12 text-secondary-400 mx-auto mb-4" />
 									<p className="text-secondary-500 dark:text-white">
-										{searchTerm
+										{debouncedSearch
 											? "No hosts match your search"
 											: onlyPending
 												? "All hosts are up to date for this package"
@@ -559,14 +691,12 @@ const PackageDetail = () => {
 																{host.currentVersion || "Unknown"}
 															</span>
 														</div>
-														{host.sourceRepoName && (
+														{(host.sourceRepoName || isWindowsHost(host)) && (
 															<div className="flex items-center gap-2">
 																<span className="text-xs text-secondary-500 dark:text-white">
-																	Repo:
+																	{isWindowsHost(host) ? "Source:" : "Repo:"}
 																</span>
-																<span className="badge-secondary text-xs">
-																	{formatRepoName(host.sourceRepoName)}
-																</span>
+																<SourceCell host={host} />
 															</div>
 														)}
 														<div className="flex items-center gap-2">
@@ -585,38 +715,40 @@ const PackageDetail = () => {
 																	</span>
 																)
 															) : (
-																<span className="badge-success text-xs">
-																	Up to Date
-																</span>
+																<UpToDateBadge
+																	host={host}
+																	className="text-xs"
+																/>
 															)}
+															<WindowsBadges host={host} />
 														</div>
 													</div>
 													<div className="flex flex-col gap-2 items-end">
-														{host.needsUpdate &&
-															canManageHosts() &&
-															!(host.osType || host.os_type || "")
-																.toLowerCase()
-																.includes("windows") && (
-																<button
-																	type="button"
-																	onClick={(e) => {
-																		e.stopPropagation();
-																		setPatchConfirmTarget({
-																			hostId: host.hostId,
-																			hostName:
-																				host.friendlyName || host.hostname,
-																			packageName: pkg.name,
-																		});
-																	}}
-																	disabled={patchingHostId === host.hostId}
-																	className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-primary-100 text-primary-800 hover:bg-primary-200 dark:bg-primary-900 dark:text-primary-200 dark:hover:bg-primary-800 disabled:opacity-50"
-																>
-																	<Wrench className="h-3 w-3" />
-																	{patchingHostId === host.hostId
-																		? "Queuing…"
-																		: "Patch"}
-																</button>
-															)}
+														{canManageHosts() && (
+															<NotPatchableTag host={host} />
+														)}
+														{canManageHosts() && isHostPatchable(host) && (
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	setPatchConfirmTarget({
+																		hostId: host.hostId,
+																		hostName:
+																			host.friendlyName || host.hostname,
+																		packageName: pkg.name,
+																		host,
+																	});
+																}}
+																disabled={patchingHostId === host.hostId}
+																className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-primary-100 text-primary-800 hover:bg-primary-200 dark:bg-primary-900 dark:text-primary-200 dark:hover:bg-primary-800 disabled:opacity-50"
+															>
+																<Wrench className="h-3 w-3" />
+																{patchingHostId === host.hostId
+																	? "Queuing…"
+																	: "Patch"}
+															</button>
+														)}
 														{host.needsReboot && (
 															<span
 																className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200"
@@ -755,16 +887,15 @@ const PackageDetail = () => {
 																	</span>
 																)
 															) : (
-																<span className="badge-success w-fit">
-																	Up to Date
-																</span>
+																<UpToDateBadge host={host} className="w-fit" />
 															)}
+															<div className="flex flex-wrap gap-1 mt-1 empty:hidden">
+																<WindowsBadges host={host} />
+															</div>
 														</td>
 														<td className="px-6 py-4 whitespace-nowrap">
-															{host.sourceRepoName ? (
-																<span className="badge-secondary text-xs">
-																	{formatRepoName(host.sourceRepoName)}
-																</span>
+															{host.sourceRepoName || isWindowsHost(host) ? (
+																<SourceCell host={host} />
 															) : (
 																<span className="text-xs text-secondary-400 dark:text-secondary-400">
 																	&mdash;
@@ -796,10 +927,7 @@ const PackageDetail = () => {
 																className="px-6 py-4 whitespace-nowrap"
 																onClick={(e) => e.stopPropagation()}
 															>
-																{host.needsUpdate &&
-																!(host.osType || host.os_type || "")
-																	.toLowerCase()
-																	.includes("windows") ? (
+																{isHostPatchable(host) ? (
 																	<button
 																		type="button"
 																		onClick={() =>
@@ -808,6 +936,7 @@ const PackageDetail = () => {
 																				hostName:
 																					host.friendlyName || host.hostname,
 																				packageName: pkg.name,
+																				host,
 																			})
 																		}
 																		disabled={patchingHostId === host.hostId}
@@ -818,6 +947,10 @@ const PackageDetail = () => {
 																			? "Queuing…"
 																			: "Patch"}
 																	</button>
+																) : (isWindowsHost(host) ||
+																		isPacmanHost(host)) &&
+																	host.needsUpdate ? (
+																	<NotPatchableTag host={host} />
 																) : (
 																	<span className="text-sm text-secondary-500 dark:text-white">
 																		-
@@ -948,8 +1081,20 @@ const PackageDetail = () => {
 						{
 							id: patchConfirmTarget.hostId,
 							friendly_name: patchConfirmTarget.hostName,
+							os_type: hostOsType(patchConfirmTarget.host),
 						},
 					]}
+					packageMeta={
+						isWindowsHost(patchConfirmTarget.host || {})
+							? {
+									[patchConfirmTarget.packageName]: {
+										source: windowsPatchInfo(patchConfirmTarget.host).source,
+										featureUpgrade: windowsPatchInfo(patchConfirmTarget.host)
+											.featureUpgrade,
+									},
+								}
+							: undefined
+					}
 					onSuccess={handlePatchWizardSuccess}
 				/>
 			)}
@@ -965,6 +1110,7 @@ const PackageDetail = () => {
 					restrictHostIds={selectedHostIds}
 					onSuccess={(mode, info) => {
 						handlePatchWizardSuccess(mode, info);
+						if (info?.deferred) return;
 						if (
 							!(mode === "patch" && (info?.runs || []).some((r) => r.immediate))
 						) {

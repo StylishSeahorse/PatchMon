@@ -223,6 +223,16 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+run_logged() {
+    _log="$1"
+    shift
+    _rcfile=$(mktemp 2>/dev/null || echo "/tmp/patchmon_install_rc.$$")
+    { "$@" 2>&1 && _rc=0 || _rc=$?; echo "$_rc" > "$_rcfile"; } | tee "$_log"
+    _rc=$(cat "$_rcfile" 2>/dev/null || echo 1)
+    rm -f "$_rcfile"
+    return "${_rc:-1}"
+}
+
 # Function to install packages with error handling
 install_apt_packages() {
     # Space-separated list of packages
@@ -255,7 +265,7 @@ install_apt_packages() {
     fi
     
     # Try to install packages
-    if eval "$_apt_cmd" 2>&1 | tee /tmp/patchmon_apt_install.log; then
+    if run_logged /tmp/patchmon_apt_install.log eval "$_apt_cmd"; then
         success "Packages installed successfully"
         return 0
     else
@@ -392,7 +402,7 @@ install_apk_packages() {
     _apk_cmd="apk add --no-cache $_missing_packages"
     
     # Try to install packages
-    if eval "$_apk_cmd" 2>&1 | tee /tmp/patchmon_apk_install.log; then
+    if run_logged /tmp/patchmon_apk_install.log eval "$_apk_cmd"; then
         success "Packages installed successfully"
         return 0
     else
@@ -465,6 +475,17 @@ elif command -v pacman >/dev/null 2>&1; then
     echo ""
     info "Installing curl..."
     install_pacman_packages curl
+    # checkupdates (pacman-contrib, plus fakeroot at runtime) gives fresher
+    # update data than the agent's pacman -Qu fallback. Matched on command name
+    # rather than package name, so install_pacman_packages is not used here.
+    # Best-effort: a stale keyring or unreachable mirror must not fail the
+    # install, because the agent works without these.
+    if ! command_exists checkupdates || ! command_exists fakeroot; then
+        info "Installing pacman-contrib and fakeroot (optional, improves update detection)..."
+        if ! pacman -S --noconfirm --needed pacman-contrib fakeroot; then
+            warning "Could not install pacman-contrib/fakeroot; the agent will fall back to pacman -Qu"
+        fi
+    fi
 elif command -v apk >/dev/null 2>&1; then
     # Alpine Linux
     info "Detected apk (Alpine Linux)"
@@ -579,10 +600,17 @@ if [ -f "/etc/patchmon/credentials" ]; then
     info "Removed old credentials file"
 fi
 
+HOST_ID_LINE=""
+case "${PATCHMON_HOST_ID:-}" in
+    ""|*[!A-Za-z0-9-]*) ;;
+    *) HOST_ID_LINE="host_id: \"$PATCHMON_HOST_ID\"" ;;
+esac
+
 # Create main config file
 cat > /etc/patchmon/config.yml << EOF
 # PatchMon Agent Configuration
 # Generated on $(date)
+${HOST_ID_LINE}
 patchmon_server: "$PATCHMON_URL"
 api_version: "v1"
 credentials_file: "/etc/patchmon/credentials.yml"
@@ -617,7 +645,11 @@ info "Downloading PatchMon agent binary..."
 # Determine the binary filename based on platform and architecture
 BINARY_NAME="patchmon-agent-${PATCHMON_OS}-${ARCHITECTURE}"
 
+# Some minimal installations do not have /usr/local/bin yet.
+mkdir -p /usr/local/bin || error "Cannot create /usr/local/bin for the PatchMon agent"
+
 # Check if agent binary already exists
+AGENT_BACKUP=""
 if [ -f "/usr/local/bin/patchmon-agent" ]; then
     warning "Agent binary already exists at /usr/local/bin/patchmon-agent"
     warning "Moving existing file out of the way for fresh installation"
@@ -626,8 +658,9 @@ if [ -f "/usr/local/bin/patchmon-agent" ]; then
     ls -t /usr/local/bin/patchmon-agent.backup.* 2>/dev/null | tail -n +4 | xargs -r rm -f
     
     # Move existing file out of the way
-    mv /usr/local/bin/patchmon-agent /usr/local/bin/patchmon-agent.backup.$(date +%Y%m%d_%H%M%S)
-    info "Moved existing agent to: /usr/local/bin/patchmon-agent.backup.$(date +%Y%m%d_%H%M%S)"
+    AGENT_BACKUP="/usr/local/bin/patchmon-agent.backup.$(date +%Y%m%d_%H%M%S)"
+    mv /usr/local/bin/patchmon-agent "$AGENT_BACKUP"
+    info "Moved existing agent to: $AGENT_BACKUP"
 fi
 
 # Clean up old shell script if it exists (from previous installations)
@@ -637,17 +670,42 @@ if [ -f "/usr/local/bin/patchmon-agent.sh" ]; then
     info "Removed old shell script agent"
 fi
 
-# Download the binary
-curl $CURL_FLAGS \
-    -H "X-API-ID: $API_ID" \
-    -H "X-API-KEY: $API_KEY" \
-    "$PATCHMON_URL/api/v1/hosts/agent/download?arch=$ARCHITECTURE&os=$PATCHMON_OS&force=binary" \
-    -o /usr/local/bin/patchmon-agent
+download_agent_binary() {
+    _dl="/usr/local/bin/.patchmon-agent.download.$$"
+    rm -f "$_dl"
+    if ! curl $CURL_FLAGS -fS \
+        -H "X-API-ID: $API_ID" \
+        -H "X-API-KEY: $API_KEY" \
+        "$PATCHMON_URL/api/v1/hosts/agent/download?arch=$ARCHITECTURE&os=$PATCHMON_OS&force=binary" \
+        -o "$_dl"; then
+        rm -f "$_dl"
+        return 1
+    fi
+    if [ ! -s "$_dl" ]; then
+        warning "Downloaded agent binary is empty"
+        rm -f "$_dl"
+        return 1
+    fi
+    chmod 755 "$_dl"
+    if ! "$_dl" --version >/dev/null 2>&1; then
+        warning "Downloaded file is not a working agent binary for $PATCHMON_OS/$ARCHITECTURE"
+        rm -f "$_dl"
+        return 1
+    fi
+    mv -f "$_dl" /usr/local/bin/patchmon-agent
+}
 
-chmod +x /usr/local/bin/patchmon-agent
+if ! download_agent_binary; then
+    if [ -n "$AGENT_BACKUP" ] && [ -f "$AGENT_BACKUP" ]; then
+        mv -f "$AGENT_BACKUP" /usr/local/bin/patchmon-agent
+        warning "Previous agent binary restored from backup"
+    fi
+    error "Failed to download the agent binary from $PATCHMON_URL. Check the server URL, credentials and network, then re-run the installation script."
+fi
 
 # Get the agent version from the binary
-AGENT_VERSION=$(/usr/local/bin/patchmon-agent version 2>/dev/null || echo "Unknown")
+AGENT_VERSION=$(/usr/local/bin/patchmon-agent --version 2>/dev/null | awk '{print $NF}')
+[ -n "$AGENT_VERSION" ] || AGENT_VERSION="Unknown"
 info "Agent version: $AGENT_VERSION"
 
 # Handle existing log files and create log directory
@@ -677,7 +735,9 @@ fi
 # Step 5: Setup service for WebSocket connection
 # Note: The service will automatically send an initial report on startup (see serve.go)
 # Detect init system and create appropriate service
-if command -v systemctl >/dev/null 2>&1; then
+# /run/systemd/system exists only when systemd is the running init. The
+# systemctl binary alone is also present when systemd is merely installed.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     # Systemd is available
     info "Setting up systemd service..."
     
@@ -855,7 +915,7 @@ EOF
         service patchmon_agent enable 2>/dev/null || true
         service patchmon_agent start
         sleep 1
-        if service patchmon_agent status 2>/dev/null | grep -q "running"; then
+        if service patchmon_agent onestatus >/dev/null 2>&1; then
             success "PatchMon Agent service started successfully"
             info "WebSocket connection established"
         else

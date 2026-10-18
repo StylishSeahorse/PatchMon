@@ -40,10 +40,20 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import AddHostWizard from "../components/AddHostWizard";
 import HostStatusPills from "../components/HostStatusPills";
+import {
+	AgentVersionIndicators,
+	ConfigVersionValue,
+} from "../components/host/HostIdentity";
 import InlineEdit from "../components/InlineEdit";
 import InlineMultiGroupEdit from "../components/InlineMultiGroupEdit";
 import InlineToggle from "../components/InlineToggle";
+import ModalPortal from "../components/ui/ModalPortal";
 import Tooltip from "../components/ui/Tooltip";
+import {
+	HOSTS_SORT_FIELDS,
+	useHostsUrlFilters,
+} from "../hooks/useHostsUrlFilters";
+import { usePageRefresh } from "../hooks/usePageRefresh";
 import { useTick } from "../hooks/useTick";
 import {
 	adminHostsAPI,
@@ -55,39 +65,37 @@ import {
 	settingsAPI,
 	userPreferencesAPI,
 } from "../utils/api";
+import {
+	hasConfigVersionMismatch,
+	hasHostIdMismatch,
+	hasIdentityConflict,
+} from "../utils/hostIdentity";
 import { deriveReportingState } from "../utils/hostStatus";
 import { getOSDisplayName, OSIcon } from "../utils/osIcons.jsx";
+import { invalidateHostScope } from "../utils/queryScopes";
+
+// Everything the page renders, not just the table: the stat cards, the filter
+// dropdowns and the connection badge each have their own query.
+const HOSTS_REFRESH_KEYS = [
+	["hosts"],
+	["hostCounts"],
+	["hostFilterOptions"],
+	["hostGroups"],
+	["wsStatusSummary"],
+];
 
 const HOSTS_PAGE_SIZE_OPTIONS = [25, 50, 100, 200, 500];
 const HOSTS_DEFAULT_PAGE_SIZE = 50;
 const HOSTS_PAGE_SIZE_STORAGE_KEY = "hosts-page-size";
 const WS_STATUS_BATCH_SIZE = 200;
 
-// The Reporting filter depends on live WebSocket state the server does not
-// hold, so it has to run client-side. To keep the row count, the range text
-// and the page controls honest we fetch an unpaginated slab, filter it, then
-// paginate the filtered result ourselves. The cap bounds that fetch; when the
-// fleet exceeds it the UI says so rather than quietly showing a partial list.
-const REPORTING_FILTER_FETCH_LIMIT = 1000;
-
-const HOSTS_SORT_FIELDS = {
-	agent_version: "agent_version",
-	friendlyName: "friendly_name",
-	group: "group",
-	hostname: "hostname",
-	integrations: "integrations",
-	ip: "ip",
-	last_update: "last_update",
-	needs_reboot: "needs_reboot",
-	notes: "notes",
-	os: "os_type",
-	os_version: "os_version",
-	security_updates: "security_updates",
-	ssg_version: "ssg_version",
-	status: "status",
-	updates: "updates",
-	uptime: "uptime",
-};
+// The Reporting and Connection filters depend on live WebSocket state the
+// server does not hold, so they have to run client-side. To keep the row count,
+// the range text and the page controls honest we fetch an unpaginated slab,
+// filter it, then paginate the filtered result ourselves. The cap bounds that
+// fetch; when the fleet exceeds it the UI says so rather than quietly showing a
+// partial list.
+const LIVE_FILTER_FETCH_LIMIT = 1000;
 
 export const normalisePageSize = (value) => {
 	const parsed = Number.parseInt(value, 10);
@@ -118,6 +126,7 @@ const fetchWsStatusBatches = async (apiIds) => {
 const Hosts = () => {
 	const hostGroupFilterId = useId();
 	const statusFilterId = useId();
+	const connectionFilterId = useId();
 	const osFilterId = useId();
 	const osVersionFilterId = useId();
 	const [showAddModal, setShowAddModal] = useState(false);
@@ -143,18 +152,23 @@ const Hosts = () => {
 	// from this so we don't spawn N intervals on N rows.
 	const tickNow = useTick(60000);
 
-	// Table state
-	const [searchTerm, setSearchTerm] = useState("");
-	const [sortField, setSortField] = useState("hostname");
-	const [sortDirection, setSortDirection] = useState("asc");
-	const [groupFilter, setGroupFilter] = useState("all");
-	const [statusFilter, setStatusFilter] = useState("all");
-	const [osFilter, setOsFilter] = useState("all");
-	const [osVersionFilter, setOsVersionFilter] = useState("all");
+	const {
+		searchTerm,
+		setSearchTerm,
+		search: debouncedSearch,
+		sortField,
+		sortDirection,
+		groupFilter,
+		statusFilter,
+		connectionFilter,
+		osFilter,
+		osVersionFilter,
+		groupBy,
+		hideStale,
+		updateFilters,
+	} = useHostsUrlFilters();
 	const [showFilters, setShowFilters] = useState(false);
-	const [groupBy, setGroupBy] = useState("none");
 	const [showColumnSettings, setShowColumnSettings] = useState(false);
-	const [hideStale, setHideStale] = useState(false);
 	const page = Math.max(1, Number.parseInt(searchParams.get("page"), 10) || 1);
 	const pageSize = normalisePageSize(
 		searchParams.get("pageSize") ||
@@ -162,30 +176,15 @@ const Hosts = () => {
 	);
 	const offset = (page - 1) * pageSize;
 
-	// Debounce search for backend (avoid refetch on every keystroke)
-	const [debouncedSearch, setDebouncedSearch] = useState("");
-	const searchDebounceRef = useRef(null);
-	useEffect(() => {
-		if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
-		searchDebounceRef.current = setTimeout(() => {
-			setDebouncedSearch(searchTerm?.trim() || "");
-		}, 400);
-		return () => {
-			if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
-		};
-	}, [searchTerm]);
-
-	// Deep-link params are applied only when their VALUE changes, never on every
-	// searchParams write. Paging rewrites `page` on the same URL, and without
-	// this guard that write would re-impose `?filter=stale` over a Reporting
-	// dropdown the user had just changed, then bounce them back to page 1 via
-	// the pagination-reset signature. First run has no previous snapshot, so
-	// deep links still apply in full on arrival.
+	// Deep-link side effects run only when a param's VALUE changes, so paging
+	// (which rewrites `page`) never reopens the panel or reselects hosts.
 	const appliedUrlParamsRef = useRef(null);
 	useEffect(() => {
 		const current = {
 			filter: searchParams.get("filter") || "",
 			showFilters: searchParams.get("showFilters") || "",
+			status: searchParams.get("status") || "",
+			connection: searchParams.get("connection") || "",
 			osFilter: searchParams.get("osFilter") || "",
 			osVersionFilter: searchParams.get("osVersionFilter") || "",
 			group: searchParams.get("group") || "",
@@ -197,48 +196,30 @@ const Hosts = () => {
 		const changed = (key) =>
 			previous === null || previous[key] !== current[key];
 
-		if (changed("filter")) {
-			switch (current.filter) {
-				case "needsUpdates":
-				case "selected":
-					// Row-level predicate is applied in the filtering logic below.
-					setShowFilters(true);
-					setStatusFilter("all");
-					break;
-				case "inactive":
-				case "stale":
-					setShowFilters(true);
-					setStatusFilter("stale");
-					break;
-				case "upToDate":
-					setShowFilters(true);
-					setStatusFilter("reporting");
-					break;
-				default:
-					break;
-			}
+		if (
+			changed("filter") &&
+			[
+				"needsUpdates",
+				"selected",
+				"inactive",
+				"stale",
+				"upToDate",
+				"awaitingData",
+			].includes(current.filter)
+		) {
+			setShowFilters(true);
 		}
 
 		if (changed("showFilters") && current.showFilters === "true") {
 			setShowFilters(true);
 		}
 
-		// OS filter parameter
-		if (changed("osFilter") && current.osFilter) {
+		if (
+			["status", "connection", "osFilter", "osVersionFilter", "group"].some(
+				(key) => changed(key) && current[key],
+			)
+		) {
 			setShowFilters(true);
-			setOsFilter(current.osFilter);
-		}
-
-		// OS version filter parameter (from dashboard OS distribution chart click)
-		if (changed("osVersionFilter") && current.osVersionFilter) {
-			setShowFilters(true);
-			setOsVersionFilter(current.osVersionFilter);
-		}
-
-		// Group filter parameter
-		if (changed("group") && current.group) {
-			setShowFilters(true);
-			setGroupFilter(current.group);
 		}
 
 		// Add host action from navigation
@@ -277,27 +258,33 @@ const Hosts = () => {
 			{ id: "os_version", label: "OS Version", visible: false, order: 6 },
 			{ id: "agent_version", label: "Agent Version", visible: true, order: 7 },
 			{
+				id: "config_version",
+				label: "Config Version",
+				visible: false,
+				order: 8,
+			},
+			{
 				id: "auto_update",
 				label: "Agent Auto-Update",
 				visible: true,
-				order: 8,
+				order: 9,
 			},
-			{ id: "ws_status", label: "Connection", visible: true, order: 9 },
-			{ id: "integrations", label: "Integrations", visible: true, order: 10 },
-			{ id: "status", label: "Reporting", visible: true, order: 11 },
-			{ id: "needs_reboot", label: "Reboot", visible: true, order: 12 },
-			{ id: "uptime", label: "Uptime", visible: true, order: 13 },
-			{ id: "updates", label: "Updates", visible: true, order: 14 },
+			{ id: "ws_status", label: "Connection", visible: true, order: 10 },
+			{ id: "integrations", label: "Integrations", visible: true, order: 11 },
+			{ id: "status", label: "Reporting", visible: true, order: 12 },
+			{ id: "needs_reboot", label: "Reboot", visible: true, order: 13 },
+			{ id: "uptime", label: "Uptime", visible: true, order: 14 },
+			{ id: "updates", label: "Updates", visible: true, order: 15 },
 			{
 				id: "security_updates",
 				label: "Security Updates",
 				visible: true,
-				order: 15,
+				order: 16,
 			},
-			{ id: "ssg_version", label: "SSG Version", visible: false, order: 16 },
-			{ id: "notes", label: "Notes", visible: false, order: 17 },
-			{ id: "last_update", label: "Last Update", visible: true, order: 18 },
-			{ id: "actions", label: "Actions", visible: true, order: 19 },
+			{ id: "ssg_version", label: "SSG Version", visible: false, order: 17 },
+			{ id: "notes", label: "Notes", visible: false, order: 18 },
+			{ id: "last_update", label: "Last Update", visible: true, order: 19 },
+			{ id: "actions", label: "Actions", visible: true, order: 20 },
 		],
 		[],
 	);
@@ -399,13 +386,17 @@ const Hosts = () => {
 		next.set("filter", "stale");
 		navigate(`/hosts?${next.toString()}`, { replace: true });
 	}, [urlFilter, searchParams, navigate]);
-	// The Reporting filter (reporting / overdue / stale) is derived from live
-	// WebSocket state that the server does not hold at query time, so it has to
-	// run client-side. While it is active we ask the server for one bounded slab
-	// rather than a page, then filter and paginate that slab locally, so the
-	// count, the range text and the page controls always agree with the rows on
-	// screen.
+	// The Reporting filter (reporting / overdue / stale) and the Connection
+	// filter (connected / offline) are derived from live WebSocket state that the
+	// server does not hold at query time, so they have to run client-side. While
+	// either is active we ask the server for one bounded slab rather than a page,
+	// then filter and paginate that slab locally, so the count, the range text
+	// and the page controls always agree with the rows on screen.
 	const reportingFilterActive = Boolean(statusFilter && statusFilter !== "all");
+	const connectionFilterActive = Boolean(
+		connectionFilter && connectionFilter !== "all",
+	);
+	const liveFilterActive = reportingFilterActive || connectionFilterActive;
 
 	const hostsQueryParams = useMemo(() => {
 		const params = {};
@@ -426,8 +417,8 @@ const Hosts = () => {
 		}
 		if (searchParams.get("reboot") === "true") params.reboot = "true";
 		if (hideStale) params.hideStale = "true";
-		if (reportingFilterActive) {
-			params.limit = REPORTING_FILTER_FETCH_LIMIT;
+		if (liveFilterActive) {
+			params.limit = LIVE_FILTER_FETCH_LIMIT;
 			params.offset = 0;
 		} else {
 			params.limit = pageSize;
@@ -444,7 +435,7 @@ const Hosts = () => {
 		urlFilter,
 		searchParams,
 		hideStale,
-		reportingFilterActive,
+		liveFilterActive,
 		pageSize,
 		offset,
 		sortField,
@@ -456,15 +447,18 @@ const Hosts = () => {
 		isLoading,
 		error,
 		refetch,
-		isFetching,
 	} = useQuery({
 		queryKey: ["hosts", hostsQueryParams],
 		queryFn: () =>
 			dashboardAPI.getHosts(hostsQueryParams).then((res) => res.data),
 		placeholderData: keepPreviousData,
-		staleTime: 5 * 60 * 1000, // Data stays fresh for 5 minutes
-		refetchOnWindowFocus: false, // Don't refetch when window regains focus
 	});
+
+	// The stat cards and the filter dropdowns come from their own queries, so a
+	// button bound only to the table left them showing counts that disagreed
+	// with the rows underneath.
+	const { refresh: refreshHosts, isRefreshing } =
+		usePageRefresh(HOSTS_REFRESH_KEYS);
 
 	const hostsPage = useMemo(() => {
 		if (Array.isArray(hostsResponse)) {
@@ -492,6 +486,7 @@ const Hosts = () => {
 		search: debouncedSearch,
 		group: groupFilter,
 		status: statusFilter,
+		connection: connectionFilter,
 		os: osFilter,
 		osVersion: osVersionFilter,
 		filter: urlFilter,
@@ -548,14 +543,11 @@ const Hosts = () => {
 		queryKey: ["hostFilterOptions"],
 		queryFn: () => dashboardAPI.getHostFilterOptions().then((res) => res.data),
 		staleTime: 5 * 60 * 1000,
-		refetchOnWindowFocus: false,
 	});
 
 	const { data: hostCounts } = useQuery({
 		queryKey: ["hostCounts"],
 		queryFn: () => dashboardAPI.getHostCounts().then((res) => res.data),
-		staleTime: 5 * 60 * 1000,
-		refetchOnWindowFocus: false,
 	});
 
 	const { data: wsStatusSummary } = useQuery({
@@ -563,7 +555,6 @@ const Hosts = () => {
 		queryFn: () => dashboardAPI.getWsStatusSummary().then((res) => res.data),
 		refetchInterval: 10000,
 		staleTime: 10000,
-		refetchOnWindowFocus: false,
 	});
 
 	// host_down alert config drives the WS pill amber→red threshold (seconds).
@@ -705,6 +696,7 @@ const Hosts = () => {
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["settings"] });
 			queryClient.invalidateQueries({ queryKey: ["serverUrl"] });
+			queryClient.invalidateQueries({ queryKey: ["serverUrlCorsCheck"] });
 		},
 	});
 
@@ -762,7 +754,7 @@ const Hosts = () => {
 	const bulkDeleteMutation = useMutation({
 		mutationFn: (hostIds) => adminHostsAPI.deleteBulk(hostIds),
 		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: ["hosts"] });
+			invalidateHostScope(queryClient);
 			setSelectedHosts([]);
 			setShowBulkDeleteModal(false);
 		},
@@ -885,7 +877,13 @@ const Hosts = () => {
 					(host.updatesCount && host.updatesCount > 0)) &&
 				(filter !== "inactive" ||
 					(host.effectiveStatus || host.status) === "inactive") &&
-				(filter !== "upToDate" || (!host.isStale && host.updatesCount === 0)) &&
+				// "Up to date" requires package data: a host we have never received
+				// packages from is unknown, not healthy. Mirrors the server predicate.
+				(filter !== "upToDate" ||
+					(!host.isStale &&
+						host.totalPackagesCount > 0 &&
+						host.updatesCount === 0)) &&
+				(filter !== "awaitingData" || !host.totalPackagesCount) &&
 				(filter !== "stale" || host.isStale) &&
 				(filter !== "selected" ||
 					(selectedIds &&
@@ -905,8 +903,8 @@ const Hosts = () => {
 
 			switch (sortField) {
 				case "friendlyName":
-					aValue = a.friendly_name.toLowerCase();
-					bValue = b.friendly_name.toLowerCase();
+					aValue = a.friendly_name?.toLowerCase() || "zzz_no_name";
+					bValue = b.friendly_name?.toLowerCase() || "zzz_no_name";
 					break;
 				case "hostname":
 					aValue = a.hostname?.toLowerCase() || "zzz_no_hostname";
@@ -951,6 +949,10 @@ const Hosts = () => {
 				case "agent_version":
 					aValue = a.agent_version?.toLowerCase() || "zzz_no_version";
 					bValue = b.agent_version?.toLowerCase() || "zzz_no_version";
+					break;
+				case "config_version":
+					aValue = a.config_version?.toLowerCase() || "zzz_no_version";
+					bValue = b.config_version?.toLowerCase() || "zzz_no_version";
 					break;
 				case "status":
 					aValue = a.effectiveStatus || a.status;
@@ -1059,20 +1061,30 @@ const Hosts = () => {
 		selectedHostIdsSetForFilter,
 	]);
 
-	// Apply the new tri-state Status filter (reporting / overdue / stale) on
-	// top of the backend / legacy-mode filter result. Cross-couples each host's
-	// reportingState with the live WS map so the dropdown matches what the user
-	// sees in the Reporting pill. Done here rather than in the predicate above
-	// so the pill colours and the filter logic stay in lock-step.
+	// Apply the tri-state Status filter (reporting / overdue / stale) and the
+	// Connection filter (connected / offline) on top of the backend / legacy-mode
+	// filter result. Both cross-couple each host with the live WS map so the
+	// dropdowns match what the user sees in the Reporting and Connection pills.
+	// Done here rather than in the predicate above so the pill colours and the
+	// filter logic stay in lock-step.
 	const filteredHosts = useMemo(() => {
-		if (!statusFilter || statusFilter === "all") return filteredAndSortedHosts;
+		if (!reportingFilterActive && !connectionFilterActive) {
+			return filteredAndSortedHosts;
+		}
 		return filteredAndSortedHosts.filter((host) => {
-			// Treat missing WS data as "assume connected" so the dropdown
-			// matches the pill, which uses the same convention.
+			// Treat missing WS data as "assume connected" so the dropdowns
+			// match the pills, which use the same convention.
 			const wsEntry = wsStatusMap[host.api_id];
 			const wsConnectedOrUnknown =
 				wsEntry === undefined || wsEntry?.connected === true;
+			if (
+				connectionFilterActive &&
+				wsConnectedOrUnknown !== (connectionFilter === "connected")
+			) {
+				return false;
+			}
 			return (
+				!reportingFilterActive ||
 				deriveReportingState(
 					host,
 					wsConnectedOrUnknown,
@@ -1082,34 +1094,35 @@ const Hosts = () => {
 		});
 	}, [
 		filteredAndSortedHosts,
+		reportingFilterActive,
+		connectionFilterActive,
+		connectionFilter,
 		statusFilter,
 		wsStatusMap,
 		updateIntervalMinutes,
 	]);
 
-	// Pagination is derived AFTER the Reporting filter so the footer count, the
-	// range text and the page controls describe the rows actually rendered. With
-	// no Reporting filter the server already returned exactly one page and this
-	// is a pass-through.
-	const totalHosts = reportingFilterActive
-		? filteredHosts.length
-		: serverTotalHosts;
+	// Pagination is derived AFTER the client-side filters so the footer count,
+	// the range text and the page controls describe the rows actually rendered.
+	// With no client-side filter the server already returned exactly one page and
+	// this is a pass-through.
+	const totalHosts = liveFilterActive ? filteredHosts.length : serverTotalHosts;
 	const totalPages = Math.max(1, Math.ceil(totalHosts / pageSize));
 	const visibleHosts = useMemo(() => {
-		if (!reportingFilterActive) return filteredHosts;
+		if (!liveFilterActive) return filteredHosts;
 		const start = (page - 1) * pageSize;
 		return filteredHosts.slice(start, start + pageSize);
-	}, [filteredHosts, reportingFilterActive, page, pageSize]);
+	}, [filteredHosts, liveFilterActive, page, pageSize]);
 	const pageStart =
 		visibleHosts.length === 0
 			? 0
-			: (reportingFilterActive ? (page - 1) * pageSize : hostsPage.offset) + 1;
+			: (liveFilterActive ? (page - 1) * pageSize : hostsPage.offset) + 1;
 	const pageEnd = pageStart === 0 ? 0 : pageStart + visibleHosts.length - 1;
 
 	// The client-side slab is bounded, so say so rather than silently hiding
 	// matches that fell outside it.
-	const reportingFilterTruncated =
-		reportingFilterActive && serverTotalHosts > REPORTING_FILTER_FETCH_LIMIT;
+	const liveFilterTruncated =
+		liveFilterActive && serverTotalHosts > LIVE_FILTER_FETCH_LIMIT;
 
 	// Clamp out-of-range deep links (`?page=999`) and pages that empty out after
 	// a delete, but only once the totals are known so a legitimate deep link is
@@ -1232,12 +1245,10 @@ const Hosts = () => {
 	}, [visibleHosts, groupBy]);
 
 	const handleSort = (field) => {
-		if (sortField === field) {
-			setSortDirection(sortDirection === "asc" ? "desc" : "asc");
-		} else {
-			setSortField(field);
-			setSortDirection("asc");
-		}
+		updateFilters({
+			sort: field,
+			order: sortField === field && sortDirection === "asc" ? "desc" : "asc",
+		});
 	};
 
 	const getSortIcon = (field) => {
@@ -1399,8 +1410,15 @@ const Hosts = () => {
 				);
 			case "agent_version":
 				return (
+					<div className="flex items-center gap-1.5 text-sm text-secondary-900 dark:text-white">
+						<span>{host.agent_version || "N/A"}</span>
+						<AgentVersionIndicators host={host} />
+					</div>
+				);
+			case "config_version":
+				return (
 					<div className="text-sm text-secondary-900 dark:text-white">
-						{host.agent_version || "N/A"}
+						<ConfigVersionValue host={host} emptyLabel="N/A" />
 					</div>
 				);
 			case "auto_update":
@@ -1533,7 +1551,13 @@ const Hosts = () => {
 				let badgeClass;
 				let label;
 				let tooltipText;
-				if (reportingState === "reporting") {
+				if (reportingState === "awaiting") {
+					badgeClass =
+						"badge bg-secondary-100 text-secondary-700 dark:bg-secondary-700 dark:text-secondary-200";
+					label = "Awaiting report";
+					tooltipText =
+						"This host has been added but its agent has not sent a report yet. Install and start the agent on the host to begin monitoring.";
+				} else if (reportingState === "reporting") {
 					badgeClass =
 						"badge bg-success-100 text-success-800 dark:bg-success-900 dark:text-success-200";
 					label = "Reporting";
@@ -1658,29 +1682,26 @@ const Hosts = () => {
 		}
 	};
 
+	const resetFilters = (changes = {}) => {
+		setSearchTerm("");
+		updateFilters(changes, { clear: true });
+	};
+
 	// Stats card click handlers
 	const handleTotalHostsClick = () => {
-		// Clear all filters to show all hosts
 		setSearchTerm("");
-		setGroupFilter("all");
-		setStatusFilter("all");
-		setOsFilter("all");
-		setGroupBy("none");
-		setHideStale(false);
 		setShowFilters(false);
-		// Clear URL parameters to ensure no filters are applied
 		navigate("/hosts", { replace: true });
 	};
 
 	const handleNeedsUpdatesClick = () => {
-		// Filter to show hosts needing updates (regardless of status)
-		setStatusFilter("all");
 		setShowFilters(true);
-		// Clear conflicting filters and set needsUpdates filter
-		const newSearchParams = new URLSearchParams(window.location.search);
-		newSearchParams.set("filter", "needsUpdates");
-		newSearchParams.delete("reboot"); // Clear reboot filter when switching to needsUpdates
-		navigate(`/hosts?${newSearchParams.toString()}`, { replace: true });
+		updateFilters({ filter: "needsUpdates", status: "", reboot: "" });
+	};
+
+	const handleConnectionFilterClick = (value) => {
+		setShowFilters(true);
+		resetFilters({ connection: value });
 	};
 
 	if (isLoading && !hostsResponse) {
@@ -1717,7 +1738,7 @@ const Hosts = () => {
 	}
 
 	return (
-		<div className="min-h-0 flex flex-col md:h-[calc(100vh-7rem)] md:overflow-hidden">
+		<div className="min-h-0 flex flex-col md:h-[calc(100vh-var(--app-main-inset))] md:overflow-hidden">
 			{/* Page Header */}
 			<div className="flex items-center justify-between mb-6">
 				<div>
@@ -1731,13 +1752,13 @@ const Hosts = () => {
 				<div className="flex items-center gap-3">
 					<button
 						type="button"
-						onClick={() => refetch()}
-						disabled={isFetching}
+						onClick={() => refreshHosts()}
+						disabled={isRefreshing}
 						className="btn-outline flex items-center justify-center p-2"
 						title="Refresh hosts data"
 					>
 						<RefreshCw
-							className={`h-4 w-4 ${isFetching ? "animate-spin" : ""}`}
+							className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
 						/>
 					</button>
 					<button
@@ -1792,10 +1813,8 @@ const Hosts = () => {
 					type="button"
 					className="card p-4 cursor-pointer hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow duration-200 text-left w-full"
 					onClick={() => {
-						const newSearchParams = new URLSearchParams();
-						newSearchParams.set("reboot", "true");
-						// Clear filter parameter when setting reboot filter
-						navigate(`/hosts?${newSearchParams.toString()}`, { replace: true });
+						setSearchTerm("");
+						navigate("/hosts?reboot=true", { replace: true });
 					}}
 				>
 					<div className="flex items-center">
@@ -1811,13 +1830,10 @@ const Hosts = () => {
 						</div>
 					</div>
 				</button>
-				<div className="card p-4 text-left w-full">
+				<div className="card p-4">
 					<div className="flex items-center">
-						<Wifi className="h-5 w-5 text-primary-600 mr-2" />
-						<div className="flex-1">
-							<p className="text-sm text-secondary-500 dark:text-white mb-1">
-								Connection Status
-							</p>
+						<Wifi className="h-5 w-5 text-primary-600 mr-2 shrink-0" />
+						<div className="flex-1 min-w-0">
 							{(() => {
 								const totalForStatus = hostCounts?.total ?? 0;
 								const connectedCount = wsStatusSummary?.connected ?? 0;
@@ -1826,25 +1842,35 @@ const Hosts = () => {
 									0,
 								);
 								return (
-									<div className="flex gap-4">
-										<div className="flex items-center gap-1">
-											<div className="w-2 h-2 bg-green-500 rounded-full"></div>
-											<span className="text-sm font-medium text-secondary-900 dark:text-white">
+									<div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+										<button
+											type="button"
+											onClick={() => handleConnectionFilterClick("connected")}
+											title="Click to filter hosts that are connected"
+											className="flex items-center gap-1.5 rounded-md px-2 py-1 -ml-2 min-h-[44px] cursor-pointer hover:bg-secondary-100 dark:hover:bg-secondary-700 transition-colors"
+										>
+											<div className="w-2 h-2 bg-green-500 rounded-full shrink-0"></div>
+											<span className="text-xl font-semibold text-secondary-900 dark:text-white">
 												{connectedCount}
 											</span>
-											<span className="text-xs text-secondary-500 dark:text-white hidden sm:inline">
+											<span className="text-sm text-secondary-500 dark:text-white">
 												Connected
 											</span>
-										</div>
-										<div className="flex items-center gap-1">
-											<div className="w-2 h-2 bg-red-500 rounded-full"></div>
-											<span className="text-sm font-medium text-secondary-900 dark:text-white">
+										</button>
+										<button
+											type="button"
+											onClick={() => handleConnectionFilterClick("offline")}
+											title="Click to filter hosts that are offline"
+											className="flex items-center gap-1.5 rounded-md px-2 py-1 min-h-[44px] cursor-pointer hover:bg-secondary-100 dark:hover:bg-secondary-700 transition-colors"
+										>
+											<div className="w-2 h-2 bg-red-500 rounded-full shrink-0"></div>
+											<span className="text-xl font-semibold text-secondary-900 dark:text-white">
 												{offlineCount}
 											</span>
-											<span className="text-xs text-secondary-500 dark:text-white hidden sm:inline">
+											<span className="text-sm text-secondary-500 dark:text-white">
 												Offline
 											</span>
-										</div>
+										</button>
 									</div>
 								);
 							})()}
@@ -1959,7 +1985,7 @@ const Hosts = () => {
 								<div className="relative">
 									<select
 										value={groupBy}
-										onChange={(e) => setGroupBy(e.target.value)}
+										onChange={(e) => updateFilters({ groupBy: e.target.value })}
 										className="appearance-none bg-white dark:bg-secondary-800 border-2 border-secondary-300 dark:border-secondary-600 rounded-lg px-2 py-2 pr-6 text-xs sm:text-sm focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-secondary-900 dark:text-white hover:border-secondary-400 dark:hover:border-secondary-500 transition-colors min-w-[100px] sm:min-w-[120px] min-h-[44px]"
 									>
 										<option value="none">No Grouping</option>
@@ -1971,7 +1997,7 @@ const Hosts = () => {
 								</div>
 								<button
 									type="button"
-									onClick={() => setHideStale(!hideStale)}
+									onClick={() => updateFilters({ hideStale: !hideStale })}
 									className={`btn-outline flex items-center gap-1.5 sm:gap-2 px-2 sm:px-4 py-2 min-h-[44px] text-xs sm:text-sm ${hideStale ? "bg-primary-50 border-primary-300" : ""}`}
 								>
 									<AlertTriangle className="h-4 w-4 flex-shrink-0" />
@@ -1994,7 +2020,7 @@ const Hosts = () => {
 										<select
 											id={hostGroupFilterId}
 											value={groupFilter}
-											onChange={(e) => setGroupFilter(e.target.value)}
+											onChange={(e) => updateFilters({ group: e.target.value })}
 											className="w-full border border-secondary-300 dark:border-secondary-600 rounded-lg px-3 py-2.5 sm:py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white min-h-[44px]"
 										>
 											<option value="all">All Groups</option>
@@ -2016,13 +2042,36 @@ const Hosts = () => {
 										<select
 											id={statusFilterId}
 											value={statusFilter}
-											onChange={(e) => setStatusFilter(e.target.value)}
+											onChange={(e) =>
+												updateFilters({ status: e.target.value })
+											}
 											className="w-full border border-secondary-300 dark:border-secondary-600 rounded-lg px-3 py-2.5 sm:py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white min-h-[44px]"
 										>
 											<option value="all">All</option>
 											<option value="reporting">Reporting</option>
 											<option value="overdue">Overdue</option>
 											<option value="stale">Stale</option>
+											<option value="awaiting">Awaiting report</option>
+										</select>
+									</div>
+									<div>
+										<label
+											htmlFor={connectionFilterId}
+											className="block text-sm font-medium text-secondary-700 dark:text-secondary-200 mb-1"
+										>
+											Connection
+										</label>
+										<select
+											id={connectionFilterId}
+											value={connectionFilter}
+											onChange={(e) =>
+												updateFilters({ connection: e.target.value })
+											}
+											className="w-full border border-secondary-300 dark:border-secondary-600 rounded-lg px-3 py-2.5 sm:py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white min-h-[44px]"
+										>
+											<option value="all">All</option>
+											<option value="connected">Connected</option>
+											<option value="offline">Offline</option>
 										</select>
 									</div>
 									<div>
@@ -2035,10 +2084,12 @@ const Hosts = () => {
 										<select
 											id={osFilterId}
 											value={osFilter}
-											onChange={(e) => {
-												setOsFilter(e.target.value);
-												setOsVersionFilter("all");
-											}}
+											onChange={(e) =>
+												updateFilters({
+													osFilter: e.target.value,
+													osVersionFilter: "",
+												})
+											}
 											className="w-full border border-secondary-300 dark:border-secondary-600 rounded-lg px-3 py-2.5 sm:py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white min-h-[44px]"
 										>
 											<option value="all">All OS</option>
@@ -2063,7 +2114,9 @@ const Hosts = () => {
 												<select
 													id={osVersionFilterId}
 													value={osVersionFilter}
-													onChange={(e) => setOsVersionFilter(e.target.value)}
+													onChange={(e) =>
+														updateFilters({ osVersionFilter: e.target.value })
+													}
 													className="w-full border border-secondary-300 dark:border-secondary-600 rounded-lg px-3 py-2.5 sm:py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-secondary-800 text-secondary-900 dark:text-white min-h-[44px]"
 												>
 													<option value="all">All Versions</option>
@@ -2083,15 +2136,7 @@ const Hosts = () => {
 									<div className="flex items-end">
 										<button
 											type="button"
-											onClick={() => {
-												setSearchTerm("");
-												setGroupFilter("all");
-												setStatusFilter("all");
-												setOsFilter("all");
-												setOsVersionFilter("all");
-												setGroupBy("none");
-												setHideStale(false);
-											}}
+											onClick={() => resetFilters()}
 											className="btn-outline w-full min-h-[44px]"
 										>
 											Clear Filters
@@ -2102,15 +2147,14 @@ const Hosts = () => {
 						)}
 					</div>
 
-					{reportingFilterTruncated && (
+					{liveFilterTruncated && (
 						<div className="mb-4 flex items-start gap-2 rounded-md border border-warning-200 dark:border-warning-700 bg-warning-50 dark:bg-warning-900 p-3">
 							<AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-warning-600 dark:text-warning-300" />
 							<p className="text-sm text-warning-800 dark:text-warning-200">
-								The Reporting filter is applied to the first{" "}
-								{REPORTING_FILTER_FETCH_LIMIT.toLocaleString()} hosts only, out
-								of {serverTotalHosts.toLocaleString()} matching your other
-								filters. Narrow the search, group or OS filters to cover every
-								host.
+								The Reporting and Connection filters are applied to the first{" "}
+								{LIVE_FILTER_FETCH_LIMIT.toLocaleString()} hosts only, out of{" "}
+								{serverTotalHosts.toLocaleString()} matching your other filters.
+								Narrow the search, group or OS filters to cover every host.
 							</p>
 						</div>
 					)}
@@ -2259,6 +2303,40 @@ const Hosts = () => {
 																		compact
 																	/>
 																</div>
+
+																{(visibleColumns.some(
+																	(col) => col.id === "config_version",
+																) ||
+																	hasConfigVersionMismatch(host) ||
+																	hasHostIdMismatch(host) ||
+																	hasIdentityConflict(host)) && (
+																	<div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+																		<div className="flex items-center gap-1.5">
+																			<span className="text-secondary-500 dark:text-white">
+																				Agent:
+																			</span>
+																			<span className="text-secondary-700 dark:text-white">
+																				{host.agent_version || "N/A"}
+																			</span>
+																			<AgentVersionIndicators host={host} />
+																		</div>
+																		{visibleColumns.some(
+																			(col) => col.id === "config_version",
+																		) && (
+																			<div className="flex items-center gap-1.5">
+																				<span className="text-secondary-500 dark:text-white">
+																					Config:
+																				</span>
+																				<span className="text-secondary-700 dark:text-white">
+																					<ConfigVersionValue
+																						host={host}
+																						emptyLabel="N/A"
+																					/>
+																				</span>
+																			</div>
+																		)}
+																	</div>
+																)}
 
 																{/* Group info */}
 																<div className="flex flex-wrap items-center gap-3 text-sm">
@@ -2421,6 +2499,17 @@ const Hosts = () => {
 																			>
 																				{column.label}
 																				{getSortIcon("agent_version")}
+																			</button>
+																		) : column.id === "config_version" ? (
+																			<button
+																				type="button"
+																				onClick={() =>
+																					handleSort("config_version")
+																				}
+																				className="flex items-center gap-2 hover:text-secondary-700"
+																			>
+																				{column.label}
+																				{getSortIcon("config_version")}
 																			</button>
 																		) : column.id === "auto_update" ? (
 																			<div className="flex items-center gap-2 font-normal text-xs text-secondary-500 dark:text-white normal-case tracking-wider">
@@ -2646,63 +2735,65 @@ const Hosts = () => {
 
 			{/* Auto-Update Confirmation Dialog */}
 			{autoUpdateDialog.show && (
-				<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-					<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-md w-full mx-4 overflow-hidden">
-						<div className="p-6">
-							<div className="flex items-start gap-4">
-								<div className="flex-shrink-0 w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center">
-									<AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-								</div>
-								<div className="flex-1">
-									<h3 className="text-lg font-semibold text-secondary-900 dark:text-white">
-										Global Auto-Updates Disabled
-									</h3>
-									<p className="mt-2 text-sm text-secondary-600 dark:text-white">
-										The master auto-update setting is currently{" "}
-										<strong>disabled</strong> in Settings &gt; Agent Updates.
-									</p>
-									<p className="mt-2 text-sm text-secondary-600 dark:text-white">
-										Enabling auto-update for{" "}
-										<strong>{autoUpdateDialog.hostName}</strong> won't take
-										effect until global auto-updates are enabled.
-									</p>
+				<ModalPortal>
+					<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[120]">
+						<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-md w-full mx-4 overflow-hidden">
+							<div className="p-6">
+								<div className="flex items-start gap-4">
+									<div className="flex-shrink-0 w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center">
+										<AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+									</div>
+									<div className="flex-1">
+										<h3 className="text-lg font-semibold text-secondary-900 dark:text-white">
+											Global Auto-Updates Disabled
+										</h3>
+										<p className="mt-2 text-sm text-secondary-600 dark:text-white">
+											The master auto-update setting is currently{" "}
+											<strong>disabled</strong> in Settings &gt; Agent Updates.
+										</p>
+										<p className="mt-2 text-sm text-secondary-600 dark:text-white">
+											Enabling auto-update for{" "}
+											<strong>{autoUpdateDialog.hostName}</strong> won't take
+											effect until global auto-updates are enabled.
+										</p>
+									</div>
 								</div>
 							</div>
-						</div>
-						<div className="bg-secondary-50 dark:bg-secondary-700/50 px-6 py-4 flex flex-col sm:flex-row gap-3 sm:justify-end">
-							<button
-								type="button"
-								onClick={() =>
-									setAutoUpdateDialog({
-										show: false,
-										hostId: null,
-										hostName: null,
-									})
-								}
-								className="px-4 py-2 text-sm font-medium text-secondary-700 dark:text-secondary-200 bg-white dark:bg-secondary-600 border border-secondary-300 dark:border-secondary-500 rounded-md hover:bg-secondary-50 dark:hover:bg-secondary-500 transition-colors"
-							>
-								Cancel
-							</button>
-							<button
-								type="button"
-								onClick={handleEnableHostOnly}
-								className="px-4 py-2 text-sm font-medium text-secondary-700 dark:text-secondary-200 bg-white dark:bg-secondary-600 border border-secondary-300 dark:border-secondary-500 rounded-md hover:bg-secondary-50 dark:hover:bg-secondary-500 transition-colors"
-							>
-								Enable Host Only
-							</button>
-							<button
-								type="button"
-								onClick={handleEnableBoth}
-								disabled={enableGlobalAutoUpdateMutation.isPending}
-								className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-							>
-								{enableGlobalAutoUpdateMutation.isPending
-									? "Enabling..."
-									: "Enable Both"}
-							</button>
+							<div className="bg-secondary-50 dark:bg-secondary-700/50 px-6 py-4 flex flex-col sm:flex-row gap-3 sm:justify-end">
+								<button
+									type="button"
+									onClick={() =>
+										setAutoUpdateDialog({
+											show: false,
+											hostId: null,
+											hostName: null,
+										})
+									}
+									className="px-4 py-2 text-sm font-medium text-secondary-700 dark:text-secondary-200 bg-white dark:bg-secondary-600 border border-secondary-300 dark:border-secondary-500 rounded-md hover:bg-secondary-50 dark:hover:bg-secondary-500 transition-colors"
+								>
+									Cancel
+								</button>
+								<button
+									type="button"
+									onClick={handleEnableHostOnly}
+									className="px-4 py-2 text-sm font-medium text-secondary-700 dark:text-secondary-200 bg-white dark:bg-secondary-600 border border-secondary-300 dark:border-secondary-500 rounded-md hover:bg-secondary-50 dark:hover:bg-secondary-500 transition-colors"
+								>
+									Enable Host Only
+								</button>
+								<button
+									type="button"
+									onClick={handleEnableBoth}
+									disabled={enableGlobalAutoUpdateMutation.isPending}
+									className="px-4 py-2 text-sm font-medium text-white bg-primary-600 rounded-md hover:bg-primary-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+								>
+									{enableGlobalAutoUpdateMutation.isPending
+										? "Enabling..."
+										: "Enable Both"}
+								</button>
+							</div>
 						</div>
 					</div>
-				</div>
+				</ModalPortal>
 			)}
 		</div>
 	);
@@ -2743,8 +2834,8 @@ const BulkAssignModal = ({
 		});
 	};
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg p-6 w-full max-w-md">
 				<div className="flex justify-between items-center mb-4">
 					<h3 className="text-lg font-semibold text-secondary-900 dark:text-white">
@@ -2835,6 +2926,8 @@ const BulkAssignModal = ({
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 // Bulk Delete Modal Component
@@ -2854,8 +2947,8 @@ const BulkDeleteModal = ({
 		onDelete();
 	};
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120]">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-md w-full mx-4">
 				<div className="px-6 py-4 border-b border-secondary-200 dark:border-secondary-600">
 					<div className="flex items-center justify-between">
@@ -2926,6 +3019,8 @@ const BulkDeleteModal = ({
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 // Column Settings Modal Component
@@ -2956,8 +3051,12 @@ const ColumnSettingsModal = ({
 		setDraggedIndex(null);
 	};
 
-	return (
-		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+	const handleDragEnd = () => {
+		setDraggedIndex(null);
+	};
+
+	const modal = (
+		<div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[120] p-4">
 			<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-lg w-full max-h-[85vh] flex flex-col">
 				{/* Header */}
 				<div className="px-6 py-4 border-b border-secondary-200 dark:border-secondary-600 flex-shrink-0">
@@ -2990,6 +3089,7 @@ const ColumnSettingsModal = ({
 								onDragStart={(e) => handleDragStart(e, index)}
 								onDragOver={handleDragOver}
 								onDrop={(e) => handleDrop(e, index)}
+								onDragEnd={handleDragEnd}
 								onKeyDown={(e) => {
 									if (e.key === "Enter" || e.key === " ") {
 										e.preventDefault();
@@ -3050,6 +3150,8 @@ const ColumnSettingsModal = ({
 			</div>
 		</div>
 	);
+
+	return <ModalPortal>{modal}</ModalPortal>;
 };
 
 export default Hosts;

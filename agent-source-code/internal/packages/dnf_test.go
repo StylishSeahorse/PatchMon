@@ -70,13 +70,17 @@ func TestDNFManager_parseUpgradablePackages(t *testing.T) {
 			input: `kernel.x86_64                     5.14.0-284.30.1.el9_2           baseos
 systemd.x86_64                    252-14.el9_2.2                  baseos`,
 			pkgMgr: "dnf",
+			// Arch-stripped keys, matching what parseInstalledPackages
+			// actually emits. The previous fixture used "kernel.x86_64",
+			// a shape that parser can never produce, which masked the
+			// name mismatch between the two parsers.
 			installedPackages: map[string]models.Package{
-				"kernel.x86_64": {
-					Name:           "kernel.x86_64",
+				"kernel": {
+					Name:           "kernel",
 					CurrentVersion: "5.14.0-284.30.1.el9_1",
 				},
-				"systemd.x86_64": {
-					Name:           "systemd.x86_64",
+				"systemd": {
+					Name:           "systemd",
 					CurrentVersion: "252-14.el9_2.1",
 				},
 			},
@@ -141,6 +145,56 @@ func TestDNFManager_extractBasePackageName(t *testing.T) {
 		{
 			name:     "simple package name",
 			input:    "kernel",
+			expected: "kernel",
+		},
+		{
+			name:     "digit after dash in name",
+			input:    "java-17-openjdk-headless-1:17.0.9.0.9-1.el9.x86_64",
+			expected: "java-17-openjdk-headless",
+		},
+		{
+			name:     "different java major does not collide",
+			input:    "java-21-openjdk-21.0.5.0.11-1.el9.aarch64",
+			expected: "java-21-openjdk",
+		},
+		{
+			name:     "dotted python name",
+			input:    "python3.11-libs-3.11.9-7.el9.x86_64",
+			expected: "python3.11-libs",
+		},
+		{
+			name:     "digit suffix in name",
+			input:    "compat-openssl11-1:1.1.1k-5.el9.x86_64",
+			expected: "compat-openssl11",
+		},
+		{
+			name:     "plus signs in name",
+			input:    "libstdc++-11.4.1-3.el9.x86_64",
+			expected: "libstdc++",
+		},
+		{
+			name:     "bare name with digit segments is unchanged",
+			input:    "java-17-openjdk-headless",
+			expected: "java-17-openjdk-headless",
+		},
+		{
+			name:     "bare name with arch and digit segments",
+			input:    "java-17-openjdk-headless.x86_64",
+			expected: "java-17-openjdk-headless",
+		},
+		{
+			name:     "dnf5 epoch form",
+			input:    "tar-2:1.35-9.fc44.aarch64",
+			expected: "tar",
+		},
+		{
+			name:     "x86_64_v2 arch",
+			input:    "java-17-openjdk-17.0.1-1.el10.x86_64_v2",
+			expected: "java-17-openjdk",
+		},
+		{
+			name:     "amazon linux kernel",
+			input:    "kernel-5.10.29-27.128.amzn2.aarch64",
 			expected: "kernel",
 		},
 	}

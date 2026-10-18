@@ -2,9 +2,24 @@
 WITH host_counts AS (
     SELECT
         COUNT(*)::int AS total_hosts,
-        COUNT(*) FILTER (WHERE status = 'active' AND last_update < $1)::int AS errored_hosts,
+        -- Must match the effective_status = 'inactive' predicate the
+        -- filter=inactive host list uses, otherwise the count and the list it
+        -- links to disagree.
+        COUNT(*) FILTER (WHERE (status = 'active' AND last_update < $1) OR status = 'inactive')::int AS errored_hosts,
         COUNT(*) FILTER (WHERE status = 'active' AND last_update < $2)::int AS offline_hosts,
-        COUNT(*) FILTER (WHERE needs_reboot = true)::int AS hosts_needing_reboot
+        COUNT(*) FILTER (WHERE needs_reboot = true)::int AS hosts_needing_reboot,
+        -- Hosts we have actually received packages from. "Up to date" is
+        -- derived from this, not from total_hosts, so a host we know nothing
+        -- about is never reported as healthy.
+        --
+        -- An EXISTS semi-join, not COUNT(DISTINCT host_id) over host_packages:
+        -- the latter reads every row in the table (1.25M at 1k hosts, 55 ms)
+        -- to rediscover something 1000 index probes answer in 2 ms, and it
+        -- scales with package rows rather than host count. It also rides the
+        -- scan of hosts this CTE is already doing.
+        COUNT(*) FILTER (WHERE EXISTS (
+            SELECT 1 FROM host_packages hp WHERE hp.host_id = hosts.id
+        ))::int AS hosts_with_package_data
     FROM hosts
 ),
 hp_package_counts AS (
@@ -47,7 +62,8 @@ SELECT
     hc.hosts_needing_reboot,
     (SELECT COUNT(*)::int FROM host_groups),
     (SELECT COUNT(*)::int FROM users),
-    (SELECT COUNT(*)::int FROM repositories)
+    (SELECT COUNT(*)::int FROM repositories),
+    hc.hosts_with_package_data
 FROM host_counts hc
 CROSS JOIN hp_package_counts hpc;
 
@@ -73,6 +89,7 @@ WITH base_hosts AS (
         h.status, h.agent_version, h.auto_update, h.notes, h.api_id,
         h.needs_reboot, h.reboot_reason, h.system_uptime, h.boot_time, h.docker_enabled, h.compliance_enabled, h.compliance_on_demand_only,
         h.last_update,
+        h.config_version, h.reported_host_id, (h.reported_host_id IS NOT NULL AND h.reported_host_id <> h.id)::boolean AS host_id_mismatch, h.identity_conflict_at,
         h.compliance_scanner_status->'scanner_info'->>'ssg_version' as ssg_version,
         COALESCE((
             SELECT MIN(hg.name)
@@ -136,7 +153,10 @@ filtered_hosts AS (
         sqlc.narg('filter')::text IS NULL
         OR (sqlc.narg('filter') = 'needsUpdates' AND updates_count > 0)
         OR (sqlc.narg('filter') = 'inactive' AND effective_status = 'inactive')
-        OR (sqlc.narg('filter') = 'upToDate' AND is_stale = false AND updates_count = 0)
+        -- "Up to date" requires package data. A host we have never received
+        -- packages from is not healthy, it is unknown: see filter 'awaitingData'.
+        OR (sqlc.narg('filter') = 'upToDate' AND is_stale = false AND total_packages_count > 0 AND updates_count = 0)
+        OR (sqlc.narg('filter') = 'awaitingData' AND total_packages_count = 0)
         OR (sqlc.narg('filter') = 'stale' AND is_stale = true)
         OR (sqlc.narg('filter') = 'selected')
     )
@@ -147,7 +167,8 @@ SELECT id, machine_id, friendly_name, hostname, ip, os_type, os_version,
     status, agent_version, auto_update, notes, api_id,
     needs_reboot, reboot_reason, system_uptime, boot_time, docker_enabled, compliance_enabled, compliance_on_demand_only,
     last_update, ssg_version, updates_count, security_updates_count, total_packages_count,
-    reporting_state, update_state
+    reporting_state, update_state,
+    config_version, reported_host_id, host_id_mismatch, identity_conflict_at
 FROM filtered_hosts
 ORDER BY
     CASE WHEN sqlc.arg('sort_key')::text = 'friendly_name'      AND sqlc.arg('sort_dir')::text = 'asc'  THEN friendly_name END ASC,
@@ -164,6 +185,8 @@ ORDER BY
     CASE WHEN sqlc.arg('sort_key')::text = 'os_version'         AND sqlc.arg('sort_dir')::text = 'desc' THEN os_version END DESC,
     CASE WHEN sqlc.arg('sort_key')::text = 'agent_version'      AND sqlc.arg('sort_dir')::text = 'asc'  THEN agent_version END ASC NULLS LAST,
     CASE WHEN sqlc.arg('sort_key')::text = 'agent_version'      AND sqlc.arg('sort_dir')::text = 'desc' THEN agent_version END DESC NULLS LAST,
+    CASE WHEN sqlc.arg('sort_key')::text = 'config_version'     AND sqlc.arg('sort_dir')::text = 'asc'  THEN config_version END ASC NULLS LAST,
+    CASE WHEN sqlc.arg('sort_key')::text = 'config_version'     AND sqlc.arg('sort_dir')::text = 'desc' THEN config_version END DESC NULLS LAST,
     CASE WHEN sqlc.arg('sort_key')::text = 'status'             AND sqlc.arg('sort_dir')::text = 'asc'  THEN effective_status END ASC,
     CASE WHEN sqlc.arg('sort_key')::text = 'status'             AND sqlc.arg('sort_dir')::text = 'desc' THEN effective_status END DESC,
     CASE WHEN sqlc.arg('sort_key')::text = 'updates'            AND sqlc.arg('sort_dir')::text = 'asc'  THEN updates_count END ASC,
@@ -201,6 +224,7 @@ WITH base_hosts AS (
         h.status, h.agent_version, h.auto_update, h.notes, h.api_id,
         h.needs_reboot, h.reboot_reason, h.system_uptime, h.boot_time, h.docker_enabled, h.compliance_enabled, h.compliance_on_demand_only,
         h.last_update,
+        h.config_version, h.reported_host_id, (h.reported_host_id IS NOT NULL AND h.reported_host_id <> h.id)::boolean AS host_id_mismatch, h.identity_conflict_at,
         h.compliance_scanner_status->'scanner_info'->>'ssg_version' as ssg_version,
         COALESCE((
             SELECT MIN(hg.name)
@@ -244,8 +268,13 @@ filtered_hosts AS (
             SELECT 1 FROM host_packages hp WHERE hp.host_id = bh.id AND hp.needs_update
         ))
         OR (sqlc.narg('filter') = 'inactive' AND bh.effective_status = 'inactive')
-        OR (sqlc.narg('filter') = 'upToDate' AND bh.is_stale = false AND NOT EXISTS (
+        OR (sqlc.narg('filter') = 'upToDate' AND bh.is_stale = false AND EXISTS (
+            SELECT 1 FROM host_packages hp WHERE hp.host_id = bh.id
+        ) AND NOT EXISTS (
             SELECT 1 FROM host_packages hp WHERE hp.host_id = bh.id AND hp.needs_update
+        ))
+        OR (sqlc.narg('filter') = 'awaitingData' AND NOT EXISTS (
+            SELECT 1 FROM host_packages hp WHERE hp.host_id = bh.id
         ))
         OR (sqlc.narg('filter') = 'stale' AND bh.is_stale = true)
         OR (sqlc.narg('filter') = 'selected')
@@ -271,6 +300,8 @@ ordered_page AS (
         CASE WHEN sqlc.arg('sort_key')::text = 'os_version'       AND sqlc.arg('sort_dir')::text = 'desc' THEN os_version END DESC,
         CASE WHEN sqlc.arg('sort_key')::text = 'agent_version'    AND sqlc.arg('sort_dir')::text = 'asc'  THEN agent_version END ASC NULLS LAST,
         CASE WHEN sqlc.arg('sort_key')::text = 'agent_version'    AND sqlc.arg('sort_dir')::text = 'desc' THEN agent_version END DESC NULLS LAST,
+        CASE WHEN sqlc.arg('sort_key')::text = 'config_version'   AND sqlc.arg('sort_dir')::text = 'asc'  THEN config_version END ASC NULLS LAST,
+        CASE WHEN sqlc.arg('sort_key')::text = 'config_version'   AND sqlc.arg('sort_dir')::text = 'desc' THEN config_version END DESC NULLS LAST,
         CASE WHEN sqlc.arg('sort_key')::text = 'status'           AND sqlc.arg('sort_dir')::text = 'asc'  THEN effective_status END ASC,
         CASE WHEN sqlc.arg('sort_key')::text = 'status'           AND sqlc.arg('sort_dir')::text = 'desc' THEN effective_status END DESC,
         CASE WHEN sqlc.arg('sort_key')::text = 'needs_reboot'     AND sqlc.arg('sort_dir')::text = 'asc'  THEN needs_reboot END ASC,
@@ -305,6 +336,7 @@ SELECT op.id, op.machine_id, op.friendly_name, op.hostname, op.ip, op.os_type, o
     op.status, op.agent_version, op.auto_update, op.notes, op.api_id,
     op.needs_reboot, op.reboot_reason, op.system_uptime, op.boot_time, op.docker_enabled, op.compliance_enabled, op.compliance_on_demand_only,
     op.last_update, op.ssg_version,
+    op.config_version, op.reported_host_id, op.host_id_mismatch, op.identity_conflict_at,
     COALESCE(pc.updates_count, 0)::int AS updates_count,
     COALESCE(pc.security_count, 0)::int AS security_updates_count,
     COALESCE(pc.total_count, 0)::int AS total_packages_count,
@@ -331,6 +363,8 @@ ORDER BY
     CASE WHEN sqlc.arg('sort_key')::text = 'os_version'       AND sqlc.arg('sort_dir')::text = 'desc' THEN op.os_version END DESC,
     CASE WHEN sqlc.arg('sort_key')::text = 'agent_version'    AND sqlc.arg('sort_dir')::text = 'asc'  THEN op.agent_version END ASC NULLS LAST,
     CASE WHEN sqlc.arg('sort_key')::text = 'agent_version'    AND sqlc.arg('sort_dir')::text = 'desc' THEN op.agent_version END DESC NULLS LAST,
+    CASE WHEN sqlc.arg('sort_key')::text = 'config_version'   AND sqlc.arg('sort_dir')::text = 'asc'  THEN op.config_version END ASC NULLS LAST,
+    CASE WHEN sqlc.arg('sort_key')::text = 'config_version'   AND sqlc.arg('sort_dir')::text = 'desc' THEN op.config_version END DESC NULLS LAST,
     CASE WHEN sqlc.arg('sort_key')::text = 'status'           AND sqlc.arg('sort_dir')::text = 'asc'  THEN op.effective_status END ASC,
     CASE WHEN sqlc.arg('sort_key')::text = 'status'           AND sqlc.arg('sort_dir')::text = 'desc' THEN op.effective_status END DESC,
     CASE WHEN sqlc.arg('sort_key')::text = 'needs_reboot'     AND sqlc.arg('sort_dir')::text = 'asc'  THEN op.needs_reboot END ASC,
@@ -388,8 +422,13 @@ WHERE (
         SELECT 1 FROM host_packages hp WHERE hp.host_id = filtered_hosts.id AND hp.needs_update
     ))
     OR (sqlc.narg('filter') = 'inactive' AND effective_status = 'inactive')
-    OR (sqlc.narg('filter') = 'upToDate' AND is_stale = false AND NOT EXISTS (
+    OR (sqlc.narg('filter') = 'upToDate' AND is_stale = false AND EXISTS (
+        SELECT 1 FROM host_packages hp WHERE hp.host_id = filtered_hosts.id
+    ) AND NOT EXISTS (
         SELECT 1 FROM host_packages hp WHERE hp.host_id = filtered_hosts.id AND hp.needs_update
+    ))
+    OR (sqlc.narg('filter') = 'awaitingData' AND NOT EXISTS (
+        SELECT 1 FROM host_packages hp WHERE hp.host_id = filtered_hosts.id
     ))
     OR (sqlc.narg('filter') = 'stale' AND is_stale = true)
     OR (sqlc.narg('filter') = 'selected')
@@ -509,30 +548,67 @@ FROM hosts
 ORDER BY friendly_name ASC;
 
 -- name: GetHomepageStats :one
-WITH active_hosts AS (
-    SELECT id FROM hosts WHERE status = 'active'
+-- The host counters here must match GetDashboardStats, otherwise a widget and
+-- the dashboard card it mirrors report different numbers for the same fleet.
+-- They previously filtered on status = 'active', which silently dropped hosts
+-- that had been created but not yet enrolled. That filter also did not mean
+-- what it appeared to: hosts.status is an enrolment lifecycle column and never
+-- becomes 'inactive', so a host that stopped reporting was counted regardless.
+WITH host_counts AS (
+    SELECT COUNT(*)::int AS total_hosts,
+           -- See GetDashboardStats: semi-join, not COUNT(DISTINCT), and it
+           -- rides the scan of `hosts` already happening here.
+           COUNT(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM host_packages hp WHERE hp.host_id = hosts.id
+           ))::int AS hosts_with_package_data
+    FROM hosts
 ),
-host_counts AS (
-    SELECT COUNT(*)::int AS total_hosts FROM active_hosts
-),
+-- Distinct counts are expressed as GROUP BY subqueries, not COUNT(DISTINCT),
+-- and must stay that way. COUNT(DISTINCT) cannot stream: it sorts the whole
+-- matching set, which at 3.7M host_packages rows spills multiple megabytes to
+-- disk and costs ~3x what the identical aggregates cost in GetDashboardStats,
+-- which already uses this shape. GROUP BY reads straight off the partial
+-- covering indexes (idx_host_packages_needs_update_host_cover and the
+-- _package / _security_package pair) and sorts nothing worth spilling.
+--
+-- Exact, not approximate: the two forms differ only on NULL handling, and
+-- host_id and package_id are both NOT NULL.
 hosts_needing_updates AS (
-    SELECT COUNT(DISTINCT hp.host_id)::int AS cnt
-    FROM host_packages hp
-    JOIN active_hosts ah ON ah.id = hp.host_id
-    WHERE hp.needs_update = true
+    SELECT COUNT(*)::int AS cnt FROM (
+        SELECT hp.host_id
+        FROM host_packages hp
+        WHERE hp.needs_update = true
+        GROUP BY hp.host_id
+    ) t
 ),
 hosts_with_security AS (
-    SELECT COUNT(DISTINCT hp.host_id)::int AS cnt
-    FROM host_packages hp
-    JOIN active_hosts ah ON ah.id = hp.host_id
-    WHERE hp.needs_update = true AND hp.is_security_update = true
+    SELECT COUNT(*)::int AS cnt FROM (
+        SELECT hp.host_id
+        FROM host_packages hp
+        WHERE hp.needs_update = true AND hp.is_security_update = true
+        GROUP BY hp.host_id
+    ) t
 ),
 package_counts AS (
+    -- Split rather than one pass with FILTER: two passes each driven by their
+    -- own covering index beat one pass that can only use the wider of them.
     SELECT
-        COUNT(DISTINCT package_id)::int AS total_outdated,
-        COUNT(DISTINCT package_id) FILTER (WHERE is_security_update)::int AS security_updates
-    FROM host_packages
-    WHERE needs_update = true
+        COALESCE((
+            SELECT COUNT(*)::int FROM (
+                SELECT hp.package_id
+                FROM host_packages hp
+                WHERE hp.needs_update = true
+                GROUP BY hp.package_id
+            ) t
+        ), 0)::int AS total_outdated,
+        COALESCE((
+            SELECT COUNT(*)::int FROM (
+                SELECT hp.package_id
+                FROM host_packages hp
+                WHERE hp.needs_update = true AND hp.is_security_update = true
+                GROUP BY hp.package_id
+            ) t
+        ), 0)::int AS security_updates
 )
 SELECT
     hc.total_hosts,
@@ -541,7 +617,8 @@ SELECT
     pc.security_updates AS security_updates,
     hws.cnt AS hosts_with_security_updates,
     (SELECT COUNT(*)::int FROM repositories WHERE is_active = true) AS total_repos,
-    (SELECT COUNT(*)::int FROM update_history WHERE timestamp >= sqlc.arg('since') AND status = 'success' AND report_type IN ('full', 'partial')) AS recent_updates_24h
+    (SELECT COUNT(*)::int FROM update_history WHERE timestamp >= sqlc.arg('since') AND status = 'success' AND report_type IN ('full', 'partial')) AS recent_updates_24h,
+    hc.hosts_with_package_data
 FROM host_counts hc
 CROSS JOIN hosts_needing_updates hnu
 CROSS JOIN hosts_with_security hws

@@ -17,6 +17,7 @@ import (
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/auth/oidc"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/config"
+	hostctx "github.com/PatchMon/PatchMon/server-source-code/internal/context"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/middleware"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/models"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
@@ -35,48 +36,309 @@ type OidcHandler struct {
 	settings    *store.SettingsStore
 	enc         *util.Encryption
 	log         *slog.Logger
+	permissions *store.PermissionsStore
 
-	// clientMu protects client and resolved; allows re-init on settings update
-	clientMu        sync.RWMutex
-	client          *oidc.Client
-	resolved        *config.ResolvedOidcConfig
-	configuredValid bool // true when all required fields are present and enabled, even if provider connection failed
+	// clientMu protects entries, keyed by context.
+	clientMu sync.RWMutex
+	entries  map[string]*oidcContextEntry
+	// entryMu holds a per-context mutex, so a slow provider discovery in one
+	// context does not block another. Mirrors PoolCache.hostLock.
+	entryMu sync.Map
+
+	probeMu    sync.Mutex
+	probes     map[string]*providerProbe
+	probeLocks sync.Map
+	probeHTTP  *http.Client
+}
+
+// The TTLs also cap how often unauthenticated callers can make us probe the
+// provider. One failed probe is not an outage: it takes providerFailuresNeeded
+// in a row, re-checked after providerRecheckTTL.
+const (
+	providerProbeTimeout   = 3 * time.Second
+	providerProbeTTL       = 30 * time.Second
+	providerRecheckTTL     = 5 * time.Second
+	providerDownTTL        = 10 * time.Second
+	providerFailuresNeeded = 2
+	providerFailureWindow  = time.Minute
+)
+
+type providerProbe struct {
+	issuer      string
+	unreachable bool
+	reason      string
+	failures    int
+	probedAt    time.Time
+	expiresAt   time.Time
+}
+
+// Eviction on settings save is the primary invalidation; the TTL is a backstop.
+const oidcClientTTL = 10 * time.Minute
+
+const oidcBuildTimeout = 10 * time.Second
+
+type oidcContextEntry struct {
+	client   *oidc.Client
+	resolved *config.ResolvedOidcConfig
+	// True when all required fields are present, even if the provider is down.
+	configuredValid bool
+	expiresAt       time.Time
 }
 
 // NewOidcHandler creates a new OIDC handler.
 func NewOidcHandler(cfg *config.Config, resolved *config.ResolvedOidcConfig, resolvedCfg *config.ResolvedConfig, client *oidc.Client, configuredValid bool, oidcStore *store.OidcSessionStore, users *store.UsersStore, auth *AuthHandler, settings *store.SettingsStore, enc *util.Encryption, log *slog.Logger) *OidcHandler {
-	return &OidcHandler{
-		cfg:             cfg,
-		resolvedCfg:     resolvedCfg,
-		oidcStore:       oidcStore,
-		users:           users,
-		auth:            auth,
-		settings:        settings,
-		enc:             enc,
-		log:             log,
+	h := &OidcHandler{
+		cfg:         cfg,
+		resolvedCfg: resolvedCfg,
+		oidcStore:   oidcStore,
+		users:       users,
+		auth:        auth,
+		settings:    settings,
+		enc:         enc,
+		log:         log,
+		entries:     map[string]*oidcContextEntry{},
+	}
+	// Seed the default context ("" key) from the startup resolve.
+	h.entries[""] = &oidcContextEntry{
 		client:          client,
 		resolved:        resolved,
 		configuredValid: configuredValid,
+		expiresAt:       time.Now().Add(oidcClientTTL),
 	}
+	return h
+}
+
+// entryLock returns the per-context mutex.
+func (h *OidcHandler) entryLock(key string) *sync.Mutex {
+	v, _ := h.entryMu.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// entryFor returns the OIDC entry for ctx's context, building it on first use.
+// Never nil; an unconfigured context yields a zero entry.
+func (h *OidcHandler) entryFor(ctx context.Context) *oidcContextEntry {
+	key := hostctx.TenantHostKey(ctx)
+
+	h.clientMu.RLock()
+	e, ok := h.entries[key]
+	h.clientMu.RUnlock()
+	if ok && e != nil && time.Now().Before(e.expiresAt) {
+		return e
+	}
+
+	lock := h.entryLock(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Re-check: another request may have built it while we waited.
+	h.clientMu.RLock()
+	e, ok = h.entries[key]
+	h.clientMu.RUnlock()
+	if ok && e != nil && time.Now().Before(e.expiresAt) {
+		return e
+	}
+
+	// Build off a context that survives client disconnect, so an abandoned
+	// request cannot cache a negative result. WithoutCancel keeps ctx values.
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), oidcBuildTimeout)
+	defer cancel()
+
+	built, err := h.buildEntry(buildCtx)
+	if err != nil {
+		// Keep the previous entry rather than caching a negative result.
+		if h.log != nil {
+			h.log.Warn("OIDC settings read failed, keeping previous configuration", "error", err)
+		}
+		h.clientMu.RLock()
+		prev := h.entries[key]
+		h.clientMu.RUnlock()
+		if prev != nil {
+			return prev
+		}
+		return &oidcContextEntry{expiresAt: time.Now()}
+	}
+
+	h.clientMu.Lock()
+	h.entries[key] = built
+	h.clientMu.Unlock()
+	return built
+}
+
+// buildEntry resolves this context's OIDC settings and constructs its client.
+// oidc.NewClient performs no I/O; discovery is deferred to first use.
+func (h *OidcHandler) buildEntry(ctx context.Context) (*oidcContextEntry, error) {
+	empty := &oidcContextEntry{expiresAt: time.Now().Add(oidcClientTTL)}
+	if h.settings == nil {
+		return empty, nil
+	}
+	// Read the row here: ResolveOidcConfig treats a read failure as "no DB
+	// settings" and falls back to env, which hides the difference.
+	s, err := h.settings.GetFirst(ctx)
+	if err != nil {
+		return nil, err
+	}
+	oidcResolved, _ := config.ResolveOidcConfig(ctx, h.cfg, func(context.Context) (*models.Settings, error) {
+		return s, nil
+	})
+	clientSecret := oidcResolved.ClientSecret
+	if !oidcResolved.ConfiguredViaEnv && clientSecret != "" && h.enc != nil {
+		dec, decErr := h.enc.Decrypt(clientSecret)
+		if decErr != nil {
+			// Fail closed: a non-empty ciphertext would read as configured.
+			if h.log != nil {
+				h.log.Warn("OIDC client secret could not be decrypted; treating OIDC as unconfigured")
+			}
+			return empty, nil
+		}
+		clientSecret = dec
+	}
+	valid := oidcResolved.Enabled && oidcResolved.IssuerURL != "" && oidcResolved.ClientID != "" && clientSecret != "" && oidcResolved.RedirectURI != ""
+	if !valid {
+		return empty, nil
+	}
+	resolvedPtr := &oidcResolved
+	c, _ := oidc.NewClient(ctx, oidc.Config{
+		IssuerURL:    oidcResolved.IssuerURL,
+		ClientID:     oidcResolved.ClientID,
+		ClientSecret: clientSecret,
+		RedirectURI:  oidcResolved.RedirectURI,
+		Scopes:       oidcResolved.Scopes,
+	})
+	return &oidcContextEntry{
+		client:          c,
+		resolved:        resolvedPtr,
+		configuredValid: true,
+		expiresAt:       time.Now().Add(oidcClientTTL),
+	}, nil
+}
+
+// evictOidcClient drops this context's cached entry.
+func (h *OidcHandler) evictOidcClient(ctx context.Context) {
+	h.EvictHost(hostctx.TenantHostKey(ctx))
+}
+
+// EvictHost drops a named context's cached entry. Satisfies hostctx.HostEvictor.
+func (h *OidcHandler) EvictHost(host string) {
+	if h == nil {
+		return
+	}
+	// Per-key lock first, so an in-flight build stores before we delete.
+	lock := h.entryLock(host)
+	lock.Lock()
+	defer lock.Unlock()
+
+	h.clientMu.Lock()
+	delete(h.entries, host)
+	h.clientMu.Unlock()
+
+	h.probeMu.Lock()
+	delete(h.probes, host)
+	h.probeMu.Unlock()
+}
+
+func (h *OidcHandler) cachedProbe(key, issuer string) *providerProbe {
+	h.probeMu.Lock()
+	defer h.probeMu.Unlock()
+	if p := h.probes[key]; p != nil && p.issuer == issuer && time.Now().Before(p.expiresAt) {
+		return p
+	}
+	return nil
+}
+
+// providerUnreachable probes the context's provider at most once per
+// providerProbeTTL, however many sign-in attempts arrive meanwhile.
+func (h *OidcHandler) providerUnreachable(ctx context.Context, e *oidcContextEntry) (bool, string) {
+	key := hostctx.TenantHostKey(ctx)
+	issuer := e.resolved.IssuerURL
+	if p := h.cachedProbe(key, issuer); p != nil {
+		return p.unreachable, p.reason
+	}
+	v, _ := h.probeLocks.LoadOrStore(key, &sync.Mutex{})
+	lock := v.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	if p := h.cachedProbe(key, issuer); p != nil {
+		return p.unreachable, p.reason
+	}
+
+	// Detached from the request, so a caller hanging up cannot record a false outage.
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), providerProbeTimeout)
+	defer cancel()
+	hc := h.probeHTTP
+	if hc == nil {
+		hc = http.DefaultClient
+	}
+	failed, reason := e.client.ProbeDiscovery(probeCtx, hc)
+	now := time.Now()
+
+	h.probeMu.Lock()
+	defer h.probeMu.Unlock()
+	if h.probes == nil {
+		h.probes = map[string]*providerProbe{}
+	}
+	next := &providerProbe{issuer: issuer, probedAt: now, expiresAt: now.Add(providerProbeTTL)}
+	if failed {
+		next.failures = 1
+		if prev := h.probes[key]; prev != nil && prev.issuer == issuer && prev.failures > 0 && now.Sub(prev.probedAt) < providerFailureWindow {
+			next.failures = prev.failures + 1
+		}
+		next.unreachable = next.failures >= providerFailuresNeeded
+		next.expiresAt = now.Add(providerRecheckTTL)
+		if next.unreachable {
+			next.reason = reason
+			next.expiresAt = now.Add(providerDownTTL)
+		}
+	}
+	h.probes[key] = next
+	return next.unreachable, next.reason
+}
+
+// entryDisablesLocalAuth holds only while SSO is fully configured, so a context
+// whose SSO settings are incomplete is never left with no way to sign in.
+func (h *OidcHandler) entryDisablesLocalAuth(e *oidcContextEntry) bool {
+	if !e.configuredValid {
+		return false
+	}
+	if e.resolved != nil {
+		return e.resolved.DisableLocalAuth
+	}
+	return h.cfg.OidcDisableLocalAuth
+}
+
+// LocalAuthDecision reports whether ctx's context refuses password sign-in. A
+// non-empty fallback means it would, but the provider is unreachable and the
+// context allows passwords in that case; it carries the reason.
+func (h *OidcHandler) LocalAuthDecision(ctx context.Context) (disabled bool, fallback string) {
+	if h == nil {
+		return false, ""
+	}
+	e := h.entryFor(ctx)
+	if !h.entryDisablesLocalAuth(e) {
+		return false, ""
+	}
+	if e.client == nil || e.resolved == nil || !e.resolved.LocalAuthFallback {
+		return true, ""
+	}
+	if unreachable, reason := h.providerUnreachable(ctx, e); unreachable {
+		return false, reason
+	}
+	return true, ""
 }
 
 // Config handles GET /api/v1/auth/oidc/config.
 func (h *OidcHandler) Config(w http.ResponseWriter, r *http.Request) {
-	h.clientMu.RLock()
-	resolved := h.resolved
-	configuredValid := h.configuredValid
-	h.clientMu.RUnlock()
+	e := h.entryFor(r.Context())
+	resolved := e.resolved
+	configuredValid := e.configuredValid
 
 	enabled := configuredValid
-	var disableLocalAuth bool
+	disableLocalAuth, fallback := h.LocalAuthDecision(r.Context())
 	var buttonText string
 	var syncRoles bool
 	if resolved != nil {
-		disableLocalAuth = enabled && resolved.DisableLocalAuth
 		buttonText = resolved.ButtonText
 		syncRoles = resolved.SyncRoles
 	} else {
-		disableLocalAuth = enabled && h.cfg.OidcDisableLocalAuth
 		buttonText = h.cfg.OidcButtonText
 		syncRoles = h.cfg.OidcSyncRoles
 	}
@@ -88,14 +350,14 @@ func (h *OidcHandler) Config(w http.ResponseWriter, r *http.Request) {
 		"buttonText":       buttonText,
 		"disableLocalAuth": disableLocalAuth,
 		"syncRoles":        syncRoles,
+		// The login form is back, for superadmins only, because SSO is unreachable.
+		"passwordFallback": fallback != "",
 	})
 }
 
 // Login handles GET /api/v1/auth/oidc/login.
 func (h *OidcHandler) Login(w http.ResponseWriter, r *http.Request) {
-	h.clientMu.RLock()
-	client := h.client
-	h.clientMu.RUnlock()
+	client := h.entryFor(r.Context()).client
 
 	if client == nil {
 		Error(w, http.StatusBadRequest, "OIDC authentication is not configured")
@@ -147,9 +409,7 @@ func (h *OidcHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 // Callback handles GET /api/v1/auth/oidc/callback.
 func (h *OidcHandler) Callback(w http.ResponseWriter, r *http.Request) {
-	h.clientMu.RLock()
-	client := h.client
-	h.clientMu.RUnlock()
+	client := h.entryFor(r.Context()).client
 
 	if client == nil {
 		http.Redirect(w, r, "/login?error=OIDC+not+enabled", http.StatusFound)
@@ -220,55 +480,14 @@ func (h *OidcHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login?error=Authentication+failed", http.StatusFound)
 		return
 	}
-	user, err := h.users.GetByOidcSubOrEmail(r.Context(), userInfo.Sub, userInfo.Email)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		if h.log != nil {
-			h.log.Error("oidc user lookup failed", "error", err)
-		}
-		http.Redirect(w, r, "/login?error=Authentication+failed", http.StatusFound)
-		return
-	}
-	if user == nil && h.oidcAutoCreateUsers() {
-		user = h.createOidcUser(r.Context(), userInfo)
-	}
+	user, failURL := h.resolveOidcUser(r.Context(), userInfo)
 	if user == nil {
-		if h.log != nil {
-			h.log.Error("oidc user not found and auto-create disabled", "email", userInfo.Email)
-		}
-		http.Redirect(w, r, "/login?error=User+not+found", http.StatusFound)
+		http.Redirect(w, r, failURL, http.StatusFound)
 		return
-	}
-	if !user.IsActive {
-		if h.log != nil {
-			h.log.Error("oidc login inactive user", "email", userInfo.Email)
-		}
-		http.Redirect(w, r, "/login?error=Account+disabled", http.StatusFound)
-		return
-	}
-	if user.OidcSub == nil && user.OidcProvider == nil {
-		if !userInfo.EmailVerified {
-			if h.log != nil {
-				h.log.Warn("oidc skip link unverified email", "email", userInfo.Email)
-			}
-		} else {
-			existing, _ := h.users.GetByOidcSub(r.Context(), userInfo.Sub)
-			if existing != nil && existing.ID != user.ID {
-				if h.log != nil {
-					h.log.Error("oidc sub already linked", "email", existing.Email)
-				}
-				http.Redirect(w, r, "/login?error=Account+linking+failed", http.StatusFound)
-				return
-			}
-			issuerHost := extractHost(h.oidcIssuerURL())
-			_ = h.users.UpdateOidcLink(r.Context(), user.ID, userInfo.Sub, issuerHost, strPtr(userInfo.Picture))
-			user.OidcSub = &userInfo.Sub
-			user.OidcProvider = &issuerHost
-			user.AvatarURL = strPtr(userInfo.Picture)
-		}
 	}
 	effectiveRole := user.Role // preserve existing role by default
-	if h.oidcSyncRoles() {
-		mappedRole := h.mapGroupsToRole(userInfo.Groups)
+	if h.oidcSyncRoles(r.Context()) {
+		mappedRole := h.mapGroupsToRole(r.Context(), userInfo.Groups)
 		if h.log != nil && len(userInfo.Groups) == 0 {
 			h.log.Warn("oidc no groups in token", "email", userInfo.Email, "hint", "Create a Scope Mapping in Authentik to add 'groups' claim")
 		}
@@ -277,7 +496,7 @@ func (h *OidcHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		// can grant superadmin. Silently demoting them here would lock the
 		// instance out of superadmin management. Preserve the existing role
 		// and log a warning so operators notice the misconfiguration.
-		if user.Role == "superadmin" && mappedRole != "superadmin" && h.oidcSuperadminGroup() == "" {
+		if user.Role == "superadmin" && mappedRole != "superadmin" && h.oidcSuperadminGroup(r.Context()) == "" {
 			if h.log != nil {
 				h.log.Warn("oidc sync skip demote superadmin",
 					"email", userInfo.Email,
@@ -299,6 +518,100 @@ func (h *OidcHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		_ = h.oidcStore.StoreIDToken(r.Context(), user.ID, userInfo.IDToken)
 	}
 	h.auth.CompleteOidcLogin(w, r, user)
+}
+
+func (h *OidcHandler) resolveOidcUser(ctx context.Context, userInfo *oidc.UserInfo) (*models.User, string) {
+	if userInfo.Issuer == "" {
+		if h.log != nil {
+			h.log.Error("oidc login rejected: no issuer for the subject", "sub", userInfo.Sub)
+		}
+		return nil, "/login?error=Authentication+failed"
+	}
+	user, err := h.users.GetByOidcSubOrEmail(ctx, userInfo.Sub, userInfo.Email)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if h.log != nil {
+			h.log.Error("oidc user lookup failed", "error", err)
+		}
+		return nil, "/login?error=Authentication+failed"
+	}
+	// The lookup matches on oidc_sub OR email; establish which before trusting it.
+	matchedBySub, legacyLink := oidcIdentityMatches(user, userInfo, h.oidcIssuerURL(ctx))
+	if matchedBySub && legacyLink {
+		previous := strVal(user.OidcProvider, "")
+		if err := h.users.UpdateOidcProvider(ctx, user.ID, userInfo.Issuer); err == nil {
+			user.OidcProvider = &userInfo.Issuer
+			if h.log != nil {
+				h.log.Warn("oidc legacy link bound to issuer", "user_id", user.ID, "email", user.Email,
+					"previous_provider", previous, "issuer", userInfo.Issuer)
+			}
+		}
+	}
+
+	// An email match, or auto-create, means the email claim decides who this is,
+	// so it has to be verified.
+	if !matchedBySub && !userInfo.EmailVerified {
+		if h.oidcTrustUnverifiedEmail(ctx) {
+			if h.log != nil {
+				h.log.Warn("oidc accepting unverified email: trust_unverified_email is enabled",
+					"email", userInfo.Email, "sub", userInfo.Sub)
+			}
+		} else {
+			if h.log != nil {
+				h.log.Warn("oidc login rejected: unverified email claim",
+					"email", userInfo.Email, "sub", userInfo.Sub,
+					"reason", userInfo.EmailVerifiedReason,
+					"hint", "see the operator guide, The verified email requirement")
+			}
+			return nil, "/login?error=Unable+to+sign+in+with+this+account"
+		}
+	}
+
+	if user == nil && h.oidcAutoCreateUsers(ctx) {
+		user = h.createOidcUser(ctx, userInfo)
+		matchedBySub = user != nil
+	}
+	if user == nil {
+		if h.log != nil {
+			h.log.Error("oidc user not found and auto-create disabled", "email", userInfo.Email)
+		}
+		return nil, "/login?error=Unable+to+sign+in+with+this+account"
+	}
+	if !user.IsActive {
+		if h.log != nil {
+			h.log.Error("oidc login inactive user", "email", userInfo.Email)
+		}
+		return nil, "/login?error=Account+disabled"
+	}
+	if !matchedBySub {
+		// An email match must not override an established identity binding.
+		if user.OidcSub != nil {
+			if h.log != nil && *user.OidcSub == userInfo.Sub {
+				h.log.Error("oidc login rejected: account is linked to a different issuer",
+					"email", userInfo.Email, "sub", userInfo.Sub, "issuer", userInfo.Issuer,
+					"linked_provider", strVal(user.OidcProvider, ""),
+					"hint", "if you moved to a new IdP, an admin can unlink the SSO identity under Settings > Users; see the operator guide")
+			} else if h.log != nil {
+				h.log.Error("oidc login rejected: account is linked to a different subject",
+					"email", userInfo.Email, "sub", userInfo.Sub,
+					"linked_sub", *user.OidcSub, "linked_provider", strVal(user.OidcProvider, ""),
+					"hint", "if the IdP user was re-created or the IdP changed, an admin can unlink the SSO identity under Settings > Users; see the operator guide")
+			}
+			return nil, "/login?error=Unable+to+sign+in+with+this+account"
+		}
+		existing, _ := h.users.GetByOidcSub(ctx, userInfo.Sub)
+		if existing != nil && existing.ID != user.ID {
+			if h.log != nil {
+				h.log.Error("oidc sub already linked", "email", existing.Email)
+			}
+			return nil, "/login?error=Unable+to+sign+in+with+this+account"
+		}
+		issuer := userInfo.Issuer
+		_ = h.users.UpdateOidcLink(ctx, user.ID, userInfo.Sub, issuer, strPtr(userInfo.Picture))
+		user.OidcSub = &userInfo.Sub
+		user.OidcProvider = &issuer
+		user.AvatarURL = strPtr(userInfo.Picture)
+	}
+	return user, ""
 }
 
 // GetSettings handles GET /api/v1/auth/oidc/settings.
@@ -337,6 +650,7 @@ func (h *OidcHandler) ImportFromEnv(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusInternalServerError, "Failed to load settings")
 		return
 	}
+	before := *s
 	// Copy env values to settings
 	s.OidcEnabled = h.cfg.OidcEnabled
 	s.OidcIssuerURL = strOrNil(strings.TrimSpace(h.cfg.OidcIssuerURL))
@@ -366,17 +680,21 @@ func (h *OidcHandler) ImportFromEnv(w http.ResponseWriter, r *http.Request) {
 	s.OidcReadonlyGroup = strOrNil(strings.TrimSpace(h.cfg.OidcReadonlyGroup))
 	s.OidcUserGroup = strOrNil(strings.TrimSpace(h.cfg.OidcUserGroup))
 	s.OidcEnforceHTTPS = h.cfg.OidcEnforceHTTPS
+	s.OidcTrustUnverifiedEmail = h.cfg.OidcTrustUnverifiedEmail
 	if secret := strings.TrimSpace(h.cfg.OidcClientSecret); secret != "" && h.enc != nil {
 		encrypted, err := h.enc.Encrypt(secret)
 		if err == nil {
 			s.OidcClientSecret = &encrypted
 		}
 	}
+	if h.rejectRestrictedOidcChange(w, r, &before, s) {
+		return
+	}
 	if err := h.settings.Update(r.Context(), s); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to import OIDC settings")
 		return
 	}
-	h.reinitOidcClient(r.Context())
+	h.evictOidcClient(r.Context())
 	secretSet := false
 	if s.OidcClientSecret != nil && *s.OidcClientSecret != "" && h.enc != nil {
 		_, err := h.enc.Decrypt(*s.OidcClientSecret)
@@ -384,6 +702,73 @@ func (h *OidcHandler) ImportFromEnv(w http.ResponseWriter, r *http.Request) {
 	}
 	callbackURL := buildOidcCallbackURL(h.cfg, s)
 	JSON(w, http.StatusOK, oidcSettingsResponse(s, &secretSet, config.ConfiguredViaEnv(h.cfg), config.EnvPreview(h.cfg), callbackURL))
+}
+
+// WithPermissions wires the role store used to stop role mapping changes granting more than the caller holds.
+func (h *OidcHandler) WithPermissions(p *store.PermissionsStore) *OidcHandler {
+	h.permissions = p
+	return h
+}
+
+// oidcTrustChanged reports whether before -> after changes which identity provider PatchMon trusts
+// or how its claims become roles; repointing these lets the editor sign in as any user.
+func oidcTrustChanged(before, after *models.Settings) bool {
+	d := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return *p
+	}
+	return before.OidcEnabled != after.OidcEnabled ||
+		before.OidcDisableLocalAuth != after.OidcDisableLocalAuth ||
+		before.OidcLocalAuthFallback != after.OidcLocalAuthFallback ||
+		before.OidcAutoCreateUsers != after.OidcAutoCreateUsers ||
+		d(before.OidcIssuerURL) != d(after.OidcIssuerURL) ||
+		d(before.OidcClientID) != d(after.OidcClientID) ||
+		d(before.OidcClientSecret) != d(after.OidcClientSecret) ||
+		d(before.OidcRedirectURI) != d(after.OidcRedirectURI) ||
+		before.OidcTrustUnverifiedEmail != after.OidcTrustUnverifiedEmail ||
+		before.OidcSyncRoles != after.OidcSyncRoles ||
+		orUser(d(before.OidcDefaultRole)) != orUser(d(after.OidcDefaultRole)) ||
+		d(before.OidcSuperadminGroup) != d(after.OidcSuperadminGroup) ||
+		d(before.OidcAdminGroup) != d(after.OidcAdminGroup) ||
+		d(before.OidcHostManagerGroup) != d(after.OidcHostManagerGroup) ||
+		d(before.OidcReadonlyGroup) != d(after.OidcReadonlyGroup) ||
+		d(before.OidcUserGroup) != d(after.OidcUserGroup)
+}
+
+func orUser(role string) string {
+	if role == "" {
+		return "user"
+	}
+	return role
+}
+
+func (h *OidcHandler) canManageSuperusers(ctx context.Context, role string) bool {
+	if role == "superadmin" {
+		return true
+	}
+	if h.permissions == nil {
+		return false
+	}
+	p, err := h.permissions.GetByRole(ctx, role)
+	return err == nil && p != nil && p.CanManageSuperusers
+}
+
+// rejectRestrictedOidcChange writes a 403 and returns true when before -> after changes the
+// provider trust settings without can_manage_superusers, or a role mapping the caller may not grant.
+func (h *OidcHandler) rejectRestrictedOidcChange(w http.ResponseWriter, r *http.Request, before, after *models.Settings) bool {
+	callerRole, _ := r.Context().Value(middleware.UserRoleKey).(string)
+	if oidcTrustChanged(before, after) && !h.canManageSuperusers(r.Context(), callerRole) {
+		Error(w, http.StatusForbidden, "Enabling SSO, or changing the SSO provider, client credentials, redirect URI, local login, the password fallback during an SSO outage, user auto-creation, email trust or role mapping, requires the Manage Superusers permission")
+		return true
+	}
+	role := ungrantableRoleChange(r.Context(), h.permissions, callerRole, before, after)
+	if role == "" {
+		return false
+	}
+	Error(w, http.StatusForbidden, "You cannot change the OIDC role mapping for a role you are not allowed to grant: "+role)
+	return true
 }
 
 // UpdateSettings handles PUT /api/v1/auth/oidc/settings.
@@ -402,7 +787,11 @@ func (h *OidcHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Error(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	before := *s
 	applyOidcSettingsUpdate(s, req, h.enc)
+	if h.rejectRestrictedOidcChange(w, r, &before, s) {
+		return
+	}
 	if err := h.settings.Update(r.Context(), s); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to update OIDC settings")
 		return
@@ -412,76 +801,35 @@ func (h *OidcHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
 		_, err := h.enc.Decrypt(*s.OidcClientSecret)
 		secretSet = err == nil
 	}
-	h.reinitOidcClient(r.Context())
+	h.evictOidcClient(r.Context())
 	callbackURL := buildOidcCallbackURL(h.cfg, s)
 	JSON(w, http.StatusOK, oidcSettingsResponse(s, &secretSet, config.ConfiguredViaEnv(h.cfg), config.EnvPreview(h.cfg), callbackURL))
 }
 
-// reinitOidcClient re-resolves OIDC config and creates or clears the client. Call after settings update.
-func (h *OidcHandler) reinitOidcClient(ctx context.Context) {
-	if h.settings == nil {
-		return
-	}
-	oidcResolved, err := config.ResolveOidcConfig(ctx, h.cfg, h.settings.GetFirst)
-	if err != nil {
-		if h.log != nil {
-			h.log.Warn("OIDC reinit resolve failed", "error", err)
-		}
-		h.clientMu.Lock()
-		h.client = nil
-		h.resolved = nil
-		h.clientMu.Unlock()
-		return
-	}
-	clientSecret := oidcResolved.ClientSecret
-	if !oidcResolved.ConfiguredViaEnv && clientSecret != "" && h.enc != nil {
-		if dec, err := h.enc.Decrypt(clientSecret); err == nil {
-			clientSecret = dec
-		}
-	}
-	valid := oidcResolved.Enabled && oidcResolved.IssuerURL != "" && oidcResolved.ClientID != "" && clientSecret != "" && oidcResolved.RedirectURI != ""
-	var newClient *oidc.Client
-	var resolvedPtr *config.ResolvedOidcConfig
-	if valid {
-		resolvedPtr = &oidcResolved
-		c, _ := oidc.NewClient(ctx, oidc.Config{
-			IssuerURL:    oidcResolved.IssuerURL,
-			ClientID:     oidcResolved.ClientID,
-			ClientSecret: clientSecret,
-			RedirectURI:  oidcResolved.RedirectURI,
-			Scopes:       oidcResolved.Scopes,
-		})
-		newClient = c
-	}
-	h.clientMu.Lock()
-	h.client = newClient
-	h.resolved = resolvedPtr
-	h.configuredValid = valid
-	h.clientMu.Unlock()
-}
-
 func oidcSettingsResponse(s *models.Settings, secretSet *bool, configuredViaEnv bool, envPreview map[string]string, callbackURL ...string) map[string]interface{} {
 	res := map[string]interface{}{
-		"configured_via_env":      configuredViaEnv,
-		"env_preview":             envPreview,
-		"oidc_enabled":            false,
-		"oidc_issuer_url":         nil,
-		"oidc_client_id":          nil,
-		"oidc_client_secret_set":  false,
-		"oidc_redirect_uri":       nil,
-		"oidc_scopes":             "openid email profile groups",
-		"oidc_auto_create_users":  false,
-		"oidc_default_role":       "user",
-		"oidc_disable_local_auth": false,
-		"oidc_button_text":        "Login with SSO",
-		"oidc_sync_roles":         false,
-		"oidc_admin_group":        nil,
-		"oidc_superadmin_group":   nil,
-		"oidc_host_manager_group": nil,
-		"oidc_readonly_group":     nil,
-		"oidc_user_group":         nil,
-		"oidc_enforce_https":      true,
-		"callback_url":            "",
+		"configured_via_env":          configuredViaEnv,
+		"env_preview":                 envPreview,
+		"oidc_enabled":                false,
+		"oidc_issuer_url":             nil,
+		"oidc_client_id":              nil,
+		"oidc_client_secret_set":      false,
+		"oidc_redirect_uri":           nil,
+		"oidc_scopes":                 "openid email profile groups",
+		"oidc_auto_create_users":      false,
+		"oidc_default_role":           "user",
+		"oidc_disable_local_auth":     false,
+		"oidc_button_text":            "Login with SSO",
+		"oidc_sync_roles":             false,
+		"oidc_admin_group":            nil,
+		"oidc_superadmin_group":       nil,
+		"oidc_host_manager_group":     nil,
+		"oidc_readonly_group":         nil,
+		"oidc_user_group":             nil,
+		"oidc_enforce_https":          true,
+		"oidc_trust_unverified_email": false,
+		"oidc_local_auth_fallback":    false,
+		"callback_url":                "",
 	}
 	if s != nil {
 		res["oidc_enabled"] = s.OidcEnabled
@@ -500,6 +848,8 @@ func oidcSettingsResponse(s *models.Settings, secretSet *bool, configuredViaEnv 
 		res["oidc_readonly_group"] = s.OidcReadonlyGroup
 		res["oidc_user_group"] = s.OidcUserGroup
 		res["oidc_enforce_https"] = s.OidcEnforceHTTPS
+		res["oidc_trust_unverified_email"] = s.OidcTrustUnverifiedEmail
+		res["oidc_local_auth_fallback"] = s.OidcLocalAuthFallback
 	}
 	if secretSet != nil {
 		res["oidc_client_secret_set"] = *secretSet
@@ -565,7 +915,7 @@ func applyOidcSettingsUpdate(s *models.Settings, req map[string]interface{}, enc
 		s.OidcAutoCreateUsers = v
 	}
 	if v, ok := getReqString(req, "oidc_default_role", "oidcDefaultRole"); ok {
-		t := v
+		t := strings.TrimSpace(v)
 		if t == "" {
 			t = "user"
 		}
@@ -602,6 +952,12 @@ func applyOidcSettingsUpdate(s *models.Settings, req map[string]interface{}, enc
 	if v, ok := getReqBool(req, "oidc_enforce_https", "oidcEnforceHttps"); ok {
 		s.OidcEnforceHTTPS = v
 	}
+	if v, ok := getReqBool(req, "oidc_trust_unverified_email", "oidcTrustUnverifiedEmail"); ok {
+		s.OidcTrustUnverifiedEmail = v
+	}
+	if v, ok := getReqBool(req, "oidc_local_auth_fallback", "oidcLocalAuthFallback"); ok {
+		s.OidcLocalAuthFallback = v
+	}
 }
 
 func strOrNil(s string) *string {
@@ -613,9 +969,7 @@ func strOrNil(s string) *string {
 
 // Logout handles GET /api/v1/auth/oidc/logout.
 func (h *OidcHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	h.clientMu.RLock()
-	client := h.client
-	h.clientMu.RUnlock()
+	client := h.entryFor(r.Context()).client
 
 	if client == nil {
 		http.Redirect(w, r, h.cfg.OidcPostLogoutURI, http.StatusFound)
@@ -628,7 +982,7 @@ func (h *OidcHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	clearAuthCookies(w, r)
 	// Path must match how the cookie was set in Login handler.
 	http.SetCookie(w, &http.Cookie{Name: "oidc_state", Value: "", Path: "/api/v1/auth/oidc", MaxAge: -1, HttpOnly: true, Secure: isSecureRequest(r)})
-	logoutURL := client.LogoutURL(h.cfg.OidcPostLogoutURI, idTokenHint, h.oidcClientID())
+	logoutURL := client.LogoutURL(h.cfg.OidcPostLogoutURI, idTokenHint, h.oidcClientID(r.Context()))
 	if logoutURL != "" {
 		http.Redirect(w, r, logoutURL, http.StatusFound)
 	} else {
@@ -637,9 +991,7 @@ func (h *OidcHandler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OidcHandler) requireHTTPS(w http.ResponseWriter, r *http.Request) bool {
-	h.clientMu.RLock()
-	resolved := h.resolved
-	h.clientMu.RUnlock()
+	resolved := h.entryFor(r.Context()).resolved
 	if resolved != nil && !resolved.EnforceHTTPS {
 		return false
 	}
@@ -675,6 +1027,24 @@ func strPtr(s string) *string {
 	return &s
 }
 
+// oidcIdentityMatches reports whether user is bound to this sub at this issuer.
+// legacy marks a hostname-only or empty binding, which the caller upgrades.
+func oidcIdentityMatches(user *models.User, info *oidc.UserInfo, configuredIssuer string) (matched, legacy bool) {
+	if user == nil || user.OidcSub == nil || *user.OidcSub != info.Sub {
+		return false, false
+	}
+	stored := strings.TrimSpace(strVal(user.OidcProvider, ""))
+	switch {
+	case stored == "":
+		configuredHost := extractHost(strings.TrimSpace(configuredIssuer))
+		return configuredHost != "" && strings.EqualFold(configuredHost, extractHost(info.Issuer)), true
+	case !strings.Contains(stored, "://"):
+		return strings.EqualFold(stored, extractHost(info.Issuer)), true
+	default:
+		return oidc.SameIssuer(stored, info.Issuer), false
+	}
+}
+
 func extractHost(u string) string {
 	parsed, err := url.Parse(u)
 	if err != nil {
@@ -683,46 +1053,59 @@ func extractHost(u string) string {
 	return parsed.Hostname()
 }
 
-func (h *OidcHandler) oidcIssuerURL() string {
-	if h.resolved != nil {
-		return h.resolved.IssuerURL
+// resolvedSnapshot returns this context's resolved OIDC config, or nil.
+// Accessors must go through this rather than touching the cache directly.
+func (h *OidcHandler) resolvedSnapshot(ctx context.Context) *config.ResolvedOidcConfig {
+	return h.entryFor(ctx).resolved
+}
+
+func (h *OidcHandler) oidcIssuerURL(ctx context.Context) string {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return r.IssuerURL
 	}
 	return h.cfg.OidcIssuerURL
 }
 
-func (h *OidcHandler) oidcClientID() string {
-	if h.resolved != nil {
-		return h.resolved.ClientID
+func (h *OidcHandler) oidcClientID(ctx context.Context) string {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return r.ClientID
 	}
 	return h.cfg.OidcClientID
 }
 
-func (h *OidcHandler) oidcAutoCreateUsers() bool {
-	if h.resolved != nil {
-		return h.resolved.AutoCreateUsers
+func (h *OidcHandler) oidcAutoCreateUsers(ctx context.Context) bool {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return r.AutoCreateUsers
 	}
 	return h.cfg.OidcAutoCreateUsers
 }
 
-func (h *OidcHandler) oidcSyncRoles() bool {
-	if h.resolved != nil {
-		return h.resolved.SyncRoles
+func (h *OidcHandler) oidcTrustUnverifiedEmail(ctx context.Context) bool {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return r.TrustUnverifiedEmail
+	}
+	return h.cfg.OidcTrustUnverifiedEmail
+}
+
+func (h *OidcHandler) oidcSyncRoles(ctx context.Context) bool {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return r.SyncRoles
 	}
 	return h.cfg.OidcSyncRoles
 }
 
 // oidcSuperadminGroup returns the effective OIDC superadmin group mapping.
 // Empty string means no group is configured (superadmin cannot be granted via OIDC).
-func (h *OidcHandler) oidcSuperadminGroup() string {
-	if h.resolved != nil {
-		return strings.TrimSpace(h.resolved.SuperadminGroup)
+func (h *OidcHandler) oidcSuperadminGroup(ctx context.Context) string {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return strings.TrimSpace(r.SuperadminGroup)
 	}
 	return strings.TrimSpace(h.cfg.OidcSuperadminGroup)
 }
 
-func (h *OidcHandler) mapGroupsToRole(groups []string) string {
-	if h.resolved != nil {
-		return mapGroupsToRoleFromResolved(groups, h.resolved)
+func (h *OidcHandler) mapGroupsToRole(ctx context.Context, groups []string) string {
+	if r := h.resolvedSnapshot(ctx); r != nil {
+		return mapGroupsToRoleFromResolved(groups, r)
 	}
 	return mapGroupsToRoleFromConfig(groups, h.cfg)
 }
@@ -833,11 +1216,19 @@ func mapGroupsToRoleFromConfig(groups []string, cfg *config.Config) string {
 
 var usernameSanitize = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
-func (h *OidcHandler) createOidcUser(ctx context.Context, info *oidc.UserInfo) *models.User {
-	baseUsername := usernameSanitize.ReplaceAllString(strings.Split(info.Email, "@")[0], "")
-	if len(baseUsername) > 32 {
-		baseUsername = baseUsername[:32]
+func oidcBaseUsername(info *oidc.UserInfo) string {
+	base := usernameSanitize.ReplaceAllString(strings.Split(info.PreferredUsername, "@")[0], "")
+	if len(base) < 3 {
+		base = usernameSanitize.ReplaceAllString(strings.Split(info.Email, "@")[0], "")
 	}
+	if len(base) > 32 {
+		base = base[:32]
+	}
+	return base
+}
+
+func (h *OidcHandler) createOidcUser(ctx context.Context, info *oidc.UserInfo) *models.User {
+	baseUsername := oidcBaseUsername(info)
 	username := baseUsername
 	counter := 1
 	for {
@@ -852,19 +1243,29 @@ func (h *OidcHandler) createOidcUser(ctx context.Context, info *oidc.UserInfo) *
 			break
 		}
 	}
-	role := h.mapGroupsToRole(info.Groups)
-	if h.log != nil && len(info.Groups) == 0 && h.oidcSyncRoles() {
+	role := h.mapGroupsToRole(ctx, info.Groups)
+	if h.log != nil && len(info.Groups) == 0 && h.oidcSyncRoles(ctx) {
 		h.log.Warn("oidc no groups in token for new user", "email", info.Email, "hint", "Create a Scope Mapping in Authentik to add 'groups' claim")
 	}
 	// If no admin/superadmin exists yet, promote the first auto-created user to superadmin.
-	adminCount, _ := h.users.CountAdmins(ctx)
+	//
+	// Must check the error: (0, err) on a transient failure would fail open and
+	// promote an ordinary user to superadmin.
+	adminCount, adminCountErr := h.users.CountAdmins(ctx)
+	if adminCountErr != nil {
+		if h.log != nil {
+			h.log.Error("oidc: cannot determine admin count, refusing to auto-create",
+				"error", adminCountErr, "email", info.Email)
+		}
+		return nil
+	}
 	if adminCount == 0 {
 		role = "superadmin"
 		if h.log != nil {
 			h.log.Info("oidc first user promoted to superadmin", "email", info.Email)
 		}
 	}
-	issuerHost := extractHost(h.oidcIssuerURL())
+	issuer := info.Issuer
 	u := &models.User{
 		ID:           uuid.New().String(),
 		Username:     username,
@@ -874,15 +1275,15 @@ func (h *OidcHandler) createOidcUser(ctx context.Context, info *oidc.UserInfo) *
 		FirstName:    strPtr(info.GivenName),
 		LastName:     strPtr(info.FamilyName),
 		OidcSub:      &info.Sub,
-		OidcProvider: &issuerHost,
+		OidcProvider: &issuer,
 		AvatarURL:    strPtr(info.Picture),
 	}
-	if err := h.users.CreateOidcUser(ctx, u, info.Sub, issuerHost, strPtr(info.Picture)); err != nil {
+	if err := h.users.CreateOidcUser(ctx, u, info.Sub, issuer, strPtr(info.Picture)); err != nil {
 		if h.log != nil {
 			h.log.Error("oidc create user failed", "error", err, "email", info.Email)
 		}
 		return nil
 	}
-	AutoSubscribeIfHosted(h.cfg != nil && h.cfg.AdminMode, h.users, h.log, u)
+	AutoSubscribeIfHosted(ctx, h.cfg != nil && h.cfg.AdminMode, h.users, h.log, u)
 	return u
 }

@@ -20,8 +20,12 @@ ORDER BY CASE WHEN discord_id = $1 THEN 0 ELSE 1 END
 LIMIT 1;
 
 -- name: GetUserByOidcSubOrEmail :one
+-- The "$2 != ''" guard mirrors GetUserByDiscordIDOrEmail. Without it an IdP
+-- asserting an empty email participates in the email branch, which is junk
+-- input rather than a takeover (the oidc_sub cross-check blocks a second such
+-- login) but should not reach account matching at all.
 SELECT * FROM users
-WHERE oidc_sub = $1 OR LOWER(email) = LOWER($2)
+WHERE oidc_sub = $1 OR (LOWER(email) = LOWER($2) AND $2 != '')
 ORDER BY CASE WHEN oidc_sub = $1 THEN 0 ELSE 1 END
 LIMIT 1;
 
@@ -58,7 +62,16 @@ SELECT * FROM users WHERE is_active = true ORDER BY username;
 DELETE FROM users WHERE id = $1;
 
 -- name: UpdatePassword :exec
-UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2;
+UPDATE users SET password_hash = $1, password_change_required = false, previous_password_hash = NULL, updated_at = NOW() WHERE id = $2;
+
+-- name: SetTemporaryPassword :exec
+UPDATE users SET previous_password_hash = password_hash, password_hash = $2, password_change_required = true, updated_at = NOW() WHERE id = $1;
+
+-- name: UpgradePasswordHash :execrows
+UPDATE users SET password_hash = @new_hash, updated_at = NOW() WHERE id = @id AND password_hash = @old_hash;
+
+-- name: UpdateLastLogin :exec
+UPDATE users SET last_login = $1 WHERE id = $2;
 
 -- name: CreateUser :exec
 INSERT INTO users (
@@ -92,6 +105,14 @@ UPDATE users SET
     oidc_sub = $1, oidc_provider = $2, avatar_url = $3, updated_at = NOW()
 WHERE id = $4;
 
+-- name: UpdateUserOidcProvider :exec
+UPDATE users SET oidc_provider = $1, updated_at = NOW()
+WHERE id = $2;
+
+-- name: ClearUserOidcLink :exec
+UPDATE users SET oidc_sub = NULL, oidc_provider = NULL, updated_at = NOW()
+WHERE id = $1;
+
 -- name: UpdateUserOidcProfile :exec
 UPDATE users SET
     last_login = $1, avatar_url = COALESCE($2, avatar_url),
@@ -111,7 +132,7 @@ WHERE id = sqlc.arg('id');
 UPDATE users SET tfa_secret = $1, updated_at = NOW() WHERE id = $2;
 
 -- name: UpdateTfaEnabled :exec
-UPDATE users SET tfa_enabled = $1, tfa_backup_codes = $2, updated_at = NOW() WHERE id = $3;
+UPDATE users SET tfa_enabled = $1, tfa_backup_codes = $2, tfa_enrolment_required = false, updated_at = NOW() WHERE id = $3;
 
 -- name: UpdateTfaBackupCodes :exec
 UPDATE users SET tfa_backup_codes = $1, updated_at = NOW() WHERE id = $2;
@@ -149,3 +170,13 @@ WHERE id = $4;
 
 -- name: SetNewsletterSubscribed :exec
 UPDATE users SET newsletter_subscribed = true, newsletter_subscribed_at = NOW(), updated_at = NOW() WHERE id = $1;
+
+-- name: ResetUserTfa :one
+UPDATE users SET tfa_enabled = false, tfa_secret = NULL, tfa_backup_codes = NULL,
+    tfa_enrolment_required = (password_hash IS NOT NULL AND oidc_sub IS NULL AND oidc_provider IS NULL), updated_at = NOW()
+WHERE id = $1 AND tfa_enabled = true
+RETURNING tfa_enrolment_required;
+
+-- name: ConsumeTfaBackupCode :execrows
+UPDATE users SET tfa_backup_codes = sqlc.arg(new_codes), updated_at = NOW()
+WHERE id = sqlc.arg(id) AND tfa_backup_codes = sqlc.arg(old_codes)::TEXT;

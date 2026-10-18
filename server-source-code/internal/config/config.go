@@ -12,8 +12,18 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// DefaultVersion is the default server version. Bump this when releasing; config_test.go uses it.
-const DefaultVersion = "2.0.3"
+// DefaultVersion is the server version reported by the API and used to look up
+// release notes. It is a var rather than a const so builds can override it at
+// link time:
+//
+//	-ldflags "-X github.com/PatchMon/PatchMon/server-source-code/internal/config.DefaultVersion=2.0.4"
+//
+// The value below is a deliberate non-version. The git tag is the single
+// source of truth for the version, and every supported build path (make,
+// docker/build.sh, CI) derives it from there and injects it. Seeing 0.0.0 in
+// the UI means a build path skipped the injection rather than that the version
+// is merely stale.
+var DefaultVersion = "0.0.0"
 
 // Config holds application configuration loaded from environment.
 // Uses same variable names as PatchMon/server for compatibility.
@@ -55,6 +65,7 @@ type Config struct {
 
 	// Profiling (pprof, memstats)
 	EnablePprof         bool
+	PprofPort           int
 	MemstatsIntervalSec int
 
 	// Patching: minutes a patch run can stay in "running" before the periodic
@@ -109,10 +120,8 @@ type Config struct {
 	// Body limits (bytes)
 	JSONBodyLimitBytes        int64
 	AgentUpdateBodyLimitBytes int64
-	// AgentPingBodyLimitBytes caps /hosts/ping bodies. Worst case is ~3-4 KB
-	// of hashes + metrics; 8 KiB gives headroom without letting an attacker
-	// abuse the cheap ping endpoint as a payload sink.
-	AgentPingBodyLimitBytes int64
+	ComplianceBodyLimitBytes  int64
+	AgentPingBodyLimitBytes   int64
 	// Redis (env only)
 	RedisTLSCA string
 	// Timezone
@@ -151,12 +160,13 @@ type Config struct {
 	OidcPostLogoutURI    string
 	OidcSyncRoles        bool
 	// Group-to-role mapping
-	OidcAdminGroup       string
-	OidcSuperadminGroup  string
-	OidcHostManagerGroup string
-	OidcReadonlyGroup    string
-	OidcUserGroup        string
-	OidcEnforceHTTPS     bool
+	OidcAdminGroup           string
+	OidcSuperadminGroup      string
+	OidcHostManagerGroup     string
+	OidcReadonlyGroup        string
+	OidcUserGroup            string
+	OidcEnforceHTTPS         bool
+	OidcTrustUnverifiedEmail bool
 
 	// SSG (SCAP Security Guide) content directory for compliance scanning
 	SSGContentDir string
@@ -209,7 +219,7 @@ func Load() (*Config, error) {
 
 		Port:    getEnvInt("PORT", 3000),
 		Env:     getEnvEnv(),
-		Version: DefaultVersion,
+		Version: strings.TrimPrefix(DefaultVersion, "v"),
 
 		JWTSecret:                 getEnv("JWT_SECRET", ""),
 		JWTExpiresIn:              getEnv("JWT_EXPIRES_IN", "1h"),
@@ -218,10 +228,11 @@ func Load() (*Config, error) {
 		CORSOrigin: getEnv("CORS_ORIGIN", "http://localhost:3000"),
 		AssetsDir:  getEnv("ASSETS_DIR", ""),
 
-		EnableLogging: getEnv("ENABLE_LOGGING", "") == "true",
+		EnableLogging: getEnv("ENABLE_LOGGING", "true") != "false",
 		LogLevel:      getEnv("LOG_LEVEL", "info"),
 
 		EnablePprof:               getEnv("ENABLE_PPROF", "") == "true",
+		PprofPort:                 getEnvInt("PPROF_PORT", 6060),
 		MemstatsIntervalSec:       getEnvInt("MEMSTATS_INTERVAL_SEC", 60),
 		PatchRunStallTimeoutMin:   getEnvInt("PATCH_RUN_STALL_TIMEOUT_MIN", 30),
 		AgentReportsRetentionDays: getEnvInt("AGENT_REPORTS_RETENTION_DAYS", 30),
@@ -239,25 +250,26 @@ func Load() (*Config, error) {
 		TfaLockoutDurationMin:  getEnvInt("TFA_LOCKOUT_DURATION_MINUTES", 30),
 		TfaRememberMeExpiresIn: getEnv("TFA_REMEMBER_ME_EXPIRES_IN", "30d"),
 
-		OidcEnabled:          getEnv("OIDC_ENABLED", "") == "true",
-		OidcIssuerURL:        getEnv("OIDC_ISSUER_URL", ""),
-		OidcClientID:         getEnv("OIDC_CLIENT_ID", ""),
-		OidcClientSecret:     getEnv("OIDC_CLIENT_SECRET", ""),
-		OidcRedirectURI:      getEnv("OIDC_REDIRECT_URI", ""),
-		OidcScopes:           getEnv("OIDC_SCOPES", "openid email profile groups"),
-		OidcAutoCreateUsers:  getEnv("OIDC_AUTO_CREATE_USERS", "") == "true",
-		OidcDefaultRole:      getEnv("OIDC_DEFAULT_ROLE", "user"),
-		OidcDisableLocalAuth: getEnv("OIDC_DISABLE_LOCAL_AUTH", "") == "true",
-		OidcButtonText:       getEnv("OIDC_BUTTON_TEXT", "Login with SSO"),
-		OidcSessionTTL:       getEnvInt("OIDC_SESSION_TTL", 600),
-		OidcPostLogoutURI:    getEnv("OIDC_POST_LOGOUT_URI", getEnv("FRONTEND_URL", getEnv("CORS_ORIGIN", "http://localhost:3000"))+"/login"),
-		OidcSyncRoles:        getEnv("OIDC_SYNC_ROLES", "") == "true",
-		OidcAdminGroup:       getEnv("OIDC_ADMIN_GROUP", ""),
-		OidcSuperadminGroup:  getEnv("OIDC_SUPERADMIN_GROUP", ""),
-		OidcHostManagerGroup: getEnv("OIDC_HOST_MANAGER_GROUP", ""),
-		OidcReadonlyGroup:    getEnv("OIDC_READONLY_GROUP", ""),
-		OidcUserGroup:        getEnv("OIDC_USER_GROUP", ""),
-		OidcEnforceHTTPS:     getEnv("OIDC_ENFORCE_HTTPS", "true") != "false",
+		OidcEnabled:              getEnv("OIDC_ENABLED", "") == "true",
+		OidcIssuerURL:            getEnv("OIDC_ISSUER_URL", ""),
+		OidcClientID:             getEnv("OIDC_CLIENT_ID", ""),
+		OidcClientSecret:         getEnv("OIDC_CLIENT_SECRET", ""),
+		OidcRedirectURI:          getEnv("OIDC_REDIRECT_URI", ""),
+		OidcScopes:               getEnv("OIDC_SCOPES", "openid email profile groups"),
+		OidcAutoCreateUsers:      getEnv("OIDC_AUTO_CREATE_USERS", "") == "true",
+		OidcDefaultRole:          getEnv("OIDC_DEFAULT_ROLE", "user"),
+		OidcDisableLocalAuth:     getEnv("OIDC_DISABLE_LOCAL_AUTH", "") == "true",
+		OidcButtonText:           getEnv("OIDC_BUTTON_TEXT", "Login with SSO"),
+		OidcSessionTTL:           getEnvInt("OIDC_SESSION_TTL", 600),
+		OidcPostLogoutURI:        getEnv("OIDC_POST_LOGOUT_URI", getEnv("FRONTEND_URL", getEnv("CORS_ORIGIN", "http://localhost:3000"))+"/login"),
+		OidcSyncRoles:            getEnv("OIDC_SYNC_ROLES", "") == "true",
+		OidcAdminGroup:           getEnv("OIDC_ADMIN_GROUP", ""),
+		OidcSuperadminGroup:      getEnv("OIDC_SUPERADMIN_GROUP", ""),
+		OidcHostManagerGroup:     getEnv("OIDC_HOST_MANAGER_GROUP", ""),
+		OidcReadonlyGroup:        getEnv("OIDC_READONLY_GROUP", ""),
+		OidcUserGroup:            getEnv("OIDC_USER_GROUP", ""),
+		OidcEnforceHTTPS:         getEnv("OIDC_ENFORCE_HTTPS", "true") != "false",
+		OidcTrustUnverifiedEmail: getEnv("OIDC_TRUST_UNVERIFIED_EMAIL", "") == "true",
 
 		SSGContentDir:         getEnv("SSG_CONTENT_DIR", "./ssg-content"),
 		AdminMode:             getEnv("ADMIN_MODE", "") == "on",
@@ -297,7 +309,8 @@ func Load() (*Config, error) {
 		PasswordRequireSpecial:      getEnv("PASSWORD_REQUIRE_SPECIAL", "true") != "false",
 		JSONBodyLimitBytes:          getEnvBytes("JSON_BODY_LIMIT", 5),
 		AgentUpdateBodyLimitBytes:   getEnvBytes("AGENT_UPDATE_BODY_LIMIT", 5),
-		AgentPingBodyLimitBytes:     getEnvBytesKBDefault("AGENT_PING_BODY_LIMIT", 8),
+		ComplianceBodyLimitBytes:    getEnvBytes("COMPLIANCE_BODY_LIMIT", 20),
+		AgentPingBodyLimitBytes:     getEnvBytesKBDefault("AGENT_PING_BODY_LIMIT", defaultAgentPingBodyLimitKB),
 		RedisTLSCA:                  getEnv("REDIS_TLS_CA", ""),
 		Timezone:                    getEnv("TZ", getEnv("TIMEZONE", "UTC")),
 		DefaultUserRole:             getEnv("DEFAULT_USER_ROLE", "user"),
@@ -409,32 +422,12 @@ func getEnvInt(key string, defaultVal int) int {
 	return v
 }
 
+const defaultAgentPingBodyLimitKB = 64
+
 // getEnvBytes parses size strings like "5mb", "2mb", "1gb" into bytes.
 // defaultMB is used when env is empty or parse fails.
 func getEnvBytes(key string, defaultMB int) int64 {
-	s := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	if s == "" {
-		return int64(defaultMB) * 1024 * 1024
-	}
-	var mult int64 = 1024 * 1024
-	if strings.HasSuffix(s, "kb") {
-		mult = 1024
-		s = strings.TrimSuffix(s, "kb")
-	} else if strings.HasSuffix(s, "mb") {
-		s = strings.TrimSuffix(s, "mb")
-	} else if strings.HasSuffix(s, "gb") {
-		mult = 1024 * 1024 * 1024
-		s = strings.TrimSuffix(s, "gb")
-	} else if strings.HasSuffix(s, "b") {
-		mult = 1
-		s = strings.TrimSuffix(s, "b")
-	}
-	s = strings.TrimSpace(s)
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || v < 1 {
-		return int64(defaultMB) * 1024 * 1024
-	}
-	return v * mult
+	return parseBodyLimit(os.Getenv(key), int64(defaultMB)*1024*1024)
 }
 
 // getEnvBytesKBDefault parses size strings like getEnvBytes but defaults to
@@ -443,24 +436,5 @@ func getEnvBytes(key string, defaultMB int) int64 {
 // silently shrink to KB if a future caller forgets which helper they're
 // invoking.
 func getEnvBytesKBDefault(key string, defaultKB int) int64 {
-	s := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	if s == "" {
-		return int64(defaultKB) * 1024
-	}
-	var mult int64 = 1024
-	if strings.HasSuffix(s, "kb") {
-		s = strings.TrimSuffix(s, "kb")
-	} else if strings.HasSuffix(s, "mb") {
-		mult = 1024 * 1024
-		s = strings.TrimSuffix(s, "mb")
-	} else if strings.HasSuffix(s, "b") {
-		mult = 1
-		s = strings.TrimSuffix(s, "b")
-	}
-	s = strings.TrimSpace(s)
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || v < 1 {
-		return int64(defaultKB) * 1024
-	}
-	return v * mult
+	return parseBodyLimitKB(os.Getenv(key), int64(defaultKB)*1024)
 }

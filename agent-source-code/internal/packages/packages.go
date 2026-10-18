@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
-	"strings"
 
+	"patchmon-agent/internal/pkgmgr"
+	"patchmon-agent/internal/textsan"
 	"patchmon-agent/pkg/models"
 
 	"github.com/sirupsen/logrus"
@@ -26,7 +26,10 @@ type Manager struct {
 	apkManager     *APKManager
 	pacmanManager  *PacmanManager
 	freebsdManager *FreeBSDManager
+	zypperManager  *ZypperManager
 	winManager     *WindowsManager
+
+	windowsUpdatesOmitted bool
 }
 
 // New creates a new package manager
@@ -45,6 +48,7 @@ func New(logger *logrus.Logger, cacheRefresh CacheRefreshConfig) *Manager {
 		apkManager:     apkManager,
 		pacmanManager:  pacmanManager,
 		freebsdManager: freebsdManager,
+		zypperManager:  NewZypperManager(logger),
 		winManager:     winManager,
 	}
 }
@@ -55,76 +59,47 @@ func (m *Manager) GetPackages() ([]models.Package, error) {
 
 	m.logger.WithField("package_manager", packageManager).Debug("Detected package manager")
 
+	var (
+		pkgs []models.Package
+		err  error
+	)
 	switch packageManager {
 	case "windows":
-		return m.winManager.GetPackages(), nil
+		pkgs, m.windowsUpdatesOmitted = m.winManager.GetPackages()
 	case "apt":
-		return m.aptManager.GetPackages(), nil
+		pkgs, err = m.aptManager.GetPackages()
 	case "dnf", "yum":
-		return m.dnfManager.GetPackages(), nil
+		pkgs, err = m.dnfManager.GetPackages()
 	case "apk":
-		return m.apkManager.GetPackages(), nil
+		pkgs, err = m.apkManager.GetPackages()
 	case "pacman":
-		return m.pacmanManager.GetPackages()
+		pkgs, err = m.pacmanManager.GetPackages()
 	case "pkg":
-		return m.freebsdManager.GetPackages()
+		pkgs, err = m.freebsdManager.GetPackages()
+	case "zypper":
+		pkgs, err = m.zypperManager.GetPackages()
 	default:
 		return nil, fmt.Errorf("unsupported package manager: %s", packageManager)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// Cleaning here, at the single collection choke point, keeps the canonical
+	// hash and the report payload consistent — both are derived downstream.
+	return textsan.CleanPackages(pkgs), nil
 }
 
+// SetAPKSecDBEnabled controls whether Alpine hosts look up security fixes in secdb.
+func (m *Manager) SetAPKSecDBEnabled(enabled bool) { m.apkManager.SetSecDBEnabled(enabled) }
+
+// WindowsUpdatesOmitted reports whether the last GetPackages left out Windows Update rows
+// because a patch run was using Windows Update.
+func (m *Manager) WindowsUpdatesOmitted() bool { return m.windowsUpdatesOmitted }
+
 // DetectPackageManager detects which package manager is available on the system.
-// Returns one of: apt, dnf, yum, apk, pacman, pkg, windows, or unknown.
+// Returns one of: apt, dnf, yum, apk, pacman, zypper, pkg, windows, or unknown.
 func (m *Manager) DetectPackageManager() string {
-	// Check for Windows first (runtime check, no exec)
-	if runtime.GOOS == "windows" {
-		return "windows"
-	}
-	// Check for FreeBSD pkg first (avoid confusion with other 'pkg' tools).
-	// When the agent runs as an rc.d service, PATH may be minimal, so also check
-	// standard FreeBSD paths explicitly so package reports still work on pfSense/FreeBSD.
-	if runtime.GOOS == "freebsd" {
-		for _, pkgPath := range []string{"/usr/sbin/pkg", "/usr/local/sbin/pkg"} {
-			if info, err := os.Stat(pkgPath); err == nil && info.Mode().IsRegular() && (info.Mode()&0111) != 0 {
-				return "pkg"
-			}
-		}
-	}
-	if _, err := exec.LookPath("pkg"); err == nil {
-		if output, err := exec.Command("uname", "-s").Output(); err == nil {
-			if strings.TrimSpace(string(output)) == "FreeBSD" {
-				return "pkg"
-			}
-		}
-	}
-
-	// Check for APK (Alpine Linux)
-	if _, err := exec.LookPath("apk"); err == nil {
-		return "apk"
-	}
-
-	// Check for APT
-	if _, err := exec.LookPath("apt"); err == nil {
-		return "apt"
-	}
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		return "apt"
-	}
-
-	// Check for DNF/YUM
-	if _, err := exec.LookPath("dnf"); err == nil {
-		return "dnf"
-	}
-	if _, err := exec.LookPath("yum"); err == nil {
-		return "yum"
-	}
-
-	// Check for Pacman
-	if _, err := exec.LookPath("pacman"); err == nil {
-		return "pacman"
-	}
-
-	return "unknown"
+	return pkgmgr.Detect()
 }
 
 // GetPkgBinaryPath returns the path to the FreeBSD pkg binary.
@@ -162,7 +137,10 @@ func CombinePackageData(installedPackages map[string]models.Package, upgradableP
 	packages := make([]models.Package, 0)
 	upgradableMap := make(map[string]bool)
 
-	// First, add upgradable packages, merging in description and repo from installed if available
+	// Deduplicated by name: a multilib host lists glibc.i686 and glibc.x86_64
+	// separately and arch-stripping collapses both, which aborts the server's
+	// bulk upsert. A security update outranks a plain one.
+	upgradableIdx := make(map[string]int, len(upgradablePackages))
 	for _, pkg := range upgradablePackages {
 		if installed, ok := installedPackages[pkg.Name]; ok {
 			if installed.Description != "" {
@@ -172,7 +150,14 @@ func CombinePackageData(installedPackages map[string]models.Package, upgradableP
 				pkg.SourceRepository = installed.SourceRepository
 			}
 		}
+		if i, seen := upgradableIdx[pkg.Name]; seen {
+			if pkg.IsSecurityUpdate && !packages[i].IsSecurityUpdate {
+				packages[i] = pkg
+			}
+			continue
+		}
 		packages = append(packages, pkg)
+		upgradableIdx[pkg.Name] = len(packages) - 1
 		upgradableMap[pkg.Name] = true
 	}
 

@@ -3,8 +3,6 @@ package handler
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,16 +29,21 @@ type InstallHandler struct {
 	bootstrap  *store.BootstrapStore
 	reports    *store.ReportStore
 	scriptBase []byte // base script (embedded or from AGENTS_DIR)
+	log        *slog.Logger
 }
 
 // NewInstallHandler creates a new install handler.
-func NewInstallHandler(hosts *store.HostsStore, settings *store.SettingsStore, bootstrap *store.BootstrapStore, reports *store.ReportStore) *InstallHandler {
+func NewInstallHandler(hosts *store.HostsStore, settings *store.SettingsStore, bootstrap *store.BootstrapStore, reports *store.ReportStore, log *slog.Logger) *InstallHandler {
+	if log == nil {
+		log = slog.Default()
+	}
 	return &InstallHandler{
 		hosts:      hosts,
 		settings:   settings,
 		bootstrap:  bootstrap,
 		reports:    reports,
 		scriptBase: loadScript(),
+		log:        log,
 	}
 }
 
@@ -89,6 +92,32 @@ func normalizeLineEndings(b []byte) []byte {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	return []byte(s)
+}
+
+// inferHostOS resolves the OS to serve for a host when the request does not
+// specify one, using what the host has already reported about itself.
+func inferHostOS(expectedPlatform *string, osType string) string {
+	if expectedPlatform != nil {
+		ep := strings.ToLower(*expectedPlatform)
+		if ep == "windows" {
+			return "windows"
+		}
+		if strings.Contains(ep, "freebsd") || strings.Contains(ep, "pfsense") {
+			return "freebsd"
+		}
+		return "linux"
+	}
+	if osType != "" {
+		reported := strings.ToLower(osType)
+		if strings.Contains(reported, "windows") {
+			return "windows"
+		}
+		if strings.Contains(reported, "freebsd") || strings.Contains(reported, "pfsense") {
+			return "freebsd"
+		}
+		return "linux"
+	}
+	return "linux"
 }
 
 // ServeInstall handles GET /api/v1/hosts/install.
@@ -147,7 +176,11 @@ func (h *InstallHandler) ServeInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	osParam := r.URL.Query().Get("os")
 	if osParam != "linux" && osParam != "freebsd" && osParam != "windows" {
-		osParam = "linux"
+		osParam = inferHostOS(host.ExpectedPlatform, host.OSType)
+	}
+	hostIDValue := ""
+	if util.ValidHostID(host.ID) {
+		hostIDValue = host.ID
 	}
 
 	// Windows: serve PowerShell script with env vars
@@ -166,13 +199,13 @@ func (h *InstallHandler) ServeInstall(w http.ResponseWriter, r *http.Request) {
 			JSON(w, http.StatusNotFound, map[string]string{"error": "Windows installation script not found"})
 			return
 		}
-		envBlock := fmt.Sprintf("$env:PATCHMON_SERVER_URL = \"%s\"\n$env:PATCHMON_BOOTSTRAP_TOKEN = \"%s\"\n$env:PATCHMON_IGNORE_SSL = \"%s\"\n\n", serverURL, token, skipSSLVerify)
+		envBlock := fmt.Sprintf("$env:PATCHMON_SERVER_URL = \"%s\"\n$env:PATCHMON_BOOTSTRAP_TOKEN = \"%s\"\n$env:PATCHMON_IGNORE_SSL = \"%s\"\n$env:PATCHMON_HOST_ID = \"%s\"\n\n", serverURL, token, skipSSLVerify, hostIDValue)
 		// Remove shebang if present (PowerShell scripts may have # optional)
 		if bytes.HasPrefix(script, []byte("#!")) {
 			script = append([]byte("#"), script[1:]...)
 		}
 		script = append([]byte(envBlock), script...)
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Disposition", `inline; filename="patchmon_install_windows.ps1"`)
 		_, _ = w.Write(script)
 		return
@@ -204,6 +237,7 @@ export BOOTSTRAP_TOKEN="%s"
 export CURL_FLAGS="%s"
 export SKIP_SSL_VERIFY="%s"
 export FORCE_INSTALL="%s"
+export PATCHMON_HOST_ID="%s"
 %s
 # Fetch actual credentials using bootstrap token (one-time use, expires in 5 minutes)
 fetch_credentials() {
@@ -212,8 +246,15 @@ fetch_credentials() {
         -d "{\"token\": \"${BOOTSTRAP_TOKEN}\"}" 2>/dev/null)
 
     if [ -z "$CREDS" ] || echo "$CREDS" | grep -q '"error"'; then
-        echo "ERROR: Failed to fetch credentials. Bootstrap token may have expired."
-        echo "Please request a new installation script."
+        CORS_CODE=$(echo "$CREDS" | grep -oE '"code":"(cors|host)_mismatch"' | cut -d'"' -f4)
+        if [ -n "$CORS_CODE" ]; then
+            echo "ERROR: The PatchMon server rejected the URL this host used (${CORS_CODE}). The hostname in Settings > Server URL must be listed in CORS_ORIGIN."
+            echo "Server response: $CREDS"
+        else
+            echo "ERROR: Failed to fetch credentials. Bootstrap token may have expired."
+            [ -n "$CREDS" ] && echo "Server response: $CREDS"
+            echo "Please request a new installation script."
+        fi
         exit 1
     fi
 
@@ -226,7 +267,7 @@ fetch_credentials() {
     fi
 }
 fetch_credentials
-`, serverURL, osParam, token, curlFlags, skipSSLVerify, forceStr, archExport)
+`, serverURL, osParam, token, curlFlags, skipSSLVerify, forceStr, hostIDValue, archExport)
 
 	// Remove shebang from original script and prepend env block
 	script := h.scriptBase
@@ -235,7 +276,7 @@ fetch_credentials
 	}
 	script = append([]byte(envBlock), script...)
 
-	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `inline; filename="patchmon_install.sh"`)
 	_, _ = w.Write(script)
 }
@@ -256,7 +297,7 @@ func (h *InstallHandler) ServeRemove(w http.ResponseWriter, r *http.Request) {
 			JSON(w, http.StatusNotFound, map[string]string{"error": "Windows removal script not found"})
 			return
 		}
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Disposition", `inline; filename="patchmon_remove_windows.ps1"`)
 		_, _ = w.Write(script)
 		return
@@ -276,7 +317,7 @@ func (h *InstallHandler) ServeRemove(w http.ResponseWriter, r *http.Request) {
 		script = append([]byte("#"), script[1:]...)
 	}
 	script = append(envPrefix, script...)
-	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `inline; filename="patchmon_remove.sh"`)
 	_, _ = w.Write(script)
 }
@@ -386,6 +427,14 @@ func (h *InstallHandler) ServePing(w http.ResponseWriter, r *http.Request) {
 			// Treat as legacy heartbeat.
 			hasBody = false
 		default:
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				slog.Warn("ping: body exceeded AGENT_PING_BODY_LIMIT", "host_id", checkin.ID, "limit_bytes", tooLarge.Limit)
+				h.rejectUpdate(w, r, checkin.ID, "ping", nil, http.StatusRequestEntityTooLarge,
+					fmt.Sprintf("Check-in exceeds the %s AGENT_PING_BODY_LIMIT. Raise it in Settings then Environment. A host with many mounted volumes can need this.", formatBytesEnv(tooLarge.Limit)),
+					pingStart)
+				return
+			}
 			JSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
 			return
 		}
@@ -413,8 +462,11 @@ func (h *InstallHandler) ServePing(w http.ResponseWriter, r *http.Request) {
 	// Hash compare. If the agent shipped no body (legacy) we skip this and
 	// `requestFull` stays empty — matches previous behaviour exactly.
 	var requestFull []string
+	hostIDMismatch := false
 	if hasBody {
 		requestFull = computeRequestFull(checkin, &req.Hashes)
+		hostIDMismatch = h.observeAgentIdentity(r.Context(), checkin.ID, checkin.ReportedHostID,
+			claimedHostID(req.HostID), checkin.Identity, req.MachineID, req.Hashes.HostnameHash)
 	}
 
 	now := time.Now()
@@ -440,13 +492,19 @@ func (h *InstallHandler) ServePing(w http.ResponseWriter, r *http.Request) {
 		// sending full reports. The key name and value are a fixed contract
 		// with the agent — do not rename or change the shape.
 		"hashGate": true,
+		// The agent hashes and sends a package field only when the server lists it here.
+		"capabilities": agentCapabilities,
 		"integrations": map[string]bool{
 			"docker":     checkin.DockerEnabled,
 			"compliance": checkin.ComplianceEnabled,
 		},
+		"hostId": checkin.ID,
 	}
 	if len(requestFull) > 0 {
 		resp["requestFull"] = requestFull
+	}
+	if hostIDMismatch {
+		resp["hostIdMismatch"] = true
 	}
 
 	// Record one update_history row per ping cycle for the Agent Activity
@@ -559,6 +617,13 @@ func buildMetricsParams(req *models.PingRequest) store.HostMetricsParams {
 		v := req.AgentVersion
 		mp.AgentVersion = &v
 	}
+	if util.ValidConfigVersion(req.ConfigVersion) {
+		v := req.ConfigVersion
+		mp.ConfigVersion = &v
+	}
+	if id := claimedHostID(req.HostID); id != "" {
+		mp.ReportedHostID = &id
+	}
 	return mp
 }
 
@@ -633,7 +698,7 @@ func (h *InstallHandler) ServeUpdateInterval(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// rejectUpdate writes an error response for a rejected /hosts/update AND
+// rejectUpdate writes an error response for a rejected /hosts/update or ping AND
 // records a matching "error" row in the Agent Activity feed.
 //
 // Without the activity row a rejection is completely invisible in the UI: the
@@ -661,7 +726,7 @@ func (h *InstallHandler) rejectUpdate(w http.ResponseWriter, r *http.Request, ho
 			Status:           "error",
 			ErrorMessage:     &msg,
 		}); err != nil {
-			slog.Warn("update: failed to record rejected-report activity row", "host_id", hostID, "error", err)
+			slog.Warn("agent check-in: failed to record rejected-request activity row", "host_id", hostID, "error", err)
 		}
 	}
 	JSON(w, status, map[string]string{"error": reason})
@@ -704,6 +769,14 @@ func (h *InstallHandler) ServeUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var payload store.ReportPayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			slog.Warn("update: body exceeded AGENT_UPDATE_BODY_LIMIT", "host_id", host.ID, "limit_bytes", tooLarge.Limit)
+			h.rejectUpdate(w, r, host.ID, "full", nil, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("Report exceeds the %s AGENT_UPDATE_BODY_LIMIT. Raise it in Settings then Environment, and raise the body size limit on any reverse proxy in front of PatchMon.", formatBytesEnv(tooLarge.Limit)),
+				updateStart)
+			return
+		}
 		h.rejectUpdate(w, r, host.ID, "full", nil, http.StatusBadRequest, "Invalid request body", updateStart)
 		return
 	}
@@ -854,11 +927,24 @@ func (h *InstallHandler) ServeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fullReportHostnameHash := ""
+	if reportType == "full" && payload.Hostname != "" {
+		fullReportHostnameHash = CanonicalHostnameHash(payload.Hostname)
+	}
+	h.observeAgentIdentity(r.Context(), host.ID, host.ReportedHostID, claimedHostID(payload.HostID),
+		store.IdentityFingerprintState{
+			Fingerprint:     host.IdentityFingerprint,
+			PrevFingerprint: host.IdentityPrevFingerprint,
+			ChangedAt:       host.IdentityFingerprintChangedAt,
+			ConflictAt:      host.IdentityConflictAt,
+		}, payload.MachineID, fullReportHostnameHash)
+
 	resp := map[string]interface{}{
 		"message":           "Host updated successfully",
 		"packagesProcessed": result.PackagesProcessed,
 		"updatesAvailable":  result.UpdatesAvailable,
 		"securityUpdates":   result.SecurityUpdates,
+		"hostId":            host.ID,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -897,19 +983,12 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 
 	// Check auto_update settings
 	settings, _ := h.settings.GetFirst(r.Context())
-	serverAutoUpdate := settings != nil && settings.AutoUpdate
-	hostAutoUpdate := host.AutoUpdate
-	autoUpdateDisabled := !serverAutoUpdate || !hostAutoUpdate
-	var autoUpdateDisabledReason string
-	if autoUpdateDisabled {
-		if !serverAutoUpdate && !hostAutoUpdate {
-			autoUpdateDisabledReason = "Auto-update is disabled in server settings and for this host"
-		} else if !serverAutoUpdate {
-			autoUpdateDisabledReason = "Auto-update is disabled in server settings"
-		} else {
-			autoUpdateDisabledReason = "Auto-update is disabled for this host"
-		}
+	patching, err := h.hosts.HasActivePatchRun(r.Context(), host.ID)
+	if err != nil {
+		slog.Warn("agent version: active patch run check failed", "host_id", host.ID, "error", err)
+		patching = true
 	}
+	autoUpdateDisabled, autoUpdateDisabledReason := agentAutoUpdateGate(settings != nil && settings.AutoUpdate, host.AutoUpdate, patching)
 
 	architecture := r.URL.Query().Get("arch")
 	if architecture == "" {
@@ -917,28 +996,8 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 	}
 
 	osParam := r.URL.Query().Get("os")
-	if osParam == "" && host.ExpectedPlatform != nil {
-		ep := strings.ToLower(*host.ExpectedPlatform)
-		if ep == "windows" {
-			osParam = "windows"
-		} else if strings.Contains(ep, "freebsd") || strings.Contains(ep, "pfsense") {
-			osParam = "freebsd"
-		} else {
-			osParam = "linux"
-		}
-	}
-	if osParam == "" && host.OSType != "" {
-		reported := strings.ToLower(host.OSType)
-		if strings.Contains(reported, "windows") {
-			osParam = "windows"
-		} else if strings.Contains(reported, "freebsd") || strings.Contains(reported, "pfsense") {
-			osParam = "freebsd"
-		} else {
-			osParam = "linux"
-		}
-	}
 	if osParam == "" {
-		osParam = "linux"
+		osParam = inferHostOS(host.ExpectedPlatform, host.OSType)
 	}
 
 	validOss := map[string]bool{"linux": true, "freebsd": true, "windows": true}
@@ -947,33 +1006,15 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	validArchLinux := map[string]bool{"amd64": true, "386": true, "arm64": true, "arm": true}
-	validArchFreebsd := map[string]bool{"amd64": true, "386": true, "arm64": true, "arm": true}
-	validArchWindows := map[string]bool{"amd64": true, "arm64": true}
-	var validArch map[string]bool
-	var archList string
-	switch osParam {
-	case "freebsd":
-		validArch = validArchFreebsd
-		archList = "amd64, 386, arm64, arm"
-	case "windows":
-		validArch = validArchWindows
-		archList = "amd64, 386"
-	default:
-		validArch = validArchLinux
-		archList = "amd64, 386, arm64, arm"
-	}
-	if !validArch[architecture] {
+	binaryName, supported := util.AgentBinaryName(osParam, architecture)
+	if !supported {
 		JSON(w, http.StatusBadRequest, map[string]string{
-			"error": fmt.Sprintf("Invalid architecture for %s. Must be one of: %s", osParam, archList),
+			"error": fmt.Sprintf("Invalid architecture for %s. Must be one of: %s",
+				osParam, strings.Join(util.SupportedAgentArches(osParam), ", ")),
 		})
 		return
 	}
 
-	binaryName := fmt.Sprintf("patchmon-agent-%s-%s", osParam, architecture)
-	if osParam == "windows" {
-		binaryName = binaryName + ".exe"
-	}
 	binDir := util.GetAgentsDir()
 	binaryPath, err := util.SafePathUnderBase(binDir, binaryName)
 	if err != nil {
@@ -1013,7 +1054,11 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	serverVersion := util.GetVersionFromBinaryPath(r.Context(), binaryPath)
+	binaryInfo, err := util.GetAgentBinaryInfo(r.Context(), binaryPath)
+	if err != nil {
+		slog.Error("failed to read agent binary", "path", binaryPath, "error", err)
+	}
+	serverVersion := binaryInfo.Version
 	if serverVersion == "" {
 		agentVersion := r.URL.Query().Get("currentVersion")
 		if agentVersion == "" {
@@ -1044,12 +1089,6 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 		hasUpdate = false
 	}
 
-	var binaryHash string
-	if data, err := os.ReadFile(binaryPath); err == nil {
-		sum := sha256.Sum256(data)
-		binaryHash = hex.EncodeToString(sum[:])
-	}
-
 	downloadURL := fmt.Sprintf("/api/v1/hosts/agent/download?arch=%s&os=%s", architecture, osParam)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"currentVersion":           agentVersion,
@@ -1062,7 +1101,7 @@ func (h *InstallHandler) ServeAgentVersion(w http.ResponseWriter, r *http.Reques
 		"minServerVersion":         nil,
 		"architecture":             architecture,
 		"agentType":                "go",
-		"hash":                     binaryHash,
+		"hash":                     binaryInfo.Hash,
 	})
 }
 
@@ -1101,28 +1140,8 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 	}
 
 	osParam := r.URL.Query().Get("os")
-	if osParam == "" && host.ExpectedPlatform != nil {
-		ep := strings.ToLower(*host.ExpectedPlatform)
-		if ep == "windows" {
-			osParam = "windows"
-		} else if strings.Contains(ep, "freebsd") || strings.Contains(ep, "pfsense") {
-			osParam = "freebsd"
-		} else {
-			osParam = "linux"
-		}
-	}
-	if osParam == "" && host.OSType != "" {
-		reported := strings.ToLower(host.OSType)
-		if strings.Contains(reported, "windows") {
-			osParam = "windows"
-		} else if strings.Contains(reported, "freebsd") || strings.Contains(reported, "pfsense") {
-			osParam = "freebsd"
-		} else {
-			osParam = "linux"
-		}
-	}
 	if osParam == "" {
-		osParam = "linux"
+		osParam = inferHostOS(host.ExpectedPlatform, host.OSType)
 	}
 
 	validOss := map[string]bool{"linux": true, "freebsd": true, "windows": true}
@@ -1131,32 +1150,13 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	validArchLinux := map[string]bool{"amd64": true, "386": true, "arm64": true, "arm": true}
-	validArchFreebsd := map[string]bool{"amd64": true, "386": true, "arm64": true, "arm": true}
-	validArchWindows := map[string]bool{"amd64": true, "arm64": true}
-	var validArch map[string]bool
-	var archList string
-	switch osParam {
-	case "freebsd":
-		validArch = validArchFreebsd
-		archList = "amd64, 386, arm64, arm"
-	case "windows":
-		validArch = validArchWindows
-		archList = "amd64, 386"
-	default:
-		validArch = validArchLinux
-		archList = "amd64, 386, arm64, arm"
-	}
-	if !validArch[architecture] {
+	binaryName, supported := util.AgentBinaryName(osParam, architecture)
+	if !supported {
 		JSON(w, http.StatusBadRequest, map[string]string{
-			"error": fmt.Sprintf("Invalid architecture for %s. Must be one of: %s", osParam, archList),
+			"error": fmt.Sprintf("Invalid architecture for %s. Must be one of: %s",
+				osParam, strings.Join(util.SupportedAgentArches(osParam), ", ")),
 		})
 		return
-	}
-
-	binaryName := fmt.Sprintf("patchmon-agent-%s-%s", osParam, architecture)
-	if osParam == "windows" {
-		binaryName = binaryName + ".exe"
 	}
 
 	// Resolve binary directory: AGENT_BINARIES_DIR, then AGENTS_DIR, then "agents" in cwd
@@ -1193,7 +1193,21 @@ func (h *InstallHandler) ServeAgentDownload(w http.ResponseWriter, r *http.Reque
 	}
 	defer func() { _ = f.Close() }()
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, binaryName))
-	http.ServeContent(w, r, binaryName, info.ModTime(), f)
+	serveAgentBinary(w, r, binaryPath, info, f)
 }
+
+func agentAutoUpdateGate(serverAutoUpdate, hostAutoUpdate, patchRunActive bool) (bool, string) {
+	switch {
+	case !serverAutoUpdate && !hostAutoUpdate:
+		return true, "Auto-update is disabled in server settings and for this host"
+	case !serverAutoUpdate:
+		return true, "Auto-update is disabled in server settings"
+	case !hostAutoUpdate:
+		return true, "Auto-update is disabled for this host"
+	case patchRunActive:
+		return true, store.PatchRunInProgressMessage
+	}
+	return false, ""
+}
+
+var agentCapabilities = []string{"wingetPinned", "wingetStoreApp"}

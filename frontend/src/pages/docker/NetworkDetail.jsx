@@ -14,6 +14,8 @@ import {
 import { Link, useParams } from "react-router-dom";
 import api, { formatRelativeTime } from "../../utils/api";
 
+const isSet = (value) => Boolean(value) && !String(value).startsWith("invalid");
+
 const NetworkDetail = () => {
 	const { id } = useParams();
 
@@ -27,11 +29,11 @@ const NetworkDetail = () => {
 	});
 
 	const network = data?.network;
-	const host = data?.host;
+	const host = data?.hosts;
 
 	if (isLoading) {
 		return (
-			<div className="flex items-center justify-center min-h-screen">
+			<div className="flex items-center justify-center min-h-[calc(100vh-var(--app-main-inset))]">
 				<RefreshCw className="h-8 w-8 animate-spin text-secondary-400" />
 			</div>
 		);
@@ -321,7 +323,7 @@ const NetworkDetail = () => {
 											className="bg-secondary-50 dark:bg-secondary-900/50 rounded-lg p-4"
 										>
 											<dl className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
-												{config.subnet && (
+												{isSet(config.subnet) && (
 													<div>
 														<dt className="text-xs font-medium text-secondary-500 dark:text-white">
 															Subnet
@@ -331,7 +333,7 @@ const NetworkDetail = () => {
 														</dd>
 													</div>
 												)}
-												{config.gateway && (
+												{isSet(config.gateway) && (
 													<div>
 														<dt className="text-xs font-medium text-secondary-500 dark:text-white">
 															Gateway
@@ -341,7 +343,7 @@ const NetworkDetail = () => {
 														</dd>
 													</div>
 												)}
-												{config.ip_range && (
+												{isSet(config.ip_range) && (
 													<div>
 														<dt className="text-xs font-medium text-secondary-500 dark:text-white">
 															IP Range
@@ -431,7 +433,7 @@ const NetworkDetail = () => {
 										to={`/hosts/${host.id}`}
 										className="text-primary-600 hover:text-primary-900 dark:text-primary-400 dark:hover:text-primary-300"
 									>
-										{host.hostname}
+										{host.friendly_name || host.hostname}
 									</Link>
 								</dd>
 							</div>
@@ -440,7 +442,8 @@ const NetworkDetail = () => {
 									Operating System
 								</dt>
 								<dd className="mt-1 text-sm text-secondary-900 dark:text-white">
-									{host.os_name} {host.os_version}
+									{[host.os_type, host.os_version].filter(Boolean).join(" ") ||
+										"Unknown"}
 								</dd>
 							</div>
 						</dl>

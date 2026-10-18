@@ -15,6 +15,7 @@ import DiscordIcon from "../components/DiscordIcon";
 import { useAuth } from "../contexts/AuthContext";
 import { authAPI, getGlobalTimezone, isCorsError } from "../utils/api";
 import { resolveLogoPath } from "../utils/logoPaths";
+import { compareVersions, isUpdateAvailable } from "../utils/version";
 
 const Login = () => {
 	const usernameId = useId();
@@ -41,6 +42,8 @@ const Login = () => {
 	const [isLoading, setIsLoading] = useState(false);
 	const [error, setError] = useState("");
 	const [requiresTfa, setRequiresTfa] = useState(false);
+	// Single-use proof that the password step already succeeded.
+	const [tfaTicket, setTfaTicket] = useState("");
 	const [tfaUsername, setTfaUsername] = useState("");
 	const [signupEnabled, setSignupEnabled] = useState(false);
 	// null = not yet loaded; don't fetch GitHub until we know the setting
@@ -52,6 +55,7 @@ const Login = () => {
 		enabled: false,
 		buttonText: "Login with SSO",
 		disableLocalAuth: false,
+		passwordFallback: false,
 	});
 	const [discordConfig, setDiscordConfig] = useState({
 		enabled: false,
@@ -288,6 +292,7 @@ const Login = () => {
 			if (result.requiresTfa) {
 				setRequiresTfa(true);
 				setTfaUsername(formData.username);
+				setTfaTicket(result.tfaTicket || "");
 				setError("");
 			} else if (result.success) {
 				navigate("/");
@@ -373,6 +378,7 @@ const Login = () => {
 				tfaUsername,
 				tfaData.token,
 				tfaData.remember_me,
+				tfaTicket,
 			);
 
 			if (response.data?.token) {
@@ -404,6 +410,16 @@ const Login = () => {
 			}
 			// Clear the token input for security (preserve remember_me preference)
 			setTfaData((prev) => ({ ...prev, token: "" }));
+
+			// The ticket is spent on the first attempt whatever the outcome, so a
+			// retry here can only fail. Only reset when the server answered: a
+			// network failure means the ticket is still good.
+			if (err.response) {
+				setRequiresTfa(false);
+				setTfaTicket("");
+				setTfaData({ token: "", remember_me: false });
+				setError("Your sign-in attempt expired. Please sign in again.");
+			}
 		} finally {
 			setIsLoading(false);
 		}
@@ -490,28 +506,16 @@ const Login = () => {
 										<div className="flex items-center gap-3">
 											<div className="flex items-center gap-2">
 												{(() => {
-													// Normalise versions for comparison (strip leading "v")
-													const strip = (v) =>
-														v ? v.replace(/^v/i, "").trim() : "";
-													// Compare two semver strings. Returns positive if a > b, negative if a < b, 0 if equal.
-													const semverCmp = (a, b) => {
-														const pa = a.split(".").map(Number);
-														const pb = b.split(".").map(Number);
-														const len = Math.max(pa.length, pb.length);
-														for (let i = 0; i < len; i++) {
-															const diff = (pa[i] || 0) - (pb[i] || 0);
-															if (diff !== 0) return diff;
-														}
-														return 0;
-													};
-													const installed = strip(currentVersion);
-													const latest = strip(latestRelease.version);
-													// Only show "Update Available" when latest is strictly newer than installed
-													const isUpdateAvailable =
-														installed &&
-														latest &&
-														semverCmp(latest, installed) > 0;
-													if (isUpdateAvailable) {
+													// Only show "Update Available" when latest is strictly newer
+													// than installed. Shared with the server's comparison so an
+													// edge build (2.0.3-rc.61) correctly reads as older than the
+													// 2.0.3 release rather than equal to it.
+													if (
+														isUpdateAvailable(
+															currentVersion,
+															latestRelease.version,
+														)
+													) {
 														return (
 															<>
 																<div className="w-2 h-2 bg-amber-400 rounded-full animate-pulse" />
@@ -521,7 +525,14 @@ const Login = () => {
 															</>
 														);
 													}
-													if (installed && latest && installed === latest) {
+													if (
+														currentVersion &&
+														latestRelease.version &&
+														compareVersions(
+															currentVersion,
+															latestRelease.version,
+														) === 0
+													) {
 														return (
 															<>
 																<div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
@@ -658,6 +669,15 @@ const Login = () => {
 							className="mt-8 space-y-6"
 							onSubmit={isSignupMode ? handleSignupSubmit : handleSubmit}
 						>
+							{oidcConfig.passwordFallback && (
+								<div className="p-3 rounded-md bg-warning-50 dark:bg-warning-900/20 border border-warning-200 dark:border-warning-800">
+									<p className="text-sm text-warning-800 dark:text-warning-200">
+										Single sign-on is unreachable. Only superadmins with
+										two-factor authentication can sign in with a password until
+										it is back.
+									</p>
+								</div>
+							)}
 							{/* Only show form fields if local auth is not disabled */}
 							{!oidcConfig.disableLocalAuth && (
 								<div className="space-y-4">
@@ -674,6 +694,8 @@ const Login = () => {
 												name="username"
 												type="text"
 												required
+												// biome-ignore lint/a11y/noAutofocus: sign-in is the page's only purpose and this is its first field
+												autoFocus
 												value={formData.username}
 												onChange={handleInputChange}
 												className="appearance-none rounded-md relative block w-full pl-10 pr-3 py-2 border border-secondary-300 placeholder-secondary-500 text-secondary-900 focus:outline-none focus:ring-primary-500 focus:border-primary-500 focus:z-10 sm:text-sm"
@@ -883,22 +905,24 @@ const Login = () => {
 								</div>
 							)}
 
-							{signupEnabled && !oidcConfig.disableLocalAuth && (
-								<div className="text-center">
-									<p className="text-sm text-secondary-700 dark:text-white">
-										{isSignupMode
-											? "Already have an account?"
-											: "Don't have an account?"}{" "}
-										<button
-											type="button"
-											onClick={toggleMode}
-											className="font-medium text-primary-600 hover:text-primary-500 dark:text-primary-400 dark:hover:text-primary-300 focus:outline-none focus:underline"
-										>
-											{isSignupMode ? "Sign in" : "Sign up"}
-										</button>
-									</p>
-								</div>
-							)}
+							{signupEnabled &&
+								!oidcConfig.disableLocalAuth &&
+								!oidcConfig.passwordFallback && (
+									<div className="text-center">
+										<p className="text-sm text-secondary-700 dark:text-white">
+											{isSignupMode
+												? "Already have an account?"
+												: "Don't have an account?"}{" "}
+											<button
+												type="button"
+												onClick={toggleMode}
+												className="font-medium text-primary-600 hover:text-primary-500 dark:text-primary-400 dark:hover:text-primary-300 focus:outline-none focus:underline"
+											>
+												{isSignupMode ? "Sign in" : "Sign up"}
+											</button>
+										</p>
+									</div>
+								)}
 						</form>
 					) : (
 						<form className="mt-8 space-y-6" onSubmit={handleTfaSubmit}>

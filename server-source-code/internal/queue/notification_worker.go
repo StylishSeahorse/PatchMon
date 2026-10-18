@@ -21,12 +21,17 @@ import (
 	"github.com/PatchMon/PatchMon/server-source-code/internal/database"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/db"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/mailer"
+	"github.com/PatchMon/PatchMon/server-source-code/internal/netguard"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/notifications"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
+
+// outboundClient is a var so tests can swap in a client without the SSRF dial
+// guard; production uses netguard.GuardedClient.
+var outboundClient = netguard.GuardedClient
 
 // NotificationDeliverHandler sends webhook or email notifications.
 type NotificationDeliverHandler struct {
@@ -42,18 +47,12 @@ func NewNotificationDeliverHandler(defaultDB *database.DB, poolCache *hostctx.Po
 	return &NotificationDeliverHandler{defaultDB: defaultDB, poolCache: poolCache, enc: enc, rdb: rdb, log: log}
 }
 
-func (h *NotificationDeliverHandler) resolveDB(ctx context.Context, payload []byte) *database.DB {
-	db := h.defaultDB
-	if len(payload) == 0 || h.poolCache == nil {
-		return db
-	}
+func (h *NotificationDeliverHandler) resolveDB(ctx context.Context, payload []byte) (context.Context, *database.DB, error) {
 	var p notifications.NotificationDeliverPayload
-	if err := json.Unmarshal(payload, &p); err == nil && strings.TrimSpace(p.Host) != "" {
-		if resolved, err := h.poolCache.GetOrCreate(ctx, p.Host); err == nil && resolved != nil {
-			db = resolved
-		}
+	if len(payload) == 0 || json.Unmarshal(payload, &p) != nil {
+		return ctx, h.defaultDB, nil
 	}
-	return db
+	return resolveDBForHost(ctx, p.Host, h.defaultDB, h.poolCache)
 }
 
 // ProcessTask implements asynq.Handler.
@@ -63,13 +62,16 @@ func (h *NotificationDeliverHandler) ProcessTask(ctx context.Context, t *asynq.T
 		return err
 	}
 	// If this was a delayed notification, check if it's been cancelled by a counterpart event.
-	if p.Delayed && p.CancelKey != "" && notifications.IsDelayedCancelled(h.rdb, p.Host, p.CancelKey) {
+	if p.Delayed && p.CancelKey != "" && notifications.IsDelayedCancelled(h.rdb, p.Host, p.CancelKey, p.EmittedAt) {
 		if h.log != nil {
 			h.log.Debug("notification_deliver: cancelled by counterpart event", "event_type", p.EventType, "cancel_key", p.CancelKey)
 		}
 		return nil
 	}
-	d := h.resolveDB(ctx, t.Payload())
+	ctx, d, err := h.resolveDB(ctx, t.Payload())
+	if err != nil {
+		return err
+	}
 	dest, err := d.Queries.GetNotificationDestinationByID(ctx, p.DestinationID)
 	if err != nil || !dest.Enabled {
 		return nil
@@ -140,6 +142,60 @@ func isSlackIncomingWebhookURL(raw string) bool {
 		return false
 	}
 	return strings.HasPrefix(u.Path, "/services/")
+}
+
+// slackCompatibleTokenRe matches the opaque IDs Mattermost and Rocket.Chat place
+// after /hooks/, which are long and unpunctuated unlike routing words such as the
+// "catch" in a Zapier catch hook.
+var slackCompatibleTokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]{15,}$`)
+
+// genericIngestHosts are automation platforms whose incoming URLs are shaped like
+// a chat webhook but whose users build rules against the structured body. They
+// answer 2xx to anything, so mis-detecting one fails silently.
+var genericIngestHosts = map[string]bool{
+	"automation.atlassian.com": true,
+	"automation.codebarrel.io": true,
+}
+
+// isSlackCompatibleWebhookURL matches self-hosted receivers that speak the Slack
+// incoming-webhook payload format, chiefly Mattermost and Rocket.Chat. They run on
+// arbitrary domains, so the only stable signal is a "/hooks/" segment followed by
+// one or two opaque tokens. Nothing before "hooks" is constrained, so an instance
+// behind a subpath proxy still matches. A miss is safe rather than fatal: the
+// generic body also carries a top-level text.
+func isSlackCompatibleWebhookURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || genericIngestHosts[strings.ToLower(u.Hostname())] {
+		return false
+	}
+	// EscapedPath keeps %2F inside a segment instead of decoding it into a separator.
+	segs := strings.Split(strings.Trim(u.EscapedPath(), "/"), "/")
+	for i, s := range segs {
+		if !strings.EqualFold(s, "hooks") {
+			continue
+		}
+		rest := segs[i+1:]
+		if len(rest) == 0 || len(rest) > 2 {
+			return false
+		}
+		for _, tok := range rest {
+			if !slackCompatibleTokenRe.MatchString(tok) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// webhookHostForLog returns just the host of a webhook URL. The path carries the
+// secret token, so it must never reach a log line.
+func webhookHostForLog(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "unparseable"
+	}
+	return u.Host
 }
 
 func truncateUTF8(s string, maxRunes int) string {
@@ -229,6 +285,19 @@ func nocMetaStrSlice(m map[string]interface{}, key string) []string {
 		return out
 	}
 	return nil
+}
+
+func nocImageUpdateList(m map[string]interface{}) string {
+	images := nocMetaStrSlice(m, "images")
+	if len(images) == 0 {
+		return ""
+	}
+	list := strings.Join(images, ", ")
+	var total int
+	if _, err := fmt.Sscanf(nocMetaStr(m, "update_count"), "%d", &total); err == nil && total > len(images) {
+		list += fmt.Sprintf(" and %d more", total-len(images))
+	}
+	return list
 }
 
 // severityEmoji returns a short icon for NOC-visible severity.
@@ -344,6 +413,10 @@ func buildNOCFields(p notifications.NotificationDeliverPayload) []map[string]int
 		addField("Host", nocMetaStr(m, "host_name"), true)
 		addField("Status", "🟢 AGENT RECOVERED", true)
 
+	case p.EventType == "container_image_update_available":
+		addField("Host", nocMetaStr(m, "host_name"), true)
+		addField("Images", nocImageUpdateList(m), false)
+
 	case p.EventType == "server_update" || p.EventType == "agent_update":
 		addField("Current Version", nocMetaStr(m, "current_version"), true)
 		addField("Available Version", "⬆️ "+nocMetaStr(m, "latest_version"), true)
@@ -395,6 +468,11 @@ func discordWebhookBody(p notifications.NotificationDeliverPayload) ([]byte, err
 
 // slackTextMaxRunes stays under Slack incoming-webhook message size limits with headroom.
 const slackTextMaxRunes = 12000
+
+// genericFallbackTextMaxRunes bounds the text added to the generic scheduled-report
+// body, whose html and csv fields already carry the report in full. The generic
+// notification body has no such duplication and keeps the full slackTextMaxRunes.
+const genericFallbackTextMaxRunes = 2000
 
 // buildSlackNOCFields creates human-readable Slack mrkdwn lines per event type.
 func buildSlackNOCFields(p notifications.NotificationDeliverPayload) string {
@@ -484,6 +562,10 @@ func buildSlackNOCFields(p notifications.NotificationDeliverPayload) string {
 		addLine("Host", nocMetaStr(m, "host_name"))
 		addLine("Status", "🟢 AGENT RECOVERED")
 
+	case p.EventType == "container_image_update_available":
+		addLine("Host", nocMetaStr(m, "host_name"))
+		addLine("Images", nocImageUpdateList(m))
+
 	case p.EventType == "server_update" || p.EventType == "agent_update":
 		addLine("Current Version", nocMetaStr(m, "current_version"))
 		addLine("Available Version", "⬆️ "+nocMetaStr(m, "latest_version"))
@@ -496,6 +578,15 @@ func buildSlackNOCFields(p notifications.NotificationDeliverPayload) string {
 }
 
 func slackIncomingWebhookBody(p notifications.NotificationDeliverPayload) ([]byte, error) {
+	out := map[string]interface{}{
+		"text":       slackIncomingWebhookText(p),
+		"username":   "PatchMon",
+		"icon_emoji": ":bell:",
+	}
+	return json.Marshal(out)
+}
+
+func slackIncomingWebhookText(p notifications.NotificationDeliverPayload) string {
 	var sb strings.Builder
 	sev := strings.TrimSpace(p.Severity)
 	if sev == "" {
@@ -530,13 +621,7 @@ func slackIncomingWebhookBody(p notifications.NotificationDeliverPayload) ([]byt
 		sb.WriteString("|🔗 View in PatchMon>\n")
 	}
 
-	text := truncateUTF8(sb.String(), slackTextMaxRunes)
-	out := map[string]interface{}{
-		"text":       text,
-		"username":   "PatchMon",
-		"icon_emoji": ":bell:",
-	}
-	return json.Marshal(out)
+	return truncateUTF8(sb.String(), slackTextMaxRunes)
 }
 
 // stripScheduledReportHTML removes tags (including script blocks) for a short Discord-friendly excerpt.
@@ -591,6 +676,30 @@ func discordScheduledReportWebhookBody(subject, html, csv string) ([]byte, error
 }
 
 func slackScheduledReportWebhookBody(subject, html, csv string) ([]byte, error) {
+	out := map[string]interface{}{
+		"text":       slackScheduledReportText(subject, html, csv),
+		"username":   "PatchMon",
+		"icon_emoji": ":bar_chart:",
+	}
+	return json.Marshal(out)
+}
+
+// genericScheduledReportText is the short preview carried by the generic body for
+// receivers that require a non-empty text. It omits the CSV block rather than
+// truncating into it, which would leave an unterminated code fence.
+func genericScheduledReportText(subject, html string) string {
+	subj := strings.TrimSpace(subject)
+	if subj == "" {
+		subj = "(no subject)"
+	}
+	body := stripScheduledReportHTML(html)
+	if body == "" {
+		body = "No HTML body in this delivery"
+	}
+	return truncateUTF8("PatchMon scheduled report: "+subj+"\n\n"+body, genericFallbackTextMaxRunes)
+}
+
+func slackScheduledReportText(subject, html, csv string) string {
 	var sb strings.Builder
 	sb.WriteString("*PatchMon · scheduled report*\n*")
 	subj := strings.TrimSpace(subject)
@@ -611,13 +720,7 @@ func slackScheduledReportWebhookBody(subject, html, csv string) ([]byte, error) 
 		sb.WriteString(cv)
 		sb.WriteString("\n```\n")
 	}
-	text := truncateUTF8(sb.String(), slackTextMaxRunes)
-	out := map[string]interface{}{
-		"text":       text,
-		"username":   "PatchMon",
-		"icon_emoji": ":bar_chart:",
-	}
-	return json.Marshal(out)
+	return truncateUTF8(sb.String(), slackTextMaxRunes)
 }
 
 type emailConfig struct {
@@ -631,8 +734,11 @@ type emailConfig struct {
 	// UseTLS is the legacy boolean preserved for backward compatibility on rows
 	// written before TLSMode existed. New code should set TLSMode and let
 	// mailer.ResolveMode pick the effective policy.
-	UseTLS  bool   `json:"use_tls"`
+	UseTLS  *bool  `json:"use_tls"`
 	TLSMode string `json:"tls_mode"`
+	// AllowInsecureAuth permits PLAIN or LOGIN auth over cleartext. Only meaningful
+	// with tls_mode=none; see mailer.Config.AllowInsecureAuth.
+	AllowInsecureAuth bool `json:"allow_insecure_auth"`
 }
 
 func (h *NotificationDeliverHandler) sendWebhook(ctx context.Context, plain string, p notifications.NotificationDeliverPayload) error {
@@ -645,10 +751,13 @@ func (h *NotificationDeliverHandler) sendWebhook(ctx context.Context, plain stri
 	}
 	var b []byte
 	var err error
+	format := "generic"
 	switch {
 	case isDiscordWebhookURL(cfg.URL):
+		format = "discord"
 		b, err = discordWebhookBody(p)
-	case isSlackIncomingWebhookURL(cfg.URL):
+	case isSlackIncomingWebhookURL(cfg.URL), isSlackCompatibleWebhookURL(cfg.URL):
+		format = "slack_compatible"
 		b, err = slackIncomingWebhookBody(p)
 	default:
 		body := map[string]interface{}{
@@ -661,6 +770,7 @@ func (h *NotificationDeliverHandler) sendWebhook(ctx context.Context, plain stri
 				"id":   p.ReferenceID,
 			},
 			"metadata": p.Metadata,
+			"text":     slackIncomingWebhookText(p),
 		}
 		if link := nocMetaStr(p.Metadata, "app_link"); link != "" {
 			body["app_link"] = link
@@ -669,6 +779,17 @@ func (h *NotificationDeliverHandler) sendWebhook(ctx context.Context, plain stri
 	}
 	if err != nil {
 		return err
+	}
+	if h.log != nil {
+		// Host only, never the path: the token in a webhook URL is a secret.
+		h.log.Debug("webhook dispatch",
+			"destination_id", p.DestinationID,
+			"event_type", p.EventType,
+			"format", format,
+			"host", webhookHostForLog(cfg.URL),
+			"body_bytes", len(b),
+			"signed", cfg.SigningSecret != "",
+		)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL, bytes.NewReader(b))
 	if err != nil {
@@ -686,7 +807,7 @@ func (h *NotificationDeliverHandler) sendWebhook(ctx context.Context, plain stri
 		sig := hex.EncodeToString(mac.Sum(nil))
 		req.Header.Set("X-PatchMon-Signature", "sha256="+sig)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := outboundClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -758,6 +879,10 @@ func buildEmailHTML(p notifications.NotificationDeliverPayload) string {
 	case p.EventType == "host_recovered":
 		addRow("Host", nocMetaStr(m, "host_name"))
 
+	case p.EventType == "container_image_update_available":
+		addRow("Host", nocMetaStr(m, "host_name"))
+		addRow("Images", nocImageUpdateList(m))
+
 	case p.EventType == "server_update" || p.EventType == "agent_update":
 		addRow("Current Version", nocMetaStr(m, "current_version"))
 		addRow("Available Version", nocMetaStr(m, "latest_version"))
@@ -790,7 +915,7 @@ func (h *NotificationDeliverHandler) sendEmail(ctx context.Context, plain string
 	subject := fmt.Sprintf("[%s] %s", strings.ToUpper(p.Severity), p.Title)
 	htmlBody := buildEmailHTML(p)
 
-	mode := mailer.ResolveMode(cfg.TLSMode, &cfg.UseTLS, cfg.SMTPPort)
+	mode := mailer.ResolveMode(cfg.TLSMode, cfg.UseTLS, cfg.SMTPPort)
 	mc := mailer.Config{
 		Host:     cfg.SMTPHost,
 		Port:     cfg.SMTPPort,
@@ -799,6 +924,9 @@ func (h *NotificationDeliverHandler) sendEmail(ctx context.Context, plain string
 		From:     cfg.From,
 		FromName: cfg.FromName,
 		TLSMode:  mode,
+		// Only honoured for tls_mode=none; mailer.validate() rejects the
+		// combination when this is false.
+		AllowInsecureAuth: cfg.AllowInsecureAuth,
 	}
 	if err := mailer.Send(ctx, mc, mailer.Message{To: cfg.To, Subject: subject, HTMLBody: htmlBody}); err != nil {
 		var se *mailer.SendError
@@ -929,6 +1057,9 @@ func buildNtfyMessage(p notifications.NotificationDeliverPayload) string {
 	case p.EventType == "host_recovered":
 		addLine("Host", nocMetaStr(m, "host_name"))
 		addLine("Status", "AGENT RECOVERED")
+	case p.EventType == "container_image_update_available":
+		addLine("Host", nocMetaStr(m, "host_name"))
+		addLine("Images", nocImageUpdateList(m))
 	case p.EventType == "server_update" || p.EventType == "agent_update":
 		addLine("Current version", nocMetaStr(m, "current_version"))
 		addLine("Available version", nocMetaStr(m, "latest_version"))
@@ -1012,7 +1143,7 @@ func (h *NotificationDeliverHandler) sendNtfy(ctx context.Context, plain string,
 		req.SetBasicAuth(cfg.Username, cfg.Password)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := outboundClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

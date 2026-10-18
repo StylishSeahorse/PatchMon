@@ -3,8 +3,9 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/agentregistry"
@@ -15,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -75,8 +77,10 @@ type RunScanPayload struct {
 	ProfileID            *string `json:"profile_id,omitempty"`
 	EnableRemediation    bool    `json:"enable_remediation"`
 	FetchRemoteResources bool    `json:"fetch_remote_resources"`
-	RequeueCount         int     `json:"requeue_count,omitempty"`
 }
+
+// RunScanTaskID is the fixed task ID that deduplicates a host's scans.
+func RunScanTaskID(hostID string) string { return "compliance-scan-" + hostID }
 
 // NewRunScanTask creates a run_scan task. Use TaskID for deduplication: compliance-scan-{hostId}.
 func NewRunScanTask(p RunScanPayload) (*asynq.Task, error) {
@@ -86,8 +90,8 @@ func NewRunScanTask(p RunScanPayload) (*asynq.Task, error) {
 	}
 	opts := []asynq.Option{
 		asynq.Queue(QueueCompliance),
-		asynq.MaxRetry(10),
-		asynq.TaskID("compliance-scan-" + p.HostID),
+		asynq.MaxRetry(maxScanRequeueAttempts),
+		asynq.TaskID(RunScanTaskID(p.HostID)),
 	}
 	return asynq.NewTask(TypeRunScan, payload, opts...), nil
 }
@@ -105,7 +109,7 @@ func NewInstallComplianceToolsTask(hostID, apiID, host string) (*asynq.Task, err
 	if err != nil {
 		return nil, err
 	}
-	return asynq.NewTask(TypeInstallComplianceTools, payload, asynq.Queue(QueueCompliance), asynq.MaxRetry(2)), nil
+	return asynq.NewTask(TypeInstallComplianceTools, payload, asynq.Queue(QueueCompliance), asynq.MaxRetry(2), asynq.Retention(time.Hour)), nil
 }
 
 // SSGUpgradePayload is the payload for per-host ssg_upgrade jobs.
@@ -139,6 +143,10 @@ type RunPatchPayload struct {
 	PackageName  *string  `json:"package_name,omitempty"`
 	PackageNames []string `json:"package_names,omitempty"`
 	DryRun       bool     `json:"dry_run,omitempty"`
+	// RebootIfRequired asks the agent to reboot the host after a successful run
+	// iff the host still reports a pending reboot. Set only by scheduled runs of
+	// a policy with auto_reboot; manual runs leave it false.
+	RebootIfRequired bool `json:"reboot_if_required,omitempty"`
 }
 
 // NewRunPatchTask creates a run_patch task.
@@ -153,6 +161,22 @@ func NewRunPatchTask(p RunPatchPayload) (*asynq.Task, error) {
 		asynq.TaskID("patch-run-" + p.PatchRunID),
 	}
 	return asynq.NewTask(TypeRunPatch, payload, opts...), nil
+}
+
+// RunPatchRetryTaskIDs are the retry task IDs a run can have, so the delete handler can cancel them.
+// Two alternate because a running task cannot enqueue a task with its own ID.
+func RunPatchRetryTaskIDs(patchRunID string) [2]string {
+	base := "patch-run-" + patchRunID + "-retry"
+	return [2]string{base, base + "-2"}
+}
+
+// NextRunPatchRetryTaskID picks the retry ID that is not the task currently running.
+func NextRunPatchRetryTaskID(patchRunID, currentTaskID string) string {
+	ids := RunPatchRetryTaskIDs(patchRunID)
+	if currentTaskID == ids[0] {
+		return ids[1]
+	}
+	return ids[0]
 }
 
 // NewRunPatchRetryTask creates a run_patch task with a custom task ID so that
@@ -183,6 +207,8 @@ func NewUpdateThresholdMonitorTask(host string) (*asynq.Task, error) {
 type ReportNowPayload struct {
 	ApiID string `json:"api_id"`
 	Host  string `json:"host,omitempty"`
+	// Set by the reconnect catch-up, never by an operator-triggered fetch.
+	OnlyIfOverdue bool `json:"only_if_overdue,omitempty"`
 }
 
 // NewReportNowTask creates a report_now task.
@@ -192,6 +218,26 @@ func NewReportNowTask(apiID, host string) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TypeReportNow, payload, asynq.Queue(QueueAgentCommands), asynq.MaxRetry(3)), nil
+}
+
+const CatchUpUniqueTTL = 5 * time.Minute
+
+// NewCatchUpReportTask creates a report_now task for a reconnecting host whose
+// report cadence has lapsed.
+//
+// Must stay asynq.Unique, not asynq.TaskID: an archived task keeps its task key,
+// so a TaskID would block this host's catch-ups for the 90-day archive retention.
+func NewCatchUpReportTask(apiID, host string, delay time.Duration) (*asynq.Task, error) {
+	payload, err := json.Marshal(ReportNowPayload{ApiID: apiID, Host: host, OnlyIfOverdue: true})
+	if err != nil {
+		return nil, err
+	}
+	return asynq.NewTask(TypeReportNow, payload,
+		asynq.Queue(QueueAgentCommands),
+		asynq.MaxRetry(1),
+		asynq.Unique(CatchUpUniqueTTL),
+		asynq.ProcessIn(delay),
+	), nil
 }
 
 // NewRefreshIntegrationStatusTask creates a refresh_integration_status task.
@@ -356,16 +402,31 @@ func NewHostStatusMonitorTask(host string) (*asynq.Task, error) {
 	return asynq.NewTask(TypeHostStatusMonitor, payload, asynq.Queue(QueueHostStatus), asynq.MaxRetry(2), asynq.Retention(AutomationRetention)), nil
 }
 
+// Fails open: an unreadable row sends the report rather than dropping it.
+// Returns the host ID so the caller need not read the row again.
+func hostStillOverdue(ctx context.Context, d *database.DB, apiID string) (bool, string) {
+	host, err := d.Queries.GetHostByApiID(ctx, apiID)
+	if err != nil {
+		return true, ""
+	}
+	if host.Status != store.StatusActive || !host.LastUpdate.Valid {
+		return false, host.ID
+	}
+	cutoff := store.OverdueCutoff(time.Now(), store.ResolveUpdateIntervalMinutes(ctx, d))
+	return host.LastUpdate.Time.Before(cutoff), host.ID
+}
+
 // ReportNowHandler handles report_now jobs.
 type ReportNowHandler struct {
-	registry *agentregistry.Registry
-	db       *database.DB
-	log      *slog.Logger
+	registry  *agentregistry.Registry
+	db        *database.DB
+	poolCache *hostctx.PoolCache
+	log       *slog.Logger
 }
 
 // NewReportNowHandler creates a report_now handler.
-func NewReportNowHandler(registry *agentregistry.Registry, db *database.DB, log *slog.Logger) *ReportNowHandler {
-	return &ReportNowHandler{registry: registry, db: db, log: log}
+func NewReportNowHandler(registry *agentregistry.Registry, db *database.DB, poolCache *hostctx.PoolCache, log *slog.Logger) *ReportNowHandler {
+	return &ReportNowHandler{registry: registry, db: db, poolCache: poolCache, log: log}
 }
 
 // ProcessTask implements asynq.Handler.
@@ -374,20 +435,36 @@ func (h *ReportNowHandler) ProcessTask(ctx context.Context, t *asynq.Task) error
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
 	}
+	ctx, d, err := resolveDBForHost(ctx, p.Host, h.db, h.poolCache)
+	if err != nil {
+		return err
+	}
+
+	// The host may have reported during the catch-up's jitter delay.
+	knownHostID := ""
+	if p.OnlyIfOverdue && d != nil {
+		overdue, id := hostStillOverdue(ctx, d, p.ApiID)
+		if !overdue {
+			h.log.Debug("report_now: host reported since catch-up was queued, dropping", "api_id", p.ApiID)
+			return nil
+		}
+		knownHostID = id
+	}
 
 	taskID, _ := asynq.GetTaskID(ctx)
 	retryCount, _ := asynq.GetRetryCount(ctx)
 	attempt := int32(retryCount + 1)
 
 	// Log to job_history on first attempt so it persists in Agent Queue tab (like BullMQ)
-	if h.db != nil && taskID != "" && retryCount == 0 {
-		host, err := h.db.Queries.GetHostByApiID(ctx, p.ApiID)
+	if d != nil && taskID != "" && retryCount == 0 {
 		var hostID *string
-		if err == nil {
+		if knownHostID != "" {
+			hostID = &knownHostID
+		} else if host, err := d.Queries.GetHostByApiID(ctx, p.ApiID); err == nil {
 			hostID = &host.ID
 		}
 		apiIDPtr := &p.ApiID
-		_ = h.db.Queries.InsertJobHistory(ctx, db.InsertJobHistoryParams{
+		_ = d.Queries.InsertJobHistory(ctx, db.InsertJobHistoryParams{
 			ID:            uuid.New().String(),
 			JobID:         taskID,
 			QueueName:     QueueAgentCommands,
@@ -401,9 +478,9 @@ func (h *ReportNowHandler) ProcessTask(ctx context.Context, t *asynq.Task) error
 
 	if !h.registry.IsConnected(p.ApiID) {
 		h.log.Warn("report_now: agent not connected", "api_id", p.ApiID)
-		if taskID != "" && h.db != nil {
+		if taskID != "" && d != nil {
 			msg := "Agent not connected"
-			_ = h.db.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
 		}
 		return nil // Don't retry - agent may connect later, user can retry
 	}
@@ -413,8 +490,8 @@ func (h *ReportNowHandler) ProcessTask(ctx context.Context, t *asynq.Task) error
 		return err // Retry on write failure - don't update job_history yet
 	}
 
-	if taskID != "" && h.db != nil {
-		_ = h.db.Queries.UpdateJobHistoryCompleted(ctx, taskID)
+	if taskID != "" && d != nil {
+		_ = d.Queries.UpdateJobHistoryCompleted(ctx, taskID)
 	}
 	h.log.Info("report_now sent", "api_id", p.ApiID)
 	return nil
@@ -427,15 +504,19 @@ func sendAgentCommand(ctx context.Context, h *ReportNowHandler, p ReportNowPaylo
 		taskID = taskIDVal
 	}
 	attempt := int32(retryCount + 1)
+	ctx, d, err := resolveDBForHost(ctx, p.Host, h.db, h.poolCache)
+	if err != nil {
+		return err
+	}
 
-	if h.db != nil && taskID != "" && retryCount == 0 {
-		host, err := h.db.Queries.GetHostByApiID(ctx, p.ApiID)
+	if d != nil && taskID != "" && retryCount == 0 {
+		host, err := d.Queries.GetHostByApiID(ctx, p.ApiID)
 		var hostID *string
 		if err == nil {
 			hostID = &host.ID
 		}
 		apiIDPtr := &p.ApiID
-		_ = h.db.Queries.InsertJobHistory(ctx, db.InsertJobHistoryParams{
+		_ = d.Queries.InsertJobHistory(ctx, db.InsertJobHistoryParams{
 			ID:            uuid.New().String(),
 			JobID:         taskID,
 			QueueName:     QueueAgentCommands,
@@ -449,9 +530,9 @@ func sendAgentCommand(ctx context.Context, h *ReportNowHandler, p ReportNowPaylo
 
 	if !h.registry.IsConnected(p.ApiID) {
 		h.log.Warn(msgType+": agent not connected", "api_id", p.ApiID)
-		if taskID != "" && h.db != nil {
+		if taskID != "" && d != nil {
 			msg := "Agent not connected"
-			_ = h.db.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
 		}
 		return nil
 	}
@@ -461,8 +542,8 @@ func sendAgentCommand(ctx context.Context, h *ReportNowHandler, p ReportNowPaylo
 		return err
 	}
 
-	if taskID != "" && h.db != nil {
-		_ = h.db.Queries.UpdateJobHistoryCompleted(ctx, taskID)
+	if taskID != "" && d != nil {
+		_ = d.Queries.UpdateJobHistoryCompleted(ctx, taskID)
 	}
 	h.log.Info(msgType+" sent", "api_id", p.ApiID)
 	return nil
@@ -474,8 +555,8 @@ type RefreshIntegrationStatusHandler struct {
 }
 
 // NewRefreshIntegrationStatusHandler creates a refresh_integration_status handler.
-func NewRefreshIntegrationStatusHandler(registry *agentregistry.Registry, db *database.DB, log *slog.Logger) *RefreshIntegrationStatusHandler {
-	return &RefreshIntegrationStatusHandler{ReportNowHandler: NewReportNowHandler(registry, db, log)}
+func NewRefreshIntegrationStatusHandler(registry *agentregistry.Registry, db *database.DB, poolCache *hostctx.PoolCache, log *slog.Logger) *RefreshIntegrationStatusHandler {
+	return &RefreshIntegrationStatusHandler{ReportNowHandler: NewReportNowHandler(registry, db, poolCache, log)}
 }
 
 // ProcessTask implements asynq.Handler.
@@ -494,8 +575,8 @@ type DockerInventoryRefreshHandler struct {
 }
 
 // NewDockerInventoryRefreshHandler creates a docker_inventory_refresh handler.
-func NewDockerInventoryRefreshHandler(registry *agentregistry.Registry, db *database.DB, log *slog.Logger) *DockerInventoryRefreshHandler {
-	return &DockerInventoryRefreshHandler{ReportNowHandler: NewReportNowHandler(registry, db, log)}
+func NewDockerInventoryRefreshHandler(registry *agentregistry.Registry, db *database.DB, poolCache *hostctx.PoolCache, log *slog.Logger) *DockerInventoryRefreshHandler {
+	return &DockerInventoryRefreshHandler{ReportNowHandler: NewReportNowHandler(registry, db, poolCache, log)}
 }
 
 // ProcessTask implements asynq.Handler.
@@ -510,14 +591,15 @@ func (h *DockerInventoryRefreshHandler) ProcessTask(ctx context.Context, t *asyn
 
 // UpdateAgentHandler handles update_agent jobs.
 type UpdateAgentHandler struct {
-	registry *agentregistry.Registry
-	db       *database.DB
-	log      *slog.Logger
+	registry  *agentregistry.Registry
+	db        *database.DB
+	poolCache *hostctx.PoolCache
+	log       *slog.Logger
 }
 
 // NewUpdateAgentHandler creates an update_agent handler.
-func NewUpdateAgentHandler(registry *agentregistry.Registry, db *database.DB, log *slog.Logger) *UpdateAgentHandler {
-	return &UpdateAgentHandler{registry: registry, db: db, log: log}
+func NewUpdateAgentHandler(registry *agentregistry.Registry, db *database.DB, poolCache *hostctx.PoolCache, log *slog.Logger) *UpdateAgentHandler {
+	return &UpdateAgentHandler{registry: registry, db: db, poolCache: poolCache, log: log}
 }
 
 // ProcessTask implements asynq.Handler.
@@ -526,19 +608,23 @@ func (h *UpdateAgentHandler) ProcessTask(ctx context.Context, t *asynq.Task) err
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return err
 	}
+	ctx, d, err := resolveDBForHost(ctx, p.Host, h.db, h.poolCache)
+	if err != nil {
+		return err
+	}
 
 	taskID, _ := asynq.GetTaskID(ctx)
 	retryCount, _ := asynq.GetRetryCount(ctx)
 	attempt := int32(retryCount + 1)
 
-	if h.db != nil && taskID != "" && retryCount == 0 {
-		host, err := h.db.Queries.GetHostByApiID(ctx, p.ApiID)
+	if d != nil && taskID != "" && retryCount == 0 {
+		host, err := d.Queries.GetHostByApiID(ctx, p.ApiID)
 		var hostID *string
 		if err == nil {
 			hostID = &host.ID
 		}
 		apiIDPtr := &p.ApiID
-		_ = h.db.Queries.InsertJobHistory(ctx, db.InsertJobHistoryParams{
+		_ = d.Queries.InsertJobHistory(ctx, db.InsertJobHistoryParams{
 			ID:            uuid.New().String(),
 			JobID:         taskID,
 			QueueName:     QueueAgentCommands,
@@ -551,38 +637,53 @@ func (h *UpdateAgentHandler) ProcessTask(ctx context.Context, t *asynq.Task) err
 	}
 
 	if !p.BypassSettings {
-		settings, err := h.db.Queries.GetFirstSettings(ctx)
+		settings, err := d.Queries.GetFirstSettings(ctx)
 		if err != nil || !settings.AutoUpdate {
 			msg := "Auto-update is disabled in server settings"
-			if taskID != "" && h.db != nil {
-				_ = h.db.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			if taskID != "" && d != nil {
+				_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
 			}
 			h.log.Info("update_agent: skipped", "api_id", p.ApiID, "reason", msg)
 			return nil
 		}
-		host, err := h.db.Queries.GetHostByApiID(ctx, p.ApiID)
+		host, err := d.Queries.GetHostByApiID(ctx, p.ApiID)
 		if err != nil {
 			msg := "Host not found"
-			if taskID != "" && h.db != nil {
-				_ = h.db.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			if taskID != "" && d != nil {
+				_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
 			}
 			return nil
 		}
 		if !host.AutoUpdate {
 			msg := "Auto-update is disabled for this host"
-			if taskID != "" && h.db != nil {
-				_ = h.db.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			if taskID != "" && d != nil {
+				_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
 			}
 			h.log.Info("update_agent: skipped", "api_id", p.ApiID, "reason", msg)
 			return nil
 		}
 	}
 
+	if d != nil {
+		patching, err := hostIsPatching(ctx, d.Queries, p.ApiID)
+		if err != nil {
+			return err
+		}
+		if patching {
+			msg := store.PatchRunInProgressMessage
+			if taskID != "" {
+				_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			}
+			h.log.Info("update_agent: skipped, patch run in progress", "api_id", p.ApiID)
+			return nil
+		}
+	}
+
 	if !h.registry.IsConnected(p.ApiID) {
 		h.log.Warn("update_agent: agent not connected", "api_id", p.ApiID)
-		if taskID != "" && h.db != nil {
+		if taskID != "" && d != nil {
 			msg := "Agent not connected"
-			_ = h.db.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
+			_ = d.Queries.UpdateJobHistoryFailed(ctx, db.UpdateJobHistoryFailedParams{JobID: taskID, ErrorMessage: &msg})
 		}
 		return nil
 	}
@@ -592,8 +693,8 @@ func (h *UpdateAgentHandler) ProcessTask(ctx context.Context, t *asynq.Task) err
 		return err
 	}
 
-	if taskID != "" && h.db != nil {
-		_ = h.db.Queries.UpdateJobHistoryCompleted(ctx, taskID)
+	if taskID != "" && d != nil {
+		_ = d.Queries.UpdateJobHistoryCompleted(ctx, taskID)
 	}
 	h.log.Info("update_agent sent", "api_id", p.ApiID)
 	return nil
@@ -613,6 +714,41 @@ func NewRunPatchHandler(registry *agentregistry.Registry, patchRuns *store.Patch
 	return &RunPatchHandler{registry: registry, patchRuns: patchRuns, poolCache: poolCache, queueClient: queueClient, log: log}
 }
 
+const scheduledRunSkippedReason = "Skipped: another patch run was in progress on this host when the scheduled window arrived"
+
+type scheduledRunStore interface {
+	GetByID(ctx context.Context, id string) (*db.GetPatchRunByIDRow, error)
+	ActivateScheduledRun(ctx context.Context, id string) (bool, error)
+	SkipScheduledRun(ctx context.Context, id, reason string) error
+}
+
+// activateIfScheduled turns a scheduled run whose window has arrived into an
+// active one. It reports false when the task must not be dispatched.
+func activateIfScheduled(ctx context.Context, runs scheduledRunStore, log *slog.Logger, p RunPatchPayload) (bool, error) {
+	run, err := runs.GetByID(ctx, p.PatchRunID)
+	if err != nil {
+		return false, err
+	}
+	if run == nil || run.Status != "scheduled" {
+		return true, nil
+	}
+	activated, err := runs.ActivateScheduledRun(ctx, p.PatchRunID)
+	if errors.Is(err, store.ErrHostHasActivePatchRun) {
+		if skipErr := runs.SkipScheduledRun(ctx, p.PatchRunID, scheduledRunSkippedReason); skipErr != nil {
+			return false, skipErr
+		}
+		log.Info("run_patch: host busy when scheduled window arrived, skipped run", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !activated {
+		log.Info("run_patch: scheduled run changed before activation, dropping task", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
+	}
+	return activated, nil
+}
+
 // ProcessTask implements asynq.Handler.
 func (h *RunPatchHandler) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	var p RunPatchPayload
@@ -620,11 +756,17 @@ func (h *RunPatchHandler) ProcessTask(ctx context.Context, t *asynq.Task) error 
 		return err
 	}
 
-	// Resolve per-context DB when Host is in payload (multi-host mode).
-	if h.poolCache != nil && strings.TrimSpace(p.Host) != "" {
-		if db, err := h.poolCache.GetOrCreate(ctx, p.Host); err == nil && db != nil {
-			ctx = hostctx.WithDB(ctx, db)
-		}
+	hctx, rd, err := resolveDBForHost(ctx, p.Host, nil, h.poolCache)
+	if err != nil {
+		return err
+	}
+	if rd != nil {
+		ctx = hostctx.WithDB(hctx, rd)
+	}
+
+	proceed, err := activateIfScheduled(ctx, h.patchRuns, h.log, p)
+	if err != nil || !proceed {
+		return err
 	}
 
 	if !h.registry.IsConnected(p.ApiID) {
@@ -647,39 +789,77 @@ func (h *RunPatchHandler) ProcessTask(ctx context.Context, t *asynq.Task) error 
 			return nil
 		}
 
-		_ = h.patchRuns.UpdateStatus(ctx, p.PatchRunID, status)
+		requeued, err := h.patchRuns.Requeue(ctx, p.PatchRunID, status)
+		if err != nil {
+			return err
+		}
+		if !requeued {
+			h.log.Info("run_patch: run status changed, dropping task", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
+			return nil
+		}
 
-		// Use a deterministic retry task ID so only one retry can exist at a time
-		// and the delete handler can cancel it.
-		retryTaskID := "patch-run-" + p.PatchRunID + "-retry"
-		task, err := NewRunPatchRetryTask(p, retryTaskID)
+		currentTaskID, _ := asynq.GetTaskID(ctx)
+		task, err := NewRunPatchRetryTask(p, NextRunPatchRetryTaskID(p.PatchRunID, currentTaskID))
 		if err != nil {
 			return err
 		}
 		_, err = h.queueClient.Enqueue(task, asynq.ProcessIn(5*time.Minute))
-		if err != nil {
-			// If a task with this ID already exists (pending), that's fine - skip.
-			h.log.Debug("run_patch: re-enqueue skipped or failed", "api_id", p.ApiID, "error", err)
-		} else {
+		switch {
+		case errors.Is(err, asynq.ErrTaskIDConflict):
+			h.log.Debug("run_patch: retry already pending", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
+		case err != nil:
+			h.log.Warn("run_patch: failed to re-queue run for offline agent", "api_id", p.ApiID, "patch_run_id", p.PatchRunID, "error", err)
+		default:
 			h.log.Info("run_patch: agent offline, re-queued in 5m", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
 		}
 		return nil
 	}
 
-	// Build run_patch payload
-	payload := map[string]interface{}{
-		"type":         "run_patch",
-		"patch_run_id": p.PatchRunID,
-		"patch_type":   p.PatchType,
-		"dry_run":      p.DryRun,
+	run, err := h.patchRuns.GetByID(ctx, p.PatchRunID)
+	if err != nil {
+		return err
 	}
-	if p.PackageName != nil {
-		payload["package_name"] = *p.PackageName
+	if run == nil || (run.Status != "queued" && run.Status != "pending_validation") {
+		status := ""
+		if run != nil {
+			status = run.Status
+		}
+		h.log.Info("run_patch: run no longer awaiting dispatch, dropping task", "api_id", p.ApiID, "patch_run_id", p.PatchRunID, "status", status)
+		return nil
 	}
-	if len(p.PackageNames) > 0 {
-		payload["package_names"] = p.PackageNames
+	// Covers runs queued before the API refused them.
+	if store.RefusesSelectedPatch(run.HostPackageManager, run.PatchType) {
+		if err := h.patchRuns.FailRun(ctx, p.PatchRunID, store.PacmanSelectedPatchUnsupported); err != nil {
+			return err
+		}
+		h.log.Warn("run_patch: selected patching refused on a pacman host, marked failed", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
+		return nil
 	}
-	msg, err := json.Marshal(payload)
+
+	var pending []db.PatchRunItem
+	windows := run.HostOsType != nil && store.IsWindowsOSType(*run.HostOsType)
+	if windows && p.PatchType == "patch_package" {
+		pending, err = h.patchRuns.ListPendingItems(ctx, p.PatchRunID)
+		if err != nil {
+			return err
+		}
+		var invalid []string
+		pending, invalid = splitDispatchableItems(pending)
+		if len(invalid) > 0 {
+			if err := h.patchRuns.AbortPendingItems(ctx, invalid, invalidTargetMessage); err != nil {
+				return err
+			}
+			h.log.Warn("run_patch: dropped items with an invalid identifier", "api_id", p.ApiID, "patch_run_id", p.PatchRunID, "count", len(invalid))
+		}
+		if len(pending) == 0 {
+			if err := h.patchRuns.FailRun(ctx, p.PatchRunID, noTargetsMessage(len(invalid))); err != nil {
+				return err
+			}
+			h.log.Warn("run_patch: windows run has no patch targets, marked failed", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
+			return nil
+		}
+	}
+	msg, err := json.Marshal(buildRunPatchMessage(p, run, windows, pending))
 	if err != nil {
 		return err
 	}
@@ -688,7 +868,92 @@ func (h *RunPatchHandler) ProcessTask(ctx context.Context, t *asynq.Task) error 
 		return err
 	}
 
-	_ = h.patchRuns.UpdateStatus(ctx, p.PatchRunID, "running")
+	if err := h.patchRuns.MarkDispatched(ctx, p.PatchRunID); err != nil {
+		h.log.Warn("run_patch: failed to mark run dispatched", "patch_run_id", p.PatchRunID, "error", err)
+	}
 	h.log.Info("run_patch sent", "api_id", p.ApiID, "patch_run_id", p.PatchRunID)
 	return nil
+}
+
+const (
+	noPatchTargetsMessage = "No patch targets: none of the selected updates or apps are pending on this host"
+	invalidTargetMessage  = "Invalid target identifier"
+)
+
+func noTargetsMessage(invalid int) string {
+	switch invalid {
+	case 0:
+		return noPatchTargetsMessage
+	case 1:
+		return "No valid patch targets: 1 item had an invalid identifier"
+	}
+	return fmt.Sprintf("No valid patch targets: %d items had an invalid identifier", invalid)
+}
+
+func splitDispatchableItems(items []db.PatchRunItem) (valid []db.PatchRunItem, invalidIDs []string) {
+	for _, it := range items {
+		switch {
+		case it.Kind == store.PatchItemKindWUA && store.IsValidWUAGuid(it.Identifier),
+			it.Kind == store.PatchItemKindWinget && store.IsValidWingetID(it.Identifier):
+			valid = append(valid, it)
+		default:
+			invalidIDs = append(invalidIDs, it.ID)
+		}
+	}
+	return valid, invalidIDs
+}
+
+type runPatchTarget struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
+func buildRunPatchMessage(p RunPatchPayload, run *db.GetPatchRunByIDRow, windows bool, pending []db.PatchRunItem) map[string]interface{} {
+	payload := map[string]interface{}{
+		"type":         "run_patch",
+		"patch_run_id": p.PatchRunID,
+		"patch_type":   p.PatchType,
+		"dry_run":      p.DryRun,
+	}
+	if p.RebootIfRequired && !p.DryRun {
+		payload["reboot_if_required"] = true
+	}
+	if !windows {
+		if p.PackageName != nil {
+			payload["package_name"] = *p.PackageName
+		}
+		if len(p.PackageNames) > 0 {
+			payload["package_names"] = p.PackageNames
+		}
+		return payload
+	}
+	switch p.PatchType {
+	case "patch_package":
+		targets := make([]runPatchTarget, len(pending))
+		for i, it := range pending {
+			targets[i] = runPatchTarget{Kind: it.Kind, ID: it.Identifier}
+		}
+		payload["targets"] = targets
+	case "patch_all":
+		payload["include_updates"] = run.WindowsIncludeUpdates == nil || *run.WindowsIncludeUpdates
+		payload["include_apps"] = run.WindowsIncludeApps == nil || *run.WindowsIncludeApps
+	}
+	return payload
+}
+
+type activeRunChecker interface {
+	GetHostByApiID(ctx context.Context, apiID string) (db.Host, error)
+	HostHasActivePatchRun(ctx context.Context, hostID string) (bool, error)
+}
+
+// hostIsPatching fails closed: any lookup error other than an unknown host is returned so the update retries.
+func hostIsPatching(ctx context.Context, q activeRunChecker, apiID string) (bool, error) {
+	host, err := q.GetHostByApiID(ctx, apiID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return q.HostHasActivePatchRun(ctx, host.ID)
 }

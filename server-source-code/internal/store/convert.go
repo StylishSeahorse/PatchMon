@@ -102,6 +102,8 @@ func dbSettingToModel(s db.Setting) models.Settings {
 		OidcReadonlyGroup:               s.OidcReadonlyGroup,
 		OidcUserGroup:                   s.OidcUserGroup,
 		OidcEnforceHTTPS:                s.OidcEnforceHttps,
+		OidcTrustUnverifiedEmail:        s.OidcTrustUnverifiedEmail,
+		OidcLocalAuthFallback:           s.OidcLocalAuthFallback,
 		MaxLoginAttempts:                pgInt32ToIntPtr(s.MaxLoginAttempts),
 		LockoutDurationMinutes:          pgInt32ToIntPtr(s.LockoutDurationMinutes),
 		SessionInactivityTimeoutMinutes: pgInt32ToIntPtr(s.SessionInactivityTimeoutMinutes),
@@ -116,6 +118,8 @@ func dbSettingToModel(s db.Setting) models.Settings {
 		EnableHSTS:                      s.EnableHsts,
 		JSONBodyLimit:                   s.JsonBodyLimit,
 		AgentUpdateBodyLimit:            s.AgentUpdateBodyLimit,
+		ComplianceBodyLimit:             s.ComplianceBodyLimit,
+		AgentPingBodyLimit:              s.AgentPingBodyLimit,
 		DBTransactionLongTimeout:        pgInt32ToIntPtr(s.DbTransactionLongTimeout),
 		CorsOrigin:                      s.CorsOrigin,
 		EnableLogging:                   s.EnableLogging,
@@ -207,6 +211,8 @@ func settingsToUpdateParams(s *models.Settings) db.UpdateSettingsParams {
 		OidcReadonlyGroup:         s.OidcReadonlyGroup,
 		OidcUserGroup:             s.OidcUserGroup,
 		OidcEnforceHttps:          s.OidcEnforceHTTPS,
+		OidcTrustUnverifiedEmail:  s.OidcTrustUnverifiedEmail,
+		OidcLocalAuthFallback:     s.OidcLocalAuthFallback,
 		ID:                        s.ID,
 	}
 }
@@ -292,21 +298,24 @@ func dbDashboardLayoutToModel(d db.DashboardLayout) models.DashboardLayout {
 
 func dbDockerContainerToModel(d db.DockerContainer) models.DockerContainer {
 	return models.DockerContainer{
-		ID:          d.ID,
-		HostID:      d.HostID,
-		ContainerID: d.ContainerID,
-		Name:        d.Name,
-		ImageID:     d.ImageID,
-		ImageName:   d.ImageName,
-		ImageTag:    d.ImageTag,
-		Status:      d.Status,
-		State:       d.State,
-		Ports:       models.JSON(d.Ports),
-		Labels:      models.JSON(d.Labels),
-		CreatedAt:   pgTime(d.CreatedAt),
-		StartedAt:   pgTimePtr(d.StartedAt),
-		UpdatedAt:   pgTime(d.UpdatedAt),
-		LastChecked: pgTime(d.LastChecked),
+		ID:           d.ID,
+		HostID:       d.HostID,
+		ContainerID:  d.ContainerID,
+		Name:         d.Name,
+		ImageID:      d.ImageID,
+		ImageName:    d.ImageName,
+		ImageTag:     d.ImageTag,
+		Status:       d.Status,
+		State:        d.State,
+		Ports:        models.JSON(d.Ports),
+		Labels:       models.JSON(d.Labels),
+		CreatedAt:    pgTime(d.CreatedAt),
+		StartedAt:    pgTimePtr(d.StartedAt),
+		UpdatedAt:    pgTime(d.UpdatedAt),
+		LastChecked:  pgTime(d.LastChecked),
+		ImageStale:   d.ImageStale,
+		RestartCount: int(d.RestartCount),
+		ImageDigest:  d.ImageDigest,
 	}
 }
 
@@ -323,20 +332,6 @@ func dbDockerImageToModel(d db.DockerImage) models.DockerImage {
 		LastPulled:  pgTimePtr(d.LastPulled),
 		LastChecked: pgTime(d.LastChecked),
 		UpdatedAt:   pgTime(d.UpdatedAt),
-	}
-}
-
-func dbDockerImageUpdateToModel(d db.DockerImageUpdate) models.DockerImageUpdate {
-	return models.DockerImageUpdate{
-		ID:               d.ID,
-		ImageID:          d.ImageID,
-		CurrentTag:       d.CurrentTag,
-		AvailableTag:     d.AvailableTag,
-		IsSecurityUpdate: d.IsSecurityUpdate,
-		Severity:         d.Severity,
-		ChangelogURL:     d.ChangelogUrl,
-		CreatedAt:        pgTime(d.CreatedAt),
-		UpdatedAt:        pgTime(d.UpdatedAt),
 	}
 }
 
@@ -444,6 +439,9 @@ func dbUserToModel(u db.User) models.User {
 		DiscordLinkedAt:        pgTimePtr(u.DiscordLinkedAt),
 		NewsletterSubscribed:   u.NewsletterSubscribed,
 		NewsletterSubscribedAt: pgTimePtr(u.NewsletterSubscribedAt),
+		TfaEnrolmentRequired:   u.TfaEnrolmentRequired,
+		PasswordChangeRequired: u.PasswordChangeRequired,
+		PreviousPasswordHash:   u.PreviousPasswordHash,
 	}
 }
 
@@ -502,6 +500,15 @@ func dbHostToModel(h db.Host) *models.Host {
 		DockerHash:                   h.DockerHash,
 		ComplianceHash:               h.ComplianceHash,
 		LastFullReportAt:             pgTimePtr(h.LastFullReportAt),
+		ConfigVersion:                h.ConfigVersion,
+		ReportedHostID:               h.ReportedHostID,
+		EnrolmentTokenID:             h.EnrolmentTokenID,
+		CredentialsReissuedAt:        pgTimePtr(h.CredentialsReissuedAt),
+		IdentityFingerprint:          h.IdentityFingerprint,
+		IdentityPrevFingerprint:      h.IdentityPrevFingerprint,
+		IdentityFingerprintChangedAt: pgTimePtr(h.IdentityFingerprintChangedAt),
+		IdentityConflictAt:           pgTimePtr(h.IdentityConflictAt),
+		EnrolmentMachineID:           h.EnrolmentMachineID,
 	}
 }
 

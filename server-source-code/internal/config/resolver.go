@@ -3,6 +3,7 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -41,6 +42,7 @@ type ResolvedConfig struct {
 	JSONBodyLimitBytes          int64
 	AgentUpdateBodyLimitBytes   int64
 	AgentPingBodyLimitBytes     int64
+	ComplianceBodyLimitBytes    int64
 	Timezone                    string
 	DefaultUserRole             string
 	SessionInactivityTimeoutMin int
@@ -85,10 +87,10 @@ func ResolveConfig(ctx context.Context, cfg *Config, settings *models.Settings) 
 	out.PasswordRequireSpecial = resolveBool("PASSWORD_REQUIRE_SPECIAL", settings.PasswordRequireSpecial, cfg.PasswordRequireSpecial)
 	out.JSONBodyLimitBytes = resolveBodyLimit("JSON_BODY_LIMIT", settings.JSONBodyLimit, cfg.JSONBodyLimitBytes)
 	out.AgentUpdateBodyLimitBytes = resolveBodyLimit("AGENT_UPDATE_BODY_LIMIT", settings.AgentUpdateBodyLimit, cfg.AgentUpdateBodyLimitBytes)
-	// Agent ping body limit is env / default only — there is no DB-settings
-	// row for it yet. Default 8 KiB. Operators with extremely chatty pings
-	// (custom integrations) can raise via env.
-	out.AgentPingBodyLimitBytes = cfg.AgentPingBodyLimitBytes
+	out.ComplianceBodyLimitBytes = resolveBodyLimit("COMPLIANCE_BODY_LIMIT", settings.ComplianceBodyLimit, cfg.ComplianceBodyLimitBytes)
+	// Unsuffixed values mean KiB here, matching AGENT_PING_BODY_LIMIT's env
+	// parsing. Sharing resolveBodyLimit would read a bare "8" as 8 MiB.
+	out.AgentPingBodyLimitBytes = resolveBodyLimitKB("AGENT_PING_BODY_LIMIT", settings.AgentPingBodyLimit, cfg.AgentPingBodyLimitBytes)
 	out.Timezone = resolveTimezone(settings.Timezone, cfg.Timezone)
 	out.DefaultUserRole = resolveString("DEFAULT_USER_ROLE", strPtr(settings.DefaultUserRole), cfg.DefaultUserRole)
 	out.SessionInactivityTimeoutMin = resolveInt("SESSION_INACTIVITY_TIMEOUT_MINUTES", settings.SessionInactivityTimeoutMinutes, cfg.SessionInactivityTimeoutMin)
@@ -135,6 +137,7 @@ func resolveFromEnvAndDefaults(cfg *Config) *ResolvedConfig {
 		JSONBodyLimitBytes:          cfg.JSONBodyLimitBytes,
 		AgentUpdateBodyLimitBytes:   cfg.AgentUpdateBodyLimitBytes,
 		AgentPingBodyLimitBytes:     cfg.AgentPingBodyLimitBytes,
+		ComplianceBodyLimitBytes:    cfg.ComplianceBodyLimitBytes,
 		Timezone:                    validateTimezone(cfg.Timezone),
 		DefaultUserRole:             cfg.DefaultUserRole,
 		SessionInactivityTimeoutMin: cfg.SessionInactivityTimeoutMin,
@@ -236,10 +239,84 @@ func parseBodyLimit(s string, fallback int64) int64 {
 	}
 	s = strings.TrimSpace(s)
 	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || v < 1 {
+	if err != nil {
 		return fallback
 	}
+	return scaleBodyLimit(v, mult, fallback)
+}
+
+// Without this bound a value large enough to overflow int64 wraps negative,
+// and BodyLimitFor reads a non-positive limit as "no limit at all".
+const maxBodyLimitBytes int64 = 32 * 1024 * 1024
+
+// Over-range values clamp rather than fall back: the settings UI used to offer
+// 50mb, so falling back would drop those installs to the default on upgrade.
+func scaleBodyLimit(v, mult, fallback int64) int64 {
+	if v < 1 {
+		return fallback
+	}
+	if v > maxBodyLimitBytes/mult {
+		return maxBodyLimitBytes
+	}
 	return v * mult
+}
+
+// IsBodyLimitKey reports whether key is one of the four request body size settings.
+func IsBodyLimitKey(key string) bool {
+	switch key {
+	case "JSON_BODY_LIMIT", "AGENT_UPDATE_BODY_LIMIT", "COMPLIANCE_BODY_LIMIT", "AGENT_PING_BODY_LIMIT":
+		return true
+	}
+	return false
+}
+
+// ValidateBodyLimit rejects a value the resolver would discard in favour of the
+// default. Values above the ceiling are accepted and clamped, as the resolver does.
+func ValidateBodyLimit(key, value string) error {
+	parse, bareUnit := parseBodyLimit, "MB"
+	if key == "AGENT_PING_BODY_LIMIT" {
+		parse, bareUnit = parseBodyLimitKB, "KB"
+	}
+	if parse(value, -1) < 1 {
+		return fmt.Errorf("%s must be a positive size such as 512kb or 5mb (a bare number means %s); values above 32mb are reduced to 32mb", key, bareUnit)
+	}
+	return nil
+}
+
+func resolveBodyLimitKB(envKey string, dbVal *string, defaultBytes int64) int64 {
+	if v := os.Getenv(envKey); v != "" {
+		return parseBodyLimitKB(strings.TrimSpace(v), defaultBytes)
+	}
+	if dbVal != nil && *dbVal != "" {
+		return parseBodyLimitKB(*dbVal, defaultBytes)
+	}
+	return defaultBytes
+}
+
+func parseBodyLimitKB(s string, fallback int64) int64 {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return fallback
+	}
+	var mult int64 = 1024
+	if strings.HasSuffix(s, "kb") {
+		s = strings.TrimSuffix(s, "kb")
+	} else if strings.HasSuffix(s, "mb") {
+		mult = 1024 * 1024
+		s = strings.TrimSuffix(s, "mb")
+	} else if strings.HasSuffix(s, "gb") {
+		mult = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "gb")
+	} else if strings.HasSuffix(s, "b") {
+		mult = 1
+		s = strings.TrimSuffix(s, "b")
+	}
+	s = strings.TrimSpace(s)
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return scaleBodyLimit(v, mult, fallback)
 }
 
 func strPtr(s string) *string {

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"time"
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/agentregistry"
 	hostctx "github.com/PatchMon/PatchMon/server-source-code/internal/context"
@@ -17,6 +19,7 @@ import (
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/hibiken/asynq"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -106,13 +109,14 @@ func (h *HostsHandler) AdminList(w http.ResponseWriter, r *http.Request) {
 	groupsByHost, _ := h.hosts.GetHostGroupsForHosts(r.Context(), hostIDs)
 
 	// Enrich with host groups
+	staleCutoff := h.hosts.StaleCutoff(r.Context())
 	data := make([]map[string]interface{}, len(hosts))
 	for i, host := range hosts {
 		groups := groupsByHost[host.ID]
 		if groups == nil {
 			groups = []models.HostGroup{}
 		}
-		data[i] = hostToResponse(&host, groups)
+		data[i] = hostToResponse(&host, groups, staleCutoff)
 	}
 
 	totalPages := 1
@@ -143,7 +147,20 @@ func (h *HostsHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	groups, _ := h.hosts.GetHostGroups(r.Context(), host.ID)
-	JSON(w, http.StatusOK, hostToResponse(host, groups))
+	JSON(w, http.StatusOK, hostToResponse(host, groups, h.hosts.StaleCutoff(r.Context())))
+}
+
+func newPendingHost(friendlyName, machineID, apiID, apiKeyHash string) *models.Host {
+	return &models.Host{
+		MachineID:    &machineID,
+		FriendlyName: friendlyName,
+		OSType:       "unknown",
+		OSVersion:    "unknown",
+		Status:       "pending",
+		ApiID:        apiID,
+		ApiKey:       apiKeyHash,
+		AutoUpdate:   true,
+	}
 }
 
 // Create handles POST /hosts/create.
@@ -191,19 +208,11 @@ func (h *HostsHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	machineID := "pending-" + uuid.New().String()
-	host := &models.Host{
-		MachineID:              &machineID,
-		FriendlyName:           req.FriendlyName,
-		OSType:                 "unknown",
-		OSVersion:              "unknown",
-		Status:                 "pending",
-		ApiID:                  apiID,
-		ApiKey:                 apiKeyHash,
-		DockerEnabled:          req.DockerEnabled != nil && *req.DockerEnabled,
-		ComplianceEnabled:      complianceEnabled,
-		ComplianceOnDemandOnly: complianceOnDemandOnly,
-		ExpectedPlatform:       req.ExpectedPlatform,
-	}
+	host := newPendingHost(req.FriendlyName, machineID, apiID, apiKeyHash)
+	host.DockerEnabled = req.DockerEnabled != nil && *req.DockerEnabled
+	host.ComplianceEnabled = complianceEnabled
+	host.ComplianceOnDemandOnly = complianceOnDemandOnly
+	host.ExpectedPlatform = req.ExpectedPlatform
 	if err := h.hosts.Create(r.Context(), host); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to create host")
 		return
@@ -286,8 +295,27 @@ func (h *HostsHandler) UpdateGroups(w http.ResponseWriter, r *http.Request) {
 	groups, _ := h.hosts.GetHostGroups(r.Context(), hostID)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Host groups updated successfully",
-		"host":    hostToResponse(host, groups),
+		"host":    hostToResponse(host, groups, h.hosts.StaleCutoff(r.Context())),
 	})
+}
+
+// GetByID returns (nil, nil) for "no such row", and the updates are :exec, so
+// an unknown id otherwise means a no-op write then a nil dereference.
+func (h *HostsHandler) requireHost(w http.ResponseWriter, r *http.Request, hostID string) (*models.Host, bool) {
+	host, err := h.hosts.GetByID(r.Context(), hostID)
+	if err != nil || host == nil {
+		Error(w, http.StatusNotFound, "Host not found")
+		return nil, false
+	}
+	return host, true
+}
+
+// Never returns nil; falls back to the pre-write row.
+func (h *HostsHandler) reloadHost(r *http.Request, hostID string, fallback *models.Host) *models.Host {
+	if updated, err := h.hosts.GetByID(r.Context(), hostID); err == nil && updated != nil {
+		return updated
+	}
+	return fallback
 }
 
 // UpdateFriendlyName handles PATCH /hosts/:hostId/friendly-name.
@@ -305,15 +333,20 @@ func (h *HostsHandler) UpdateFriendlyName(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	existing, ok := h.requireHost(w, r, hostID)
+	if !ok {
+		return
+	}
+
 	if err := h.hosts.UpdateFriendlyName(r.Context(), hostID, req.FriendlyName); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to update friendly name")
 		return
 	}
-	host, _ := h.hosts.GetByID(r.Context(), hostID)
+	host := h.reloadHost(r, hostID, existing)
 	groups, _ := h.hosts.GetHostGroups(r.Context(), hostID)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Friendly name updated successfully",
-		"host":    hostToResponse(host, groups),
+		"host":    hostToResponse(host, groups, h.hosts.StaleCutoff(r.Context())),
 	})
 }
 
@@ -328,15 +361,20 @@ func (h *HostsHandler) UpdateNotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	existing, ok := h.requireHost(w, r, hostID)
+	if !ok {
+		return
+	}
+
 	if err := h.hosts.UpdateNotes(r.Context(), hostID, req.Notes); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to update notes")
 		return
 	}
-	host, _ := h.hosts.GetByID(r.Context(), hostID)
+	host := h.reloadHost(r, hostID, existing)
 	groups, _ := h.hosts.GetHostGroups(r.Context(), hostID)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Notes updated successfully",
-		"host":    hostToResponse(host, groups),
+		"host":    hostToResponse(host, groups, h.hosts.StaleCutoff(r.Context())),
 	})
 }
 
@@ -351,16 +389,25 @@ func (h *HostsHandler) UpdateConnection(w http.ResponseWriter, r *http.Request) 
 		Error(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if req.IP != nil && *req.IP != "" && net.ParseIP(*req.IP) == nil {
+		Error(w, http.StatusBadRequest, "Invalid IP address")
+		return
+	}
+
+	existing, ok := h.requireHost(w, r, hostID)
+	if !ok {
+		return
+	}
 
 	if err := h.hosts.UpdateConnection(r.Context(), hostID, req.IP, req.Hostname); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to update connection")
 		return
 	}
-	host, _ := h.hosts.GetByID(r.Context(), hostID)
+	host := h.reloadHost(r, hostID, existing)
 	groups, _ := h.hosts.GetHostGroups(r.Context(), hostID)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Host connection information updated successfully",
-		"host":    hostToResponse(host, groups),
+		"host":    hostToResponse(host, groups, h.hosts.StaleCutoff(r.Context())),
 	})
 }
 
@@ -398,7 +445,7 @@ func (h *HostsHandler) SetPrimaryInterface(w http.ResponseWriter, r *http.Reques
 	groups, _ := h.hosts.GetHostGroups(r.Context(), hostID)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Primary interface updated successfully",
-		"host":    hostToResponse(host, groups),
+		"host":    hostToResponse(host, groups, h.hosts.StaleCutoff(r.Context())),
 	})
 }
 
@@ -447,11 +494,16 @@ func (h *HostsHandler) UpdateAutoUpdate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	existing, ok := h.requireHost(w, r, hostID)
+	if !ok {
+		return
+	}
+
 	if err := h.hosts.UpdateAutoUpdate(r.Context(), hostID, req.AutoUpdate); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to update auto-update")
 		return
 	}
-	host, _ := h.hosts.GetByID(r.Context(), hostID)
+	host := h.reloadHost(r, hostID, existing)
 	JSON(w, http.StatusOK, map[string]interface{}{
 		"message": "Agent auto-update " + map[bool]string{true: "enabled", false: "disabled"}[req.AutoUpdate] + " successfully",
 		"host":    map[string]interface{}{"id": host.ID, "friendlyName": host.FriendlyName, "autoUpdate": req.AutoUpdate},
@@ -489,6 +541,21 @@ func (h *HostsHandler) RegenerateCredentials(w http.ResponseWriter, r *http.Requ
 		"apiKey":   apiKey,
 		"warning":  "Previous credentials are now invalid. Update your agent configuration.",
 	})
+}
+
+// DismissIdentityConflict handles POST /hosts/:hostId/identity-conflict/dismiss.
+func (h *HostsHandler) DismissIdentityConflict(w http.ResponseWriter, r *http.Request) {
+	hostID := chi.URLParam(r, "hostId")
+	found, err := h.hosts.DismissIdentityConflict(r.Context(), hostID)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "Failed to dismiss identity conflict")
+		return
+	}
+	if !found {
+		Error(w, http.StatusNotFound, "Host not found")
+		return
+	}
+	JSON(w, http.StatusOK, map[string]interface{}{"message": "Identity conflict dismissed", "host_id": hostID})
 }
 
 // FetchReport handles POST /hosts/:hostId/fetch-report.
@@ -632,16 +699,51 @@ func (h *HostsHandler) RefreshDocker(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// DockerImageCheck handles POST /hosts/:hostId/docker-image-check.
+func (h *HostsHandler) DockerImageCheck(w http.ResponseWriter, r *http.Request) {
+	hostID := chi.URLParam(r, "hostId")
+	host, err := h.hosts.GetByID(r.Context(), hostID)
+	if err != nil || host == nil {
+		Error(w, http.StatusNotFound, "Host not found")
+		return
+	}
+	if h.registry == nil || !h.registry.IsConnected(host.ApiID) || h.registry.Get(host.ApiID).Scope != hostctx.TenantHostKey(r.Context()) {
+		Error(w, http.StatusConflict, "Agent is not connected, so the image update check cannot be started")
+		return
+	}
+	if err := h.registry.SendMessage(host.ApiID, websocket.TextMessage, dockerImageCheckCommand); err != nil {
+		slog.Warn("docker image check: send failed", "host_id", host.ID, "error", err)
+		Error(w, http.StatusServiceUnavailable, "Failed to send the image update check to the agent")
+		return
+	}
+	JSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "Docker image update check requested",
+		"host": map[string]interface{}{
+			"id":           host.ID,
+			"friendlyName": host.FriendlyName,
+			"apiId":        host.ApiID,
+		},
+	})
+}
+
 // ForceAgentUpdate handles POST /hosts/:hostId/force-agent-update.
 func (h *HostsHandler) ForceAgentUpdate(w http.ResponseWriter, r *http.Request) {
 	if h.queueClient == nil {
 		Error(w, http.StatusServiceUnavailable, "Queue service unavailable")
 		return
 	}
-	hostID := chi.URLParam(r, "hostId")
-	host, err := h.hosts.GetByID(r.Context(), hostID)
-	if err != nil || host == nil {
-		Error(w, http.StatusNotFound, "Host not found")
+	host, ok := loadHost(w, r, h.hosts, chi.URLParam(r, "hostId"))
+	if !ok {
+		return
+	}
+	active, err := h.hosts.HasActivePatchRun(r.Context(), host.ID)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "Failed to check for an active patch run")
+		return
+	}
+	if active {
+		Error(w, http.StatusConflict, store.PatchRunInProgressMessage)
 		return
 	}
 	task, err := queue.NewUpdateAgentTask(host.ApiID, hostFromRequest(r), true) // bypass_settings=true for force update
@@ -722,10 +824,11 @@ func (h *HostsHandler) BulkDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify all exist
+	// The nil check is what enforces this: GetByID returns (nil, nil) for
+	// "no such row".
 	for _, id := range req.HostIds {
-		_, err := h.hosts.GetByID(r.Context(), id)
-		if err != nil {
+		existing, err := h.hosts.GetByID(r.Context(), id)
+		if err != nil || existing == nil {
 			Error(w, http.StatusNotFound, "Some hosts not found")
 			return
 		}
@@ -783,13 +886,14 @@ func (h *HostsHandler) BulkUpdateGroups(w http.ResponseWriter, r *http.Request) 
 	for i := range hostsList {
 		hostByID[hostsList[i].ID] = &hostsList[i]
 	}
+	staleCutoff := h.hosts.StaleCutoff(r.Context())
 	for i, hid := range req.HostIds {
 		if host := hostByID[hid]; host != nil {
 			groups := groupsByHost[hid]
 			if groups == nil {
 				groups = []models.HostGroup{}
 			}
-			hosts[i] = hostToResponse(host, groups)
+			hosts[i] = hostToResponse(host, groups, staleCutoff)
 		}
 	}
 
@@ -1028,8 +1132,11 @@ func (h *HostsHandler) SetComplianceScanners(w http.ResponseWriter, r *http.Requ
 		Error(w, http.StatusBadRequest, "At least one of openscap_enabled or docker_bench_enabled must be provided")
 		return
 	}
-	_, err := h.hosts.GetByID(r.Context(), hostID)
-	if err != nil {
+	// GetByID returns (nil, nil) for "no such row", so the nil check is what
+	// actually makes this a 404; testing err alone let an unknown id fall
+	// through to a no-op update reported as success.
+	existing, err := h.hosts.GetByID(r.Context(), hostID)
+	if err != nil || existing == nil {
 		Error(w, http.StatusNotFound, "Host not found")
 		return
 	}
@@ -1068,8 +1175,11 @@ func (h *HostsHandler) SetComplianceDefaultProfile(w http.ResponseWriter, r *htt
 		Error(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	_, err := h.hosts.GetByID(r.Context(), hostID)
-	if err != nil {
+	// GetByID returns (nil, nil) for "no such row", so the nil check is what
+	// actually makes this a 404; testing err alone let an unknown id fall
+	// through to a no-op update reported as success.
+	existing, err := h.hosts.GetByID(r.Context(), hostID)
+	if err != nil || existing == nil {
 		Error(w, http.StatusNotFound, "Host not found")
 		return
 	}
@@ -1240,22 +1350,81 @@ func (h *HostsHandler) ApplyPendingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	installQueued := false
+	if openscapNewlyEnabled(host, complianceEnabled, openscapEnabled) && openscapInstallSupported(host) {
+		installQueued = h.queueScannerInstall(r, host)
+	}
+
 	JSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"message": "Configuration applied successfully",
+		"success":              true,
+		"message":              "Configuration applied successfully",
+		"scannerInstallQueued": installQueued,
 	})
 }
 
-func hostToResponse(h *models.Host, groups []models.HostGroup) map[string]interface{} {
+// The agent restarts after apply_config; the install command must reach it once it has reconnected.
+const scannerInstallDelay = 30 * time.Second
+
+func openscapNewlyEnabled(before *models.Host, complianceEnabled, openscapEnabled bool) bool {
+	return complianceEnabled && openscapEnabled &&
+		(!before.ComplianceEnabled || !before.ComplianceOpenscapEnabled)
+}
+
+// openscapInstallSupported skips platforms the agent cannot install OpenSCAP on.
+// Agents older than zypper support report "unknown" on SUSE, so this must stay a deny-list.
+func openscapInstallSupported(host *models.Host) bool {
+	if host.PackageManager == nil {
+		return true
+	}
+	switch *host.PackageManager {
+	case "windows", "pkg", "apk", "pacman":
+		return false
+	}
+	return true
+}
+
+func (h *HostsHandler) queueScannerInstall(r *http.Request, host *models.Host) bool {
+	if h.queueClient == nil {
+		return false
+	}
+	task, err := queue.NewInstallComplianceToolsTask(host.ID, host.ApiID, hostFromRequest(r))
+	if err != nil {
+		slog.Error("apply-pending-config: failed to build scanner install task", "host_id", host.ID, "error", err)
+		return false
+	}
+	if h.integrationStatus != nil {
+		_ = h.integrationStatus.ClearInstallEvents(r.Context(), host.ApiID, "compliance")
+	}
+	info, err := h.queueClient.Enqueue(task, asynq.ProcessIn(scannerInstallDelay))
+	if err != nil {
+		slog.Error("apply-pending-config: failed to queue scanner install", "host_id", host.ID, "error", err)
+		return false
+	}
+	if h.integrationStatus != nil {
+		_ = h.integrationStatus.SetComplianceInstallJob(r.Context(), host.ID, info.ID)
+	}
+	slog.Info("apply-pending-config: queued scanner install", "host_id", host.ID, "job_id", info.ID)
+	return true
+}
+
+func hostToResponse(h *models.Host, groups []models.HostGroup, staleCutoff time.Time) map[string]interface{} {
 	res := map[string]interface{}{
 		"id": h.ID, "friendly_name": h.FriendlyName, "hostname": h.Hostname, "ip": h.IP,
 		"os_type": h.OSType, "os_version": h.OSVersion, "architecture": h.Architecture,
-		"last_update": h.LastUpdate, "status": h.Status, "api_id": h.ApiID, "agent_version": h.AgentVersion,
+		"last_update": h.LastUpdate, "status": h.Status,
+		"effective_status": store.EffectiveStatus(h.Status, h.LastUpdate, staleCutoff),
+		"api_id":           h.ApiID, "agent_version": h.AgentVersion,
 		"auto_update": h.AutoUpdate, "created_at": h.CreatedAt, "notes": h.Notes,
 		"system_uptime": h.SystemUptime, "boot_time": h.BootTime, "needs_reboot": h.NeedsReboot,
 		"docker_enabled": h.DockerEnabled, "compliance_enabled": h.ComplianceEnabled,
 		"package_manager": h.PackageManager, "primary_interface": h.PrimaryInterface,
 		"awaiting_post_patch_report_run_id": h.AwaitingPostPatchReportRunID,
+		"expected_platform":                 h.ExpectedPlatform,
+		"config_version":                    h.ConfigVersion,
+		"reported_host_id":                  h.ReportedHostID,
+		"host_id_mismatch":                  h.HostIDMismatch(),
+		"identity_conflict_at":              h.IdentityConflictAt,
+		"credentials_reissued_at":           h.CredentialsReissuedAt,
 	}
 	hg := make([]map[string]interface{}, len(groups))
 	for i, g := range groups {

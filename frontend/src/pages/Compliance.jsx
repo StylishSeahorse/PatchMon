@@ -39,17 +39,23 @@ import ScanHistoryTab from "../components/compliance/ScanHistoryTab";
 import ScanResultsTab from "../components/compliance/ScanResultsTab";
 import {
 	ComplianceProfilesPie,
-	ComplianceTrendLinePlaceholder,
 	FailuresBySeverityDoughnut,
 	HostComplianceStatusBar,
 	LastScanAgeBar,
 	OpenSCAPDistributionDoughnut,
 } from "../components/compliance/widgets";
 import { getDoughnutOptions } from "../components/compliance/widgets/chartOptions";
+import ModalPortal from "../components/ui/ModalPortal";
 import { useTheme } from "../contexts/ThemeContext";
 import { useToast } from "../contexts/ToastContext";
-import { adminHostsAPI } from "../utils/api";
+import { useTabParam } from "../hooks/useTabParam";
+import { adminHostsAPI, settingsAPI } from "../utils/api";
 import { complianceAPI } from "../utils/complianceApi";
+import { hostComplianceStatus } from "../utils/complianceStatus";
+import {
+	deriveReportingStateByTime,
+	hasNeverReported,
+} from "../utils/hostStatus";
 
 // Custom tooltip component for consistent styling across all charts
 const CustomTooltip = ({ active, payload, label, type }) => {
@@ -121,7 +127,7 @@ const Compliance = () => {
 	const { isDark } = useTheme();
 	const toast = useToast();
 	const location = useLocation();
-	const [searchParams] = useSearchParams();
+	const [searchParams, setSearchParams] = useSearchParams();
 	const [activeTab, setActiveTab] = useState(() => {
 		const urlTab = searchParams.get("tab");
 		if (urlTab && COMPLIANCE_TABS.some((t) => t.id === urlTab)) return urlTab;
@@ -132,30 +138,45 @@ const Compliance = () => {
 	});
 
 	const [scanResultsFilters, setScanResultsFilters] = useState(null);
+	useTabParam(activeTab);
 
-	// Sync tab and filters on actual URL navigation (not in-page tab clicks)
+	const urlTab = searchParams.get("tab");
 	useEffect(() => {
-		const params = new URLSearchParams(location.search);
-		const tab = params.get("tab");
-		if (tab && COMPLIANCE_TABS.some((t) => t.id === tab)) {
-			setActiveTab(tab);
+		if (urlTab && COMPLIANCE_TABS.some((t) => t.id === urlTab)) {
+			setActiveTab(urlTab);
 		}
-		const profileType = params.get("profile_type");
-		if (profileType && ["openscap", "docker-bench"].includes(profileType)) {
-			setProfileTypeFilter(profileType);
+	}, [urlTab]);
+
+	const urlProfileType = searchParams.get("profile_type");
+	useEffect(() => {
+		if (
+			urlProfileType &&
+			["openscap", "docker-bench"].includes(urlProfileType)
+		) {
+			setProfileTypeFilter(urlProfileType);
 		}
-	}, [location.search]);
+	}, [urlProfileType]);
 
 	// Handle tab navigation and filters from external links (e.g. host compliance cards)
+	const requestedTab = location.state?.complianceTab;
+	const requestedFilters = location.state?.scanResultsFilters;
 	useEffect(() => {
-		const requested = location.state?.complianceTab;
-		if (requested && COMPLIANCE_TABS.some((t) => t.id === requested)) {
-			setActiveTab(requested);
+		if (requestedTab && COMPLIANCE_TABS.some((t) => t.id === requestedTab)) {
+			setActiveTab(requestedTab);
+			// Must also write the URL, or useTabParam's write of the previous tab wins and the two loop.
+			setSearchParams(
+				(prev) => {
+					const next = new URLSearchParams(prev);
+					next.set("tab", requestedTab);
+					return next;
+				},
+				{ replace: true },
+			);
 		}
-		if (location.state?.scanResultsFilters) {
-			setScanResultsFilters(location.state.scanResultsFilters);
+		if (requestedFilters) {
+			setScanResultsFilters(requestedFilters);
 		}
-	}, [location.state?.complianceTab, location.state?.scanResultsFilters]);
+	}, [requestedTab, requestedFilters, setSearchParams]);
 	const [showBulkScanModal, setShowBulkScanModal] = useState(false);
 	const [selectedHosts, setSelectedHosts] = useState([]);
 	const [bulkScanOptions, setBulkScanOptions] = useState({
@@ -164,7 +185,8 @@ const Compliance = () => {
 	});
 	const [bulkScanResult, setBulkScanResult] = useState(null);
 	const [pendingScans, setPendingScans] = useState([]); // Hosts where scan was triggered but not yet in database
-	const prevActiveScanIds = useRef(new Set());
+	const prevActiveScanIds = useRef(new Map());
+	const cancelledHostIds = useRef(new Set());
 	const [profileTypeFilter, setProfileTypeFilter] = useState(() => {
 		const urlProfileType = searchParams.get("profile_type");
 		if (urlProfileType && ["openscap", "docker-bench"].includes(urlProfileType))
@@ -205,26 +227,43 @@ const Compliance = () => {
 		select: (data) => ({ hosts: data.data || [] }),
 	});
 
+	// update_interval drives the host picker's reporting dot, the same ×2
+	// boundary the Hosts table and HostStatusPills use.
+	const { data: complianceSettings } = useQuery({
+		queryKey: ["settings", "public"],
+		queryFn: () => settingsAPI.getPublic().then((res) => res.data),
+		staleTime: 5 * 60 * 1000,
+	});
+	const updateIntervalMinutes = (() => {
+		const parsed = Number.parseInt(complianceSettings?.update_interval, 10);
+		return Number.isFinite(parsed) && parsed > 0 ? parsed : 60;
+	})();
+
 	// Track active scans and notify when they complete
 	useEffect(() => {
 		const activeScans = activeScansData?.activeScans || [];
-		const currentIds = new Set(activeScans.map((s) => s.id));
+		const current = new Map(activeScans.map((s) => [s.id, s.hostId]));
 		const activeHostIds = new Set(activeScans.map((s) => s.hostId));
 
-		// Find scans that were active before but are now gone (completed)
-		for (const prevId of prevActiveScanIds.current) {
-			if (!currentIds.has(prevId)) {
-				// A scan completed - refresh dashboard data
-				queryClient.invalidateQueries(["compliance-dashboard"]);
-				toast.success("Compliance scan completed");
-				break; // Only show one notification per batch
-			}
+		let finished = false;
+		let completed = false;
+		for (const [prevId, prevHostId] of prevActiveScanIds.current) {
+			if (current.has(prevId)) continue;
+			finished = true;
+			if (!cancelledHostIds.current.has(prevHostId)) completed = true;
+		}
+		if (finished) {
+			queryClient.invalidateQueries({ queryKey: ["compliance-dashboard"] });
+			if (completed) toast.success("Compliance scan completed");
+		}
+		for (const hostId of cancelledHostIds.current) {
+			if (!activeHostIds.has(hostId)) cancelledHostIds.current.delete(hostId);
 		}
 
 		// Remove pending scans that now appear as real active scans
 		setPendingScans((prev) => prev.filter((p) => !activeHostIds.has(p.hostId)));
 
-		prevActiveScanIds.current = currentIds;
+		prevActiveScanIds.current = current;
 	}, [activeScansData, queryClient, toast]);
 
 	// Check if pending scans have completed (scan records appear in dashboard)
@@ -283,10 +322,13 @@ const Compliance = () => {
 			complianceAPI.triggerBulkScan(data.hostIds, data.options),
 		onSuccess: (response) => {
 			setBulkScanResult(response.data);
-			queryClient.invalidateQueries(["compliance-active-scans"]);
+			queryClient.invalidateQueries({ queryKey: ["compliance-active-scans"] });
 			const { success, failed } = response.data.summary || {};
 
 			// Track triggered hosts as pending scans for immediate UI feedback
+			for (const t of response.data.triggered || []) {
+				cancelledHostIds.current.delete(t.hostId);
+			}
 			if (response.data.triggered?.length > 0) {
 				const newPending = response.data.triggered.map((t) => ({
 					id: `pending-${t.hostId}`,
@@ -323,7 +365,8 @@ const Compliance = () => {
 		mutationFn: ({ hostId }) =>
 			complianceAPI.triggerScan(hostId, { profile_type: "all" }),
 		onSuccess: (_, { hostId, hostName }) => {
-			queryClient.invalidateQueries(["compliance-active-scans"]);
+			cancelledHostIds.current.delete(hostId);
+			queryClient.invalidateQueries({ queryKey: ["compliance-active-scans"] });
 			setPendingScans((prev) => [
 				...prev,
 				{
@@ -346,9 +389,24 @@ const Compliance = () => {
 
 	const cancelScanMutation = useMutation({
 		mutationFn: ({ hostId }) => complianceAPI.cancelScan(hostId),
-		onSuccess: (_, { hostName }) => {
-			toast.success(`Cancel request sent for ${hostName || "host"}`);
-			queryClient.invalidateQueries(["compliance-active-scans"]);
+		onSuccess: (response, { hostId, hostName }) => {
+			if (response?.data?.agentNotified === false) {
+				toast.warning(
+					`Scan cancelled for ${hostName || "host"}, but the agent could not be reached and may still finish it`,
+				);
+			} else {
+				toast.success(`Scan cancelled for ${hostName || "host"}`);
+			}
+			const shownActive = [...prevActiveScanIds.current.values()].includes(
+				hostId,
+			);
+			if (response?.data?.scansCancelled > 0 || shownActive) {
+				cancelledHostIds.current.add(hostId);
+			}
+			setPendingScans((prev) => prev.filter((p) => p.hostId !== hostId));
+			queryClient.invalidateQueries({ queryKey: ["compliance-active-scans"] });
+			queryClient.invalidateQueries({ queryKey: ["compliance-dashboard"] });
+			queryClient.invalidateQueries({ queryKey: ["compliance-scan-history"] });
 		},
 		onError: (error, { hostName }) => {
 			const errorMsg = error.response?.data?.error || error.message;
@@ -390,10 +448,25 @@ const Compliance = () => {
 	} = dashboard || {};
 
 	const allHostsTableRows = hosts_with_latest_scan || [];
-	const hostsTableRows =
+	// Rows expose which scanners a host has enabled, not the profile type of its
+	// latest scan, so the filter matches on scanner enablement. Note
+	// docker_enabled is the Docker integration and is not the same thing as
+	// Docker Bench scanning.
+	const matchesProfileType = (row) => {
+		if (profileTypeFilter === "openscap")
+			return row.compliance_openscap_enabled;
+		if (profileTypeFilter === "docker-bench")
+			return row.compliance_docker_bench_enabled;
+		return true;
+	};
+	const hostsTableRows = (
 		tableFilter === "never-scanned"
 			? allHostsTableRows.filter((row) => row.last_scan_date == null)
-			: allHostsTableRows.filter((row) => row.compliance_enabled);
+			: allHostsTableRows.filter(
+					(row) =>
+						row.compliance_enabled || row.compliance_docker_bench_enabled,
+				)
+	).filter(matchesProfileType);
 
 	// Combine real active scans with pending scans for display
 	const realActiveScans = activeScansData?.activeScans || [];
@@ -436,7 +509,7 @@ const Compliance = () => {
 	const filteredScans =
 		recent_scans?.filter((scan) => {
 			if (profileTypeFilter === "all") return true;
-			return scan.compliance_profiles?.type === profileTypeFilter;
+			return scan.profile?.type === profileTypeFilter;
 		}) || [];
 
 	const _filteredWorstHosts =
@@ -462,6 +535,24 @@ const Compliance = () => {
 		if (profileTypeFilter === "openscap") return "OpenSCAP";
 		if (profileTypeFilter === "docker-bench") return "Docker Bench";
 		return "All Scans";
+	};
+
+	const clearProfileTypeFilter = () => {
+		setProfileTypeFilter("all");
+		const params = new URLSearchParams(searchParams);
+		params.delete("profile_type");
+		setSearchParams(params, { replace: true });
+	};
+
+	const openHostScanResults = (row, status) => {
+		const bothScanners =
+			row.compliance_openscap_enabled && row.compliance_docker_bench_enabled;
+		setScanResultsFilters({
+			status,
+			host_id: row.host_id,
+			profile_type: bothScanners ? row.score_scan_type || "" : "",
+		});
+		setActiveTab("scan-results");
 	};
 
 	const allHosts = hostsData?.hosts || [];
@@ -630,6 +721,21 @@ const Compliance = () => {
 								again to clear.
 							</p>
 						)}
+						{profileTypeFilter !== "all" && (
+							<div className="flex flex-wrap items-center gap-2 mb-4">
+								<p className="text-sm text-primary-600 dark:text-primary-400">
+									Showing hosts with {getFilterDisplayName()} scanning enabled.
+								</p>
+								<button
+									type="button"
+									onClick={clearProfileTypeFilter}
+									className="inline-flex items-center gap-1 min-h-[44px] px-2 text-sm font-medium text-primary-600 dark:text-primary-400 hover:text-primary-700 dark:hover:text-primary-300"
+								>
+									<X className="h-3.5 w-3.5" />
+									Clear filter
+								</button>
+							</div>
+						)}
 						<div className="overflow-x-auto">
 							<table className="min-w-full divide-y divide-secondary-200 dark:divide-secondary-600">
 								<thead className="bg-secondary-50 dark:bg-secondary-700">
@@ -756,14 +862,21 @@ const Compliance = () => {
 															{row.friendly_name || row.hostname || " -"}
 														</Link>
 													</td>
-													<td className="px-4 py-2 whitespace-nowrap">
+													<td
+														className="px-4 py-2 whitespace-nowrap"
+														title={
+															row.score != null
+																? `${{ compliant: "Compliant", warning: "Warning", critical: "Critical" }[hostComplianceStatus(row)]}${row.score_profile_name ? ` · ${row.score_profile_name}` : ""} (${Math.round(row.score)}%)`
+																: undefined
+														}
+													>
 														{row.score != null ? (
-															Number(row.score) >= 80 ? (
+															hostComplianceStatus(row) === "compliant" ? (
 																<ShieldCheck
 																	className="h-5 w-5 text-green-600 dark:text-green-400"
 																	title="Compliant"
 																/>
-															) : Number(row.score) >= 60 ? (
+															) : hostComplianceStatus(row) === "warning" ? (
 																<AlertTriangle
 																	className="h-5 w-5 text-yellow-600 dark:text-yellow-400"
 																	title="Warning"
@@ -814,13 +927,7 @@ const Compliance = () => {
 														{row.passed != null ? (
 															<button
 																type="button"
-																onClick={() => {
-																	setScanResultsFilters({
-																		status: "pass",
-																		host_id: row.host_id,
-																	});
-																	setActiveTab("scan-results");
-																}}
+																onClick={() => openHostScanResults(row, "pass")}
 																className="text-green-600 dark:text-green-400 hover:underline font-medium tabular-nums"
 																title="View passing rules for this host"
 															>
@@ -834,13 +941,7 @@ const Compliance = () => {
 														{row.failed != null ? (
 															<button
 																type="button"
-																onClick={() => {
-																	setScanResultsFilters({
-																		status: "fail",
-																		host_id: row.host_id,
-																	});
-																	setActiveTab("scan-results");
-																}}
+																onClick={() => openHostScanResults(row, "fail")}
 																className="text-red-600 dark:text-red-400 hover:underline font-medium tabular-nums"
 																title="View failing rules for this host"
 															>
@@ -854,13 +955,9 @@ const Compliance = () => {
 														{row.skipped != null ? (
 															<button
 																type="button"
-																onClick={() => {
-																	setScanResultsFilters({
-																		status: "skipped",
-																		host_id: row.host_id,
-																	});
-																	setActiveTab("scan-results");
-																}}
+																onClick={() =>
+																	openHostScanResults(row, "skipped")
+																}
 																className="text-secondary-600 dark:text-white hover:underline font-medium tabular-nums"
 																title="View skipped/N/A rules for this host"
 															>
@@ -924,185 +1021,219 @@ const Compliance = () => {
 
 			{/* Bulk Scan Modal */}
 			{showBulkScanModal && (
-				<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-					<div className="bg-secondary-800 rounded-lg border border-secondary-700 w-full max-w-2xl max-h-[80vh] overflow-hidden">
-						{/* Modal Header */}
-						<div className="flex items-center justify-between p-4 border-b border-secondary-700">
-							<h2 className="text-lg font-semibold text-white">
-								Bulk Compliance Scan
-							</h2>
-							<button
-								onClick={() => {
-									setShowBulkScanModal(false);
-									setBulkScanResult(null);
-								}}
-								className="text-white hover:text-white"
-							>
-								<X className="h-5 w-5" />
-							</button>
-						</div>
-
-						{/* Modal Body */}
-						<div className="p-4 space-y-4 max-h-[60vh] overflow-y-auto">
-							{/* Scan Options */}
-							<div className="space-y-3">
-								<h3 className="text-sm font-medium text-white">Scan Options</h3>
-								<div className="flex flex-wrap gap-4">
-									<div className="flex-1 min-w-[200px]">
-										<label className="block text-xs text-white mb-1">
-											Profile Type
-										</label>
-										<select
-											value={bulkScanOptions.profileType}
-											onChange={(e) =>
-												setBulkScanOptions((prev) => ({
-													...prev,
-													profileType: e.target.value,
-												}))
-											}
-											className="w-full px-3 py-2 bg-secondary-700 border border-secondary-600 rounded-lg text-white text-sm"
-										>
-											<option value="all">All Profiles</option>
-											<option value="openscap">OpenSCAP Only</option>
-											<option value="docker-bench">Docker Bench Only</option>
-										</select>
-									</div>
-									<div className="flex items-center gap-2">
-										<input
-											type="checkbox"
-											id="enableRemediation"
-											checked={bulkScanOptions.enableRemediation}
-											onChange={(e) =>
-												setBulkScanOptions((prev) => ({
-													...prev,
-													enableRemediation: e.target.checked,
-												}))
-											}
-											className="w-4 h-4 rounded bg-secondary-700 border-secondary-600"
-										/>
-										<label
-											htmlFor="enableRemediation"
-											className="text-sm text-white"
-										>
-											Enable Remediation
-										</label>
-									</div>
-								</div>
+				<ModalPortal>
+					<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[120]">
+						<div className="bg-secondary-800 rounded-lg border border-secondary-700 w-full max-w-2xl max-h-[80vh] overflow-hidden">
+							{/* Modal Header */}
+							<div className="flex items-center justify-between p-4 border-b border-secondary-700">
+								<h2 className="text-lg font-semibold text-white">
+									Bulk Compliance Scan
+								</h2>
+								<button
+									onClick={() => {
+										setShowBulkScanModal(false);
+										setBulkScanResult(null);
+									}}
+									className="text-white hover:text-white"
+								>
+									<X className="h-5 w-5" />
+								</button>
 							</div>
 
-							{/* Host Selection */}
-							<div className="space-y-3">
-								<div className="flex items-center justify-between">
+							{/* Modal Body */}
+							<div className="p-4 space-y-4 max-h-[60vh] overflow-y-auto">
+								{/* Scan Options */}
+								<div className="space-y-3">
 									<h3 className="text-sm font-medium text-white">
-										Select Hosts ({selectedHosts.length} of {allHosts.length})
+										Scan Options
 									</h3>
-									<button
-										onClick={handleSelectAll}
-										className="text-xs text-primary-400 hover:text-primary-300"
-									>
-										{selectedHosts.length === allHosts.length
-											? "Deselect All"
-											: "Select All"}
-									</button>
-								</div>
-								<div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-[200px] overflow-y-auto">
-									{allHosts.map((host) => (
-										<label
-											key={host.id}
-											className={`flex items-center gap-3 p-2 rounded-lg cursor-pointer transition-colors ${
-												selectedHosts.includes(host.id)
-													? "bg-primary-900/30 border border-primary-700"
-													: "bg-secondary-700/50 border border-secondary-600 hover:border-secondary-500"
-											}`}
-										>
+									<div className="flex flex-wrap gap-4">
+										<div className="flex-1 min-w-[200px]">
+											<label className="block text-xs text-white mb-1">
+												Profile Type
+											</label>
+											<select
+												value={bulkScanOptions.profileType}
+												onChange={(e) =>
+													setBulkScanOptions((prev) => ({
+														...prev,
+														profileType: e.target.value,
+													}))
+												}
+												className="w-full px-3 py-2 bg-secondary-700 border border-secondary-600 rounded-lg text-white text-sm"
+											>
+												<option value="all">All Profiles</option>
+												<option value="openscap">OpenSCAP Only</option>
+												<option value="docker-bench">Docker Bench Only</option>
+											</select>
+										</div>
+										<div className="flex items-center gap-2">
 											<input
 												type="checkbox"
-												checked={selectedHosts.includes(host.id)}
-												onChange={() => handleToggleHost(host.id)}
+												id="enableRemediation"
+												checked={bulkScanOptions.enableRemediation}
+												onChange={(e) =>
+													setBulkScanOptions((prev) => ({
+														...prev,
+														enableRemediation: e.target.checked,
+													}))
+												}
 												className="w-4 h-4 rounded bg-secondary-700 border-secondary-600"
 											/>
-											<div className="flex-1 min-w-0">
-												<p className="text-sm font-medium text-white truncate">
-													{host.friendly_name || host.hostname}
-												</p>
-												<p className="text-xs text-white truncate">
-													{host.hostname}
-												</p>
-											</div>
-											<div
-												className={`w-2 h-2 rounded-full ${host.status === "online" ? "bg-green-500" : "bg-red-500"}`}
-											/>
-										</label>
-									))}
+											<label
+												htmlFor="enableRemediation"
+												className="text-sm text-white"
+											>
+												Enable Remediation
+											</label>
+										</div>
+									</div>
 								</div>
+
+								{/* Host Selection */}
+								<div className="space-y-3">
+									<div className="flex items-center justify-between">
+										<h3 className="text-sm font-medium text-white">
+											Select Hosts ({selectedHosts.length} of {allHosts.length})
+										</h3>
+										<button
+											onClick={handleSelectAll}
+											className="text-xs text-primary-400 hover:text-primary-300"
+										>
+											{selectedHosts.length === allHosts.length
+												? "Deselect All"
+												: "Select All"}
+										</button>
+									</div>
+									<div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-[200px] overflow-y-auto">
+										{allHosts.map((host) => {
+											const reportingState = hasNeverReported(host)
+												? "awaiting"
+												: deriveReportingStateByTime(
+														host.last_update,
+														updateIntervalMinutes,
+													);
+											const dotVariant =
+												reportingState === "awaiting"
+													? {
+															className: "bg-secondary-400",
+															label: "Awaiting first report",
+														}
+													: reportingState === "reporting"
+														? {
+																className: "bg-success-500",
+																label: "Reporting",
+															}
+														: reportingState === "overdue"
+															? {
+																	className: "bg-warning-500",
+																	label: "Overdue",
+																}
+															: {
+																	className: "bg-danger-500",
+																	label: "Not reporting",
+																};
+											return (
+												<label
+													key={host.id}
+													className={`flex items-center gap-3 p-2 rounded-lg cursor-pointer transition-colors ${
+														selectedHosts.includes(host.id)
+															? "bg-primary-900/30 border border-primary-700"
+															: "bg-secondary-700/50 border border-secondary-600 hover:border-secondary-500"
+													}`}
+												>
+													<input
+														type="checkbox"
+														checked={selectedHosts.includes(host.id)}
+														onChange={() => handleToggleHost(host.id)}
+														className="w-4 h-4 rounded bg-secondary-700 border-secondary-600"
+													/>
+													<div className="flex-1 min-w-0">
+														<p className="text-sm font-medium text-white truncate">
+															{host.friendly_name || host.hostname}
+														</p>
+														<p className="text-xs text-white truncate">
+															{host.hostname}
+														</p>
+													</div>
+													<div
+														className={`w-2 h-2 rounded-full flex-shrink-0 ${dotVariant.className}`}
+														title={dotVariant.label}
+													/>
+													<span className="sr-only">{dotVariant.label}</span>
+												</label>
+											);
+										})}
+									</div>
+								</div>
+
+								{/* Results */}
+								{bulkScanResult && (
+									<div
+										className={`p-3 rounded-lg ${bulkScanResult.summary?.failed > 0 ? "bg-yellow-900/30 border border-yellow-700" : "bg-green-900/30 border border-green-700"}`}
+									>
+										<p
+											className={`text-sm font-medium ${bulkScanResult.summary?.failed > 0 ? "text-yellow-300" : "text-green-300"}`}
+										>
+											{bulkScanResult.message}
+										</p>
+										{bulkScanResult.failed?.length > 0 && (
+											<div className="mt-2 text-xs text-yellow-400">
+												<p>Failed hosts:</p>
+												<ul className="list-disc list-inside">
+													{bulkScanResult.failed.map((f) => (
+														<li key={`failed-${f.hostName}`}>
+															{f.hostName}: {f.error}
+														</li>
+													))}
+												</ul>
+											</div>
+										)}
+									</div>
+								)}
 							</div>
 
-							{/* Results */}
-							{bulkScanResult && (
-								<div
-									className={`p-3 rounded-lg ${bulkScanResult.summary?.failed > 0 ? "bg-yellow-900/30 border border-yellow-700" : "bg-green-900/30 border border-green-700"}`}
+							{/* Modal Footer */}
+							<div className="flex items-center justify-end gap-3 p-4 border-t border-secondary-700">
+								<button
+									onClick={() => {
+										setShowBulkScanModal(false);
+										setBulkScanResult(null);
+									}}
+									className="px-4 py-2 text-white hover:text-white transition-colors"
 								>
-									<p
-										className={`text-sm font-medium ${bulkScanResult.summary?.failed > 0 ? "text-yellow-300" : "text-green-300"}`}
-									>
-										{bulkScanResult.message}
-									</p>
-									{bulkScanResult.failed?.length > 0 && (
-										<div className="mt-2 text-xs text-yellow-400">
-											<p>Failed hosts:</p>
-											<ul className="list-disc list-inside">
-												{bulkScanResult.failed.map((f) => (
-													<li key={`failed-${f.hostName}`}>
-														{f.hostName}: {f.error}
-													</li>
-												))}
-											</ul>
-										</div>
+									Cancel
+								</button>
+								<button
+									onClick={handleBulkScan}
+									disabled={
+										selectedHosts.length === 0 || bulkScanMutation.isPending
+									}
+									className="flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 disabled:bg-secondary-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+								>
+									{bulkScanMutation.isPending ? (
+										<>
+											<RefreshCw className="h-4 w-4 animate-spin" />
+											Triggering...
+										</>
+									) : (
+										<>
+											<Play className="h-4 w-4" />
+											Scan {selectedHosts.length} Host
+											{selectedHosts.length !== 1 ? "s" : ""}
+										</>
 									)}
-								</div>
-							)}
-						</div>
-
-						{/* Modal Footer */}
-						<div className="flex items-center justify-end gap-3 p-4 border-t border-secondary-700">
-							<button
-								onClick={() => {
-									setShowBulkScanModal(false);
-									setBulkScanResult(null);
-								}}
-								className="px-4 py-2 text-white hover:text-white transition-colors"
-							>
-								Cancel
-							</button>
-							<button
-								onClick={handleBulkScan}
-								disabled={
-									selectedHosts.length === 0 || bulkScanMutation.isPending
-								}
-								className="flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 disabled:bg-secondary-600 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
-							>
-								{bulkScanMutation.isPending ? (
-									<>
-										<RefreshCw className="h-4 w-4 animate-spin" />
-										Triggering...
-									</>
-								) : (
-									<>
-										<Play className="h-4 w-4" />
-										Scan {selectedHosts.length} Host
-										{selectedHosts.length !== 1 ? "s" : ""}
-									</>
-								)}
-							</button>
+								</button>
+							</div>
 						</div>
 					</div>
-				</div>
+				</ModalPortal>
 			)}
 
 			{/* ==================== OVERVIEW TAB ==================== */}
 			{activeTab === "overview" && (
 				<>
-					{/* Compliance dashboard widgets - same 6 cards as main Dashboard */}
+					{/* Compliance dashboard widgets, mirroring the main Dashboard */}
 					<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6 mb-6">
 						<FailuresBySeverityDoughnut
 							data={dashboard}
@@ -1123,7 +1254,6 @@ const Compliance = () => {
 							data={dashboard}
 							onTabChange={(tab) => setActiveTab(tab)}
 						/>
-						<ComplianceTrendLinePlaceholder />
 						<HostComplianceStatusBar
 							data={dashboard}
 							onTabChange={(tab) => setActiveTab(tab)}

@@ -1,8 +1,80 @@
 # PatchMon Agent Installation Script for Windows (Server-Provided Version)
 # The server injects PATCHMON_SERVER_URL, PATCHMON_BOOTSTRAP_TOKEN, PATCHMON_IGNORE_SSL
-# as env vars at the top of this script before serving it.
+# and PATCHMON_HOST_ID as env vars at the top of this script before serving it.
 
 $ErrorActionPreference = "Stop"
+
+# Launching a binary written to disk moments ago can fail with "Access is
+# denied" before the process ever starts. Windows file sharing is mandatory
+# rather than advisory, so an antivirus scanner holding the freshly written
+# image locks out CreateProcess, and a large unsigned executable is exactly
+# what real-time protection stops to inspect. The agent already rides out this
+# error class on its own config file (internal/config/transient_windows.go);
+# the installer is the first thing to execute a just-written image, so it needs
+# the same tolerance. A launch failure raises an error rather than setting an
+# exit code, so $LASTEXITCODE alone never sees it.
+function Invoke-AgentBinary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$AgentArgs
+    )
+
+    $attempts = 6
+    $backoffSeconds = 2
+
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            & $Path @AgentArgs
+            return
+        } catch {
+            if ($attempt -eq $attempts) {
+                throw
+            }
+            Write-Host "Windows would not start the agent yet (attempt $attempt of $attempts). Retrying in $backoffSeconds seconds..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $backoffSeconds
+        }
+    }
+}
+
+function Show-AgentLaunchFailure {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InstallDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigFile,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Reason
+    )
+
+    Write-Host ""
+    Write-Warning "The agent was installed but Windows would not run it: $Reason"
+    Write-Host ""
+    Write-Host "This is nearly always antivirus or SmartScreen blocking an unsigned" -ForegroundColor Yellow
+    Write-Host "executable. The PatchMon agent is not code-signed yet, so real-time" -ForegroundColor Yellow
+    Write-Host "protection can quarantine it or hold it open as soon as it is written." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "1. Check whether it was quarantined:" -ForegroundColor Cyan
+    Write-Host "     Get-MpThreat | Select-Object -Last 5" -ForegroundColor Gray
+    Write-Host "2. Clear the download marker:" -ForegroundColor Cyan
+    Write-Host "     Unblock-File '$Path'" -ForegroundColor Gray
+    Write-Host "3. If it is still blocked, exclude the install directory:" -ForegroundColor Cyan
+    Write-Host "     Add-MpPreference -ExclusionPath '$InstallDir'" -ForegroundColor Gray
+    Write-Host "4. Re-run this installer. Running it again is safe." -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "What is on this machine now:" -ForegroundColor Yellow
+    Write-Host "   - Agent binary installed at $Path" -ForegroundColor Gray
+    Write-Host "   - Configuration written to $ConfigFile" -ForegroundColor Gray
+    Write-Host "   - System PATH updated" -ForegroundColor Gray
+    Write-Host "   - No Windows service created, so nothing is running yet" -ForegroundColor Gray
+}
 
 # Read server-injected values from environment variables
 $ServerURL     = $env:PATCHMON_SERVER_URL
@@ -12,6 +84,14 @@ $APIKey        = $env:PATCHMON_API_KEY
 $InstallPath   = "C:\Program Files\PatchMon"
 $ConfigPath    = "C:\ProgramData\PatchMon"
 $SkipSslVerify = ($env:PATCHMON_IGNORE_SSL -eq "true" -or $env:PATCHMON_IGNORE_SSL -eq "1")
+$HostId        = if ($env:PATCHMON_HOST_ID -match '^[A-Za-z0-9-]{1,64}$') { $env:PATCHMON_HOST_ID } else { "" }
+
+# Check if running as Administrator
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Error "This script must be run as Administrator. Right-click PowerShell and select 'Run as Administrator'."
+    exit 1
+}
 
 # Honor server's ignore SSL setting (injected when Settings > Agent Updates > Ignore SSL is enabled)
 if ($SkipSslVerify) {
@@ -34,16 +114,15 @@ if ($BootstrapToken -and $ServerURL) {
         }
         Write-Host "Credentials received successfully." -ForegroundColor Green
     } catch {
+        $serverResponse = $_.ErrorDetails.Message
+        if ($serverResponse -match '"code"\s*:\s*"(cors_mismatch|host_mismatch)"') {
+            Write-Host "Server response: $serverResponse"
+            Write-Error "The PatchMon server rejected the URL this host used ($($Matches[1])). The hostname in Settings > Server URL must be listed in CORS_ORIGIN."
+            exit 1
+        }
         Write-Error "Failed to fetch credentials: $($_.Exception.Message). Bootstrap token may have expired. Please request a new installation script."
         exit 1
     }
-}
-
-# Check if running as Administrator
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Error "This script must be run as Administrator. Right-click PowerShell and select 'Run as Administrator'."
-    exit 1
 }
 
 Write-Host "PatchMon Agent Installation for Windows" -ForegroundColor Green
@@ -92,6 +171,18 @@ New-Item -ItemType Directory -Force -Path $InstallPath | Out-Null
 Write-Host "Creating configuration directory..." -ForegroundColor Yellow
 New-Item -ItemType Directory -Force -Path $ConfigPath | Out-Null
 
+# Lock the config dir to SYSTEM and Administrators before any secret is written.
+# (OI)(CI) makes config.yml/credentials.yml inherit the lock; /T /C heals an older install.
+Write-Host "Securing configuration directory..." -ForegroundColor Yellow
+try {
+    & icacls $ConfigPath /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /T /C | Out-Null
+    $grantExit = $LASTEXITCODE
+    & icacls $ConfigPath /setowner "*S-1-5-32-544" /T /C | Out-Null
+    if ($grantExit -ne 0 -or $LASTEXITCODE -ne 0) { throw "icacls reported a non-zero exit" }
+} catch {
+    Write-Warning "Could not fully secure $ConfigPath. Credentials may be readable by other local users until permissions are corrected."
+}
+
 # Download the binary from the server
 Write-Host "Downloading PatchMon agent..." -ForegroundColor Yellow
 try {
@@ -121,6 +212,12 @@ Start-Sleep -Seconds 1
 Write-Host "Installing agent to $targetPath..." -ForegroundColor Yellow
 Copy-Item -Path $tempPath -Destination $targetPath -Force
 
+# Clear the download marker if one was attached. Invoke-WebRequest does not
+# normally write a Zone.Identifier stream, but some endpoint protection products
+# do, and it survives an NTFS to NTFS copy, so it would follow the binary into
+# Program Files and SmartScreen would refuse to start it.
+Unblock-File -Path $targetPath -ErrorAction SilentlyContinue
+
 # Clean up temp file
 Remove-Item -Path $tempPath -Force
 
@@ -128,19 +225,31 @@ Remove-Item -Path $tempPath -Force
 $configFile = Join-Path $ConfigPath "config.yml"
 if (-not (Test-Path $configFile)) {
     Write-Host "Creating default configuration file..." -ForegroundColor Yellow
+    # Single-quoted YAML scalars. A double-quoted scalar processes backslash
+    # escapes, so a Windows path either fails to parse ("\c" in \credentials.yml)
+    # or is silently mangled ("\P" is a valid escape for U+2029).
     $configContent = @"
-patchmon_server: "$ServerURL"
-api_version: "v1"
-credentials_file: "$ConfigPath\credentials.yml"
-log_file: "$ConfigPath\patchmon-agent.log"
-log_level: "info"
+patchmon_server: '$($ServerURL -replace "'", "''")'
+api_version: 'v1'
+credentials_file: '$($ConfigPath -replace "'", "''")\credentials.yml'
+log_file: '$($ConfigPath -replace "'", "''")\patchmon-agent.log'
+log_level: 'info'
 skip_ssl_verify: $($SkipSslVerify.ToString().ToLower())
+host_id: '$HostId'
 "@
     Set-Content -Path $configFile -Value $configContent -Encoding UTF8
 } else {
     # Config exists - update skip_ssl_verify to match server settings
     $content = Get-Content -Path $configFile -Raw -ErrorAction SilentlyContinue
     if ($content) {
+        # Repair paths written double-quoted by an earlier installer, which left
+        # the file unparseable and the agent running on defaults.
+        $doubleQuotedPath = '(?m)^([ \t]*)(patchmon_server|api_version|credentials_file|log_file|log_level)[ \t]*:[ \t]*"([^"]*\\[^"]*)"([ \t]*(?:#[^\r\n]*)?)(\r?)$'
+        $content = [regex]::Replace($content, $doubleQuotedPath, {
+            param($m)
+            "$($m.Groups[1].Value)$($m.Groups[2].Value): '$($m.Groups[3].Value -replace "'", "''")'$($m.Groups[4].Value)$($m.Groups[5].Value)"
+        })
+
         if ($content -match "skip_ssl_verify\s*:\s*(true|false)") {
             $content = $content -replace "skip_ssl_verify\s*:\s*(true|false)", "skip_ssl_verify: $($SkipSslVerify.ToString().ToLower())"
         } else {
@@ -164,7 +273,19 @@ if ($ServerURL -and $APIID -and $APIKey) {
     if ($SkipSslVerify) {
         $env:PATCHMON_SKIP_SSL_VERIFY = "true"
     }
-    & $targetPath --config (Join-Path $ConfigPath "config.yml") config set-api $APIID $APIKey $ServerURL
+    $setApiArgs = @("--config", $configFile, "config", "set-api", $APIID, $APIKey, $ServerURL)
+    try {
+        if ($HostId) {
+            Invoke-AgentBinary -Path $targetPath -AgentArgs ($setApiArgs + @("--host-id", $HostId))
+        }
+        # An agent older than 2.1.4 rejects --host-id; it learns the host ID later instead.
+        if (-not $HostId -or $LASTEXITCODE -ne 0) {
+            Invoke-AgentBinary -Path $targetPath -AgentArgs $setApiArgs
+        }
+    } catch {
+        Show-AgentLaunchFailure -Path $targetPath -InstallDir $InstallPath -ConfigFile $configFile -Reason $_.Exception.Message
+        exit 1
+    }
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Credentials configured successfully." -ForegroundColor Green
     } else {
@@ -183,7 +304,12 @@ Write-Host "Testing installation..." -ForegroundColor Yellow
 if ($SkipSslVerify) {
     $env:PATCHMON_SKIP_SSL_VERIFY = "true"
 }
-& $targetPath --config (Join-Path $ConfigPath "config.yml") ping
+try {
+    Invoke-AgentBinary -Path $targetPath -AgentArgs @("--config", $configFile, "ping")
+} catch {
+    Show-AgentLaunchFailure -Path $targetPath -InstallDir $InstallPath -ConfigFile $configFile -Reason $_.Exception.Message
+    exit 1
+}
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Installation test failed. Please check the installation manually."
     exit 1
@@ -248,6 +374,9 @@ try {
 } catch {
     Write-Warning "Failed to create/start Windows Service: $_"
     Write-Host ""
+    Write-Host "If this says access is denied, antivirus is likely blocking the unsigned" -ForegroundColor Yellow
+    Write-Host "binary. Try: Unblock-File '$servicePath'   or exclude '$InstallPath'." -ForegroundColor Yellow
+    Write-Host ""
     Write-Host "The agent is installed and configured, but you'll need to run it manually:" -ForegroundColor Yellow
     Write-Host "  patchmon-agent.exe serve" -ForegroundColor Cyan
     Write-Host ""
@@ -265,28 +394,28 @@ if ($serviceStarted) {
 }
 Write-Host ""
 Write-Host "Installation Summary:" -ForegroundColor Green
-Write-Host "   • Configuration directory: $ConfigPath" -ForegroundColor Gray
-Write-Host "   • Agent binary installed: $InstallPath\patchmon-agent.exe" -ForegroundColor Gray
-Write-Host "   • Architecture: $arch" -ForegroundColor Gray
+Write-Host "   - Configuration directory: $ConfigPath" -ForegroundColor Gray
+Write-Host "   - Agent binary installed: $InstallPath\patchmon-agent.exe" -ForegroundColor Gray
+Write-Host "   - Architecture: $arch" -ForegroundColor Gray
 $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($svc -and $svc.Status -eq "Running") {
-    Write-Host "   • Windows Service: configured and running" -ForegroundColor Gray
+    Write-Host "   - Windows Service: configured and running" -ForegroundColor Gray
 } elseif ($svc) {
-    Write-Host "   • Windows Service: configured (Status: $($svc.Status))" -ForegroundColor Gray
+    Write-Host "   - Windows Service: configured (Status: $($svc.Status))" -ForegroundColor Gray
 } else {
-    Write-Host "   • Windows Service: not configured (run manually: patchmon-agent.exe serve)" -ForegroundColor Gray
+    Write-Host "   - Windows Service: not configured (run manually: patchmon-agent.exe serve)" -ForegroundColor Gray
 }
-Write-Host "   • API credentials configured and tested" -ForegroundColor Gray
-Write-Host "   • Logs: $ConfigPath\patchmon-agent.log" -ForegroundColor Gray
+Write-Host "   - API credentials configured and tested" -ForegroundColor Gray
+Write-Host "   - Logs: $ConfigPath\patchmon-agent.log" -ForegroundColor Gray
 
 Write-Host ""
 Write-Host "Management Commands:" -ForegroundColor Cyan
-Write-Host "   • Test connection: patchmon-agent ping" -ForegroundColor Gray
-Write-Host "   • Manual report: patchmon-agent report" -ForegroundColor Gray
-Write-Host "   • Check status: patchmon-agent diagnostics" -ForegroundColor Gray
-Write-Host "   • Service status: Get-Service -Name $serviceName" -ForegroundColor Gray
-Write-Host "   • Service logs: Get-Content `"$ConfigPath\patchmon-agent.log`" -Tail 50 -Wait" -ForegroundColor Gray
-Write-Host "   • Restart service: Restart-Service -Name $serviceName" -ForegroundColor Gray
+Write-Host "   - Test connection: patchmon-agent ping" -ForegroundColor Gray
+Write-Host "   - Manual report: patchmon-agent report" -ForegroundColor Gray
+Write-Host "   - Check status: patchmon-agent diagnostics" -ForegroundColor Gray
+Write-Host "   - Service status: Get-Service -Name $serviceName" -ForegroundColor Gray
+Write-Host "   - Service logs: Get-Content `"$ConfigPath\patchmon-agent.log`" -Tail 50 -Wait" -ForegroundColor Gray
+Write-Host "   - Restart service: Restart-Service -Name $serviceName" -ForegroundColor Gray
 
 Write-Host ""
 if ($serviceStarted) {

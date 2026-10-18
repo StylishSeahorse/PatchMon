@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
-	"net/http/pprof"
 	"strings"
 	"time"
 
@@ -37,6 +36,9 @@ import (
 // NewRouter creates the HTTP router with all routes and middleware.
 // Returns (handler, guacdProcess) - guacdProcess should be stopped on shutdown.
 // frontendFS is the embedded frontend static files (static/frontend/dist); pass nil to disable SPA serving.
+// rdpTicketRateLimit is RDP ticket requests per user per minute.
+const rdpTicketRateLimit = 10
+
 func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *redisclient.Client, registry *agentregistry.Registry, queueClient *asynq.Client, queueInspector *asynq.Inspector, ctxRegistry *hostctx.Registry, poolCache *hostctx.PoolCache, redisCache *hostctx.RedisCache, notifyEmit *notifications.Emitter, log *slog.Logger, frontendFS fs.FS) (http.Handler, *guacd.Process) {
 	r := chi.NewRouter()
 
@@ -52,6 +54,9 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	settingsStore := store.NewSettingsStore(dbProvider)
 	settings, _ := settingsStore.GetFirst(ctx)
 	resolved := config.ResolveConfig(ctx, cfg, settings)
+	if err := middleware.ValidateOrigins(resolved.CORSOrigin); err != nil && log != nil {
+		log.Warn("CORS_ORIGIN contains an entry that is not an origin", "error", err)
+	}
 
 	r.Use(middleware.RequestID())
 	r.Use(middleware.Recovery(log))
@@ -79,46 +84,37 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			log.Warn("ignoring invalid TRUSTED_PROXY_RANGES entries",
 				"entries", strings.Join(invalid, ", "))
 		}
-		r.Use(middleware.RealIP(trustedProxies))
+		r.Use(middleware.RealIP(trustedProxies, log))
 	}
 	// Note: chi's Timeout middleware is NOT applied globally because it conflicts with
 	// WebSocket/SSE routes (hijacked connections). It writes a 503 to a
 	// hijacked ResponseWriter causing "WriteHeader on hijacked connection".
 	// Instead, timeout is applied per-group below, skipping WS routes.
 
-	if poolCache != nil && cfg.RegistryReloadSecret != "" {
-		r.Post("/internal/reload-tenant", hostctx.ReloadHandler(poolCache, redisCache, cfg.RegistryReloadSecret))
-	}
-
 	usersStore := store.NewUsersStore(dbProvider)
 	permissionsStore := store.NewPermissionsStore(dbProvider)
 
-	if cfg.EnablePprof {
-		// Pprof endpoints require admin authentication to prevent information leakage.
-		r.Group(func(r chi.Router) {
-			r.Use(middleware.RequirePermission("can_manage_settings", permissionsStore))
-			r.Handle("/debug/pprof/*", http.HandlerFunc(pprof.Index))
-			r.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
-			r.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
-			r.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
-			r.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
-		})
-	}
 	dashboardPrefsStore := store.NewDashboardPreferencesStore(dbProvider)
 
 	enc, _ := util.NewEncryption()
 
+	// `resolved` above is read once from the default database; this resolves
+	// each context's own settings per request.
+	cfgResolver := hostctx.NewConfigResolver(cfg, resolved, settingsStore.GetFirst)
+
 	var tfaLockout *store.TfaLockoutStore
 	var loginLockout *store.LoginLockoutStore
 	if rdb != nil {
-		tfaLockout = store.NewTfaLockoutStore(redisResolver, resolved.MaxTfaAttempts, resolved.TfaLockoutDurationMin)
+		tfaLockout = store.NewTfaLockoutStore(redisResolver, cfgResolver, resolved.MaxTfaAttempts, resolved.TfaLockoutDurationMin)
 	}
 	if rdb != nil {
-		loginLockout = store.NewLoginLockoutStore(redisResolver, resolved.MaxLoginAttempts, resolved.LockoutDurationMin)
+		loginLockout = store.NewLoginLockoutStore(redisResolver, cfgResolver, resolved.MaxLoginAttempts, resolved.LockoutDurationMin)
 	}
 	releaseNotesAcceptanceStore := store.NewReleaseNotesAcceptanceStore(dbProvider)
 	trustedDevicesStore := store.NewTrustedDevicesStore(dbProvider)
-	authHandler := handler.NewAuthHandler(cfg, resolved, usersStore, store.NewSessionsStore(dbProvider), trustedDevicesStore, settingsStore, tfaLockout, loginLockout, releaseNotesAcceptanceStore, dbProvider, notifyEmit, log).WithPermissions(permissionsStore)
+	tfaReplay := store.NewTfaReplayStore(redisResolver)
+	auditLogsStore := store.NewAuditLogsStore(dbProvider)
+	authHandler := handler.NewAuthHandler(cfg, resolved, usersStore, store.NewSessionsStore(dbProvider), trustedDevicesStore, settingsStore, tfaLockout, loginLockout, store.NewPendingLoginStore(redisResolver), releaseNotesAcceptanceStore, dbProvider, notifyEmit, log).WithPermissions(permissionsStore).WithConfigResolver(cfgResolver).WithTfaReplay(tfaReplay).WithAudit(auditLogsStore)
 	var oidcHandler *handler.OidcHandler
 	if rdb != nil {
 		oidcResolved, _ := config.ResolveOidcConfig(ctx, cfg, settingsStore.GetFirst)
@@ -146,8 +142,19 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 				Scopes:       oidcResolved.Scopes,
 			})
 			oidcClient = c
+			if log != nil {
+				source := "database settings"
+				if oidcResolved.ConfiguredViaEnv {
+					source = "environment variables"
+				}
+				log.Info("OIDC SSO enabled; provider discovery is deferred to the first login attempt",
+					"issuer", oidcResolved.IssuerURL,
+					"client_id", oidcResolved.ClientID,
+					"source", source)
+			}
 		}
-		oidcHandler = handler.NewOidcHandler(cfg, resolvedPtr, resolved, oidcClient, valid, store.NewOidcSessionStore(redisResolver), usersStore, authHandler, settingsStore, enc, log)
+		oidcHandler = handler.NewOidcHandler(cfg, resolvedPtr, resolved, oidcClient, valid, store.NewOidcSessionStore(redisResolver), usersStore, authHandler, settingsStore, enc, log).WithPermissions(permissionsStore)
+		authHandler.WithLocalAuthPolicy(oidcHandler)
 	}
 	var discordHandler *handler.DiscordHandler
 	if rdb != nil {
@@ -156,9 +163,14 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	tfaHandler := handler.NewTfaHandler(usersStore, store.NewSessionsStore(dbProvider), trustedDevicesStore, dbProvider, notifyEmit, log)
 	trustedDevicesHandler := handler.NewTrustedDevicesHandler(trustedDevicesStore, log)
 	userPrefsHandler := handler.NewUserPreferencesHandler(usersStore)
-	settingsHandler := handler.NewSettingsHandlerWithConfig(settingsStore, usersStore, enc, registry, cfg.AssetsDir, cfg, resolved)
+	settingsHandler := handler.NewSettingsHandlerWithConfig(settingsStore, usersStore, enc, registry, cfg.AssetsDir, cfg, resolved).WithEvictors(cfgResolver, oidcHandler).WithPermissions(permissionsStore)
+	// Registered here so every per-context cache exists and can be evicted.
+	if poolCache != nil && cfg.RegistryReloadSecret != "" {
+		r.Post("/internal/reload-tenant", hostctx.ReloadHandler(poolCache, redisCache, cfg.RegistryReloadSecret, cfgResolver, oidcHandler))
+	}
+
 	permissionsHandler := handler.NewPermissionsHandler(permissionsStore)
-	usersHandler := handler.NewUsersHandler(usersStore, store.NewSessionsStore(dbProvider), trustedDevicesStore, permissionsStore, settingsStore, resolved, cfg, dbProvider, notifyEmit, log)
+	usersHandler := handler.NewUsersHandler(usersStore, store.NewSessionsStore(dbProvider), trustedDevicesStore, permissionsStore, settingsStore, resolved, cfg, dbProvider, notifyEmit, log).WithConfigResolver(cfgResolver).WithTfaReset(tfaLockout, auditLogsStore, tfaReplay)
 	hostsStore := store.NewHostsStore(dbProvider)
 	billingHandler := handler.NewBillingHandler(cfg, log, hostsStore)
 	metricsHandler := handler.NewMetricsHandler(settingsStore, hostsStore, cfg)
@@ -185,13 +197,13 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	)
 	hostGroupsHandler := handler.NewHostGroupsHandler(hostGroupsStore, hostsStore)
 	dashboardPrefsHandler := handler.NewDashboardPreferencesHandler(dashboardPrefsStore)
-	dockerHandler := handler.NewDockerHandler(dockerStore)
+	dockerHandler := handler.NewDockerHandler(dockerStore, registry)
 	reportStore := store.NewReportStore(dbProvider)
-	integrationsHandler := handler.NewIntegrationsHandler(hostsStore, store.NewDockerStore(dbProvider), integrationStatusStore, dbProvider, notifyEmit, reportStore)
+	integrationsHandler := handler.NewIntegrationsHandler(hostsStore, store.NewDockerStore(dbProvider), integrationStatusStore, dbProvider, notifyEmit, reportStore, store.NewJobHistoryStore(dbProvider))
 	complianceStore := store.NewComplianceStore(dbProvider)
 	complianceHandler := handler.NewComplianceHandler(complianceStore, hostsStore, registry, queueClient, queueInspector, integrationStatusStore, cfg.SSGContentDir, notifyEmit, reportStore)
 	autoEnrollmentStore := store.NewAutoEnrollmentStore(dbProvider)
-	autoEnrollmentHandler := handler.NewAutoEnrollmentHandler(autoEnrollmentStore, hostGroupsStore, hostsStore, settingsStore, log, cfg)
+	autoEnrollmentHandler := handler.NewAutoEnrollmentHandler(autoEnrollmentStore, hostGroupsStore, hostsStore, settingsStore, registry, log, cfg)
 
 	var bootstrapStore *store.BootstrapStore
 	var sshTicketStore *store.SshTicketStore
@@ -201,7 +213,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	if rdb != nil {
 		sshTicketStore = store.NewSshTicketStore(redisResolver)
 	}
-	installHandler := handler.NewInstallHandler(hostsStore, settingsStore, bootstrapStore, reportStore)
+	installHandler := handler.NewInstallHandler(hostsStore, settingsStore, bootstrapStore, reportStore, log)
 	sshProxySessions := sshproxy.NewSessions()
 	alertsStore := store.NewAlertsStore(dbProvider)
 	alertConfigStore := store.NewAlertConfigStore(dbProvider)
@@ -210,6 +222,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	if rdb != nil && cfg.GuacdAddress != "" {
 		rdpTicketStore := store.NewRDPTicketStore(redisResolver, enc)
 		rdpSessions := rdpproxy.NewSessions(log, registry)
+		rdpSessions.SetCapEmptyScope(poolCache != nil)
 		rdpHandler = handler.NewRDPHandler(
 			rdpTicketStore, rdpSessions, hostsStore, usersStore, permissionsStore,
 			registry, cfg.GuacdAddress, resolved.CORSOrigin, corsOriginResolver(ctxRegistry), log, dbProvider, notifyEmit,
@@ -222,10 +235,13 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	var agentWsHandler *handler.AgentWSHandler
 	agentOpts := []handler.AgentWSHandlerOption{
 		handler.WithOnAgentDisconnect(handler.NewAgentDisconnectHandler(dbProvider, hostsStore, patchRunsStore, registry, notifyEmit, log)),
-		handler.WithOnAgentConnect(handler.NewAgentConnectHandler(dbProvider, queueClient, queueInspector, notifyEmit, log)),
+		handler.WithOnAgentConnect(handler.NewAgentConnectHandler(dbProvider, queueClient, queueInspector, integrationStatusStore, notifyEmit, log)),
 	}
 	if rdpHandler != nil {
-		agentOpts = append(agentOpts, handler.WithOnRDPProxyMessage(rdpHandler.HandleRDPProxyMessage))
+		agentOpts = append(agentOpts,
+			handler.WithOnRDPProxyMessage(rdpHandler.HandleRDPProxyMessage),
+			handler.WithOnAgentConnClosed(rdpHandler.OnAgentConnClosed),
+		)
 	}
 	if sshTicketStore != nil {
 		sshTerminalWSHandler = handler.NewSshTerminalWSHandler(
@@ -253,7 +269,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	agentVersionHandler := handler.NewAgentVersionHandler(log)
 	alertConfigHandler := handler.NewAlertConfigHandler(alertConfigStore)
 	notificationsHandler := handler.NewNotificationsHandler(dbProvider, enc, notifyEmit, resolved, cfg, settingsStore, queueClient)
-	automationHandler := handler.NewAutomationHandler(queueInspector, queueClient, registry, settingsStore, alertConfigStore)
+	automationHandler := handler.NewAutomationHandler(queueInspector, queueClient, registry, settingsStore, alertConfigStore).WithConfig(cfg)
 	apiHostsHandler := handler.NewApiHostsHandler(hostsStore, hostGroupsStore, dbProvider, dashboardStore, queueInspector)
 
 	patchPoliciesStore := store.NewPatchPoliciesStore(dbProvider)
@@ -264,7 +280,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 	// for the stop-run endpoint. Kept as optional dependencies so unrelated
 	// call-sites don't need to thread them.
 	patchingHandler.SetStreamDependencies(patchstream.NewHub(), registry)
-	windowsUpdatesHandler := handler.NewWindowsUpdatesHandler(hostsStore, dbProvider, notifyEmit)
+	windowsUpdatesHandler := handler.NewWindowsUpdatesHandler(hostsStore, dbProvider)
 
 	aiSvc := ai.NewService(enc)
 	aiHandler := handler.NewAIHandler(settingsStore, aiSvc, enc, redisResolver)
@@ -277,20 +293,20 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 
 	r.Get("/health", healthHandler(db, rdb))
 
-	// Start guacd subprocess if RDP enabled and address is localhost.
-	// When GUACD_ADDRESS points to a remote host (e.g. guacd:4822 in Docker), guacd runs as a sidecar.
+	// Start guacd subprocess if RDP enabled and address is localhost. In Docker the
+	// image has no guacd binary and the sidecar shares this network namespace instead.
 	var guacdProc *guacd.Process
 	rdpEnabled := rdpHandler != nil
 	if rdpEnabled && !guacd.IsRemoteAddress(cfg.GuacdAddress) {
 		guacdProc = guacd.Start(ctx, cfg.GuacdPath, cfg.GuacdAddress, log)
 	} else if rdpEnabled && guacd.IsRemoteAddress(cfg.GuacdAddress) && log != nil {
-		log.Info("RDP using remote guacd", "addr", cfg.GuacdAddress)
+		log.Warn("GUACD_ADDRESS is not a loopback address; RDP sessions will fail unless guacd shares this server's network namespace. Use 127.0.0.1:4822.", "addr", cfg.GuacdAddress)
 	}
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.HSTS(resolved.EnableHSTS))
 		r.Use(middleware.Timeout(30 * time.Second))
-		r.Use(middleware.BodyLimit(resolved.JSONBodyLimitBytes))
+		r.Use(middleware.BodyLimitFor(cfgResolver, func(rc *config.ResolvedConfig) int64 { return rc.JSONBodyLimitBytes }))
 		// Internal: registry reload (provisioner calls after creating context)
 		if ctxRegistry != nil && cfg.RegistryReloadSecret != "" {
 			r.Post("/internal/reload-registry-map", hostctx.RegistryReloadHandler(ctxRegistry, cfg.RegistryReloadSecret))
@@ -307,25 +323,22 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 		r.Get("/hosts/remove", installHandler.ServeRemove)
 		r.Get("/hosts/agent/version", installHandler.ServeAgentVersion)
 		r.Get("/hosts/agent/download", installHandler.ServeAgentDownload)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent), middleware.BodyLimit(resolved.AgentPingBodyLimitBytes)).Post("/hosts/ping", installHandler.ServePing)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent), middleware.BodyLimit(resolved.AgentUpdateBodyLimitBytes)).Post("/hosts/update", installHandler.ServeUpdate)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent), middleware.BodyLimitFor(cfgResolver, func(rc *config.ResolvedConfig) int64 { return rc.AgentPingBodyLimitBytes })).Post("/hosts/ping", installHandler.ServePing)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent), middleware.BodyLimitFor(cfgResolver, func(rc *config.ResolvedConfig) int64 { return rc.AgentUpdateBodyLimitBytes })).Post("/hosts/update", installHandler.ServeUpdate)
 		r.Post("/hosts/bootstrap/exchange", installHandler.BootstrapExchange)
 		r.Get("/hosts/integrations", integrationsHandler.AgentGetIntegrationStatus)
 		r.Post("/integrations/docker", integrationsHandler.ReceiveDockerData)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent), middleware.BodyLimitFor(cfgResolver, func(rc *config.ResolvedConfig) int64 { return rc.AgentUpdateBodyLimitBytes })).Post("/integrations/docker/image-checks", integrationsHandler.ReceiveDockerImageChecks)
 		r.Post("/hosts/integration-status", integrationsHandler.ReceiveIntegrationStatus)
-		r.Post("/compliance/scans", complianceHandler.ReceiveScans)
-		r.Get("/compliance/ssg-version", complianceHandler.SSGVersion)
-		r.Get("/compliance/ssg-content/{filename}", complianceHandler.SSGContent)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent), middleware.BodyLimitFor(cfgResolver, func(rc *config.ResolvedConfig) int64 { return rc.ComplianceBodyLimitBytes })).Post("/compliance/scans", complianceHandler.ReceiveScans)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent)).Get("/compliance/ssg-version", complianceHandler.AgentSSGVersion)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent)).Get("/compliance/ssg-content/{filename}", complianceHandler.SSGContent)
 		// Patching agent output (API key auth)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent)).Post("/patching/runs/{id}/output", patchingHandler.ServePatchOutput)
-		// Windows Update agent callbacks (API key auth)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent)).Post("/patching/windows-updates/result", windowsUpdatesHandler.RecordInstallResult)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent)).Post("/patching/windows-updates/reboot", windowsUpdatesHandler.RecordRebootStatus)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent)).Post("/patching/windows-updates/superseded", windowsUpdatesHandler.RemoveSuperseded)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAgent)).Get("/patching/windows-updates/approved", windowsUpdatesHandler.GetApprovedGUIDs)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent)).Post("/patching/runs/{id}/output", patchingHandler.ServePatchOutput)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent)).Post("/patching/runs/{id}/items", patchingHandler.ServePatchItems)
 		// Auto-enrollment (public, token in headers for enroll, query params for script)
-		r.Post("/auto-enrollment/enroll", autoEnrollmentHandler.Enroll)
-		r.Get("/auto-enrollment/script", autoEnrollmentHandler.ServeScript)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent)).Post("/auto-enrollment/enroll", autoEnrollmentHandler.Enroll)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAgent)).Get("/auto-enrollment/script", autoEnrollmentHandler.ServeScript)
 		// Agent WebSocket (GET with Upgrade: websocket)
 		r.Get("/agents/ws", agentWsHandler.ServeWS)
 		// SSH terminal WebSocket (ticket auth via query param).
@@ -340,10 +353,14 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 		}
 
 		r.Get("/auth/signup-enabled", authHandler.SignupEnabled)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAuth)).Post("/auth/login", authHandler.Login)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAuth)).Post("/auth/verify-tfa", authHandler.VerifyTfa)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAuth)).Post("/auth/setup-admin", authHandler.SetupAdmin)
-		r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitAuth)).Post("/auth/signup", authHandler.Signup)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAuth)).Post("/auth/login", authHandler.Login)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAuth)).Post("/auth/verify-tfa", authHandler.VerifyTfa)
+		// Unauthenticated by design: it authenticates itself with the refresh_token
+		// cookie, and the caller reaches it precisely because its access token has
+		// expired.
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAuth)).Post("/auth/refresh", authHandler.Refresh)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAuth)).Post("/auth/setup-admin", authHandler.SetupAdmin)
+		r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitAuth)).Post("/auth/signup", authHandler.Signup)
 		if oidcHandler != nil {
 			r.Get("/auth/oidc/config", oidcHandler.Config)
 			r.Get("/auth/oidc/login", oidcHandler.Login)
@@ -404,8 +421,8 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitGeneral))
-			r.Use(middleware.AuthWithSessionCheck(cfg, store.NewSessionsStore(dbProvider), resolved, log))
+			r.Use(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitGeneral))
+			r.Use(middleware.AuthWithSessionCheck(cfg, store.NewSessionsStore(dbProvider), cfgResolver, log))
 			// Swagger UI - JWT protected, documents integration API endpoints only
 			r.Get("/api-docs", func(w http.ResponseWriter, r *http.Request) {
 				http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
@@ -437,8 +454,9 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			// to the manager + Stripe. Gated identically to the other billing
 			// endpoints (AdminMode + can_manage_billing; 404 on failure).
 			r.Post("/me/billing/sync", billingHandler.PostMyBillingSync(permissionsStore))
-			r.With(middleware.RateLimit(redisResolver, resolved, middleware.RateLimitPassword)).Put("/auth/change-password", authHandler.ChangePassword)
+			r.With(middleware.RateLimit(redisResolver, cfgResolver, middleware.RateLimitPassword)).Put("/auth/change-password", authHandler.ChangePassword)
 			r.Post("/auth/logout", authHandler.Logout)
+			r.Post("/auth/heartbeat", authHandler.Heartbeat)
 			r.Get("/auth/sessions", authHandler.GetSessions)
 			r.Delete("/auth/sessions", authHandler.RevokeAllSessions)
 			r.Delete("/auth/sessions/{sessionId}", authHandler.RevokeSession)
@@ -467,7 +485,11 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			}
 			if rdpEnabled {
 				// Gated by rdp module (Max tier).
-				r.With(middleware.RequirePermission("can_use_remote_access", permissionsStore), hostctx.RequireModule("rdp")).Post("/auth/rdp-ticket", rdpHandler.ServeCreateTicket)
+				r.With(
+					middleware.RequirePermission("can_use_remote_access", permissionsStore),
+					hostctx.RequireModule("rdp"),
+					middleware.RateLimitPerUser(redisResolver, "rdp-ticket", rdpTicketRateLimit, time.Minute),
+				).Post("/auth/rdp-ticket", rdpHandler.ServeCreateTicket)
 			}
 			r.Get("/user/preferences", userPrefsHandler.Get)
 			r.Patch("/user/preferences", userPrefsHandler.Update)
@@ -485,6 +507,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			r.With(middleware.RequirePermission("can_manage_settings", permissionsStore)).Get("/settings/environment", settingsHandler.GetEnvironmentConfig)
 			r.With(middleware.RequirePermission("can_manage_settings", permissionsStore)).Patch("/settings/environment/{key}", settingsHandler.UpdateEnvironmentConfig)
 			r.Get("/settings/public", settingsHandler.GetPublic)
+			r.With(middleware.RequireAnyPermission(permissionsStore, "can_manage_hosts", "can_manage_settings")).Get("/settings/server-url/cors-check", settingsHandler.ServerURLCORSCheck)
 			r.With(middleware.RequirePermission("can_manage_settings", permissionsStore)).Get("/metrics", metricsHandler.Get)
 			r.With(middleware.RequirePermission("can_manage_settings", permissionsStore)).Put("/metrics", metricsHandler.Update)
 			r.With(middleware.RequirePermission("can_manage_settings", permissionsStore)).Post("/metrics/regenerate-id", metricsHandler.RegenerateID)
@@ -543,10 +566,12 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Patch("/hosts/{hostId}/auto-update", hostsHandler.UpdateAutoUpdate)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Patch("/hosts/{hostId}/host-down-alerts", hostsHandler.UpdateHostDownAlerts)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/{hostId}/regenerate-credentials", hostsHandler.RegenerateCredentials)
+			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/{hostId}/identity-conflict/dismiss", hostsHandler.DismissIdentityConflict)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/bulk/fetch-report", hostsHandler.FetchReportBulk)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/{hostId}/fetch-report", hostsHandler.FetchReport)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/{hostId}/refresh-integration-status", hostsHandler.RefreshIntegrationStatus)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/{hostId}/refresh-docker", hostsHandler.RefreshDocker)
+			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore), middleware.RateLimitPerContext(redisResolver, "docker-image-check", 6, time.Minute)).Post("/hosts/{hostId}/docker-image-check", hostsHandler.DockerImageCheck)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Post("/hosts/{hostId}/force-agent-update", hostsHandler.ForceAgentUpdate)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Delete("/hosts/{hostId}", hostsHandler.Delete)
 			r.With(middleware.RequirePermission("can_manage_hosts", permissionsStore)).Delete("/hosts/bulk", hostsHandler.BulkDelete)
@@ -646,6 +671,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			r.With(middleware.RequirePermission("can_view_reports", permissionsStore)).Get("/alerts", alertsHandler.List)
 			r.With(middleware.RequirePermission("can_view_reports", permissionsStore)).Get("/alerts/stats", alertsHandler.GetStats)
 			r.With(middleware.RequirePermission("can_view_reports", permissionsStore)).Get("/alerts/actions", alertsHandler.GetAvailableActions)
+			r.With(middleware.RequirePermission("can_view_reports", permissionsStore)).Get("/alerts/types", alertsHandler.ListTypes)
 			r.With(middleware.RequirePermission("can_manage_alerts", permissionsStore)).Post("/alerts/bulk-delete", alertsHandler.BulkDelete)
 			r.With(middleware.RequirePermission("can_manage_alerts", permissionsStore)).Post("/alerts/bulk-action", alertsHandler.BulkAction)
 			// Advanced alert configuration (gated by alerts_advanced module, Plus tier).
@@ -688,6 +714,8 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			r.With(middleware.RequirePermission("can_manage_users", permissionsStore)).Put("/auth/admin/users/{userId}", usersHandler.Update)
 			r.With(middleware.RequirePermission("can_manage_users", permissionsStore)).Delete("/auth/admin/users/{userId}", usersHandler.Delete)
 			r.With(middleware.RequirePermission("can_manage_users", permissionsStore)).Post("/auth/admin/users/{userId}/reset-password", usersHandler.ResetPassword)
+			r.With(middleware.RequirePermission("can_manage_users", permissionsStore)).Post("/auth/admin/users/{userId}/unlink-oidc", usersHandler.UnlinkOidc)
+			r.With(middleware.RateLimitPerUser(redisResolver, "reset-tfa", 10, 15*time.Minute), middleware.RequirePermission("can_manage_users", permissionsStore)).Post("/auth/admin/users/{userId}/reset-tfa", usersHandler.ResetTfa)
 
 			// Docker inventory (can_view_hosts for read, can_manage_docker for delete).
 			// Gated by the docker module (Plus tier).
@@ -706,6 +734,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, db *database.DB, rdb *re
 			r.With(middleware.RequirePermission("can_view_hosts", permissionsStore), hostctx.RequireModule("docker")).Get("/docker/networks", dockerHandler.ListNetworks)
 			r.With(middleware.RequirePermission("can_view_hosts", permissionsStore), hostctx.RequireModule("docker")).Get("/docker/networks/{id}", dockerHandler.GetNetwork)
 			r.With(middleware.RequirePermission("can_manage_docker", permissionsStore), hostctx.RequireModule("docker")).Delete("/docker/networks/{id}", dockerHandler.DeleteNetwork)
+			r.With(middleware.RequirePermission("can_manage_docker", permissionsStore), hostctx.RequireModule("docker"), middleware.RateLimitPerContext(redisResolver, "docker-image-checks-run", 6, time.Minute)).Post("/docker/image-checks/run", dockerHandler.RunImageChecks)
 
 			// Auto-enrollment tokens
 			r.With(middleware.RequirePermission("can_manage_settings", permissionsStore)).Get("/auto-enrollment/tokens", autoEnrollmentHandler.List)

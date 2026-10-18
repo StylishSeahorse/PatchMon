@@ -13,12 +13,19 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 )
 
-const maxMicrosoftGraphPhotoBytes = 1 << 20
+const (
+	maxMicrosoftGraphPhotoBytes = 1 << 20
+	maxProviderResponseBytes    = 2 << 20
+	providerRequestTimeout      = 30 * time.Second
+)
+
+var errProviderResponseTooLarge = errors.New("oidc: provider response exceeds size limit")
 
 var microsoftGraphPhotoURL = "https://graph.microsoft.com/v1.0/me/photo/$value"
 
@@ -31,15 +38,20 @@ type SessionData struct {
 
 // UserInfo holds normalized user claims from OIDC.
 type UserInfo struct {
-	Sub           string
-	Email         string
-	Name          string
-	GivenName     string
-	FamilyName    string
-	EmailVerified bool
-	Groups        []string
-	Picture       string
-	IDToken       string
+	Sub string
+	// Issuer is the verified id_token iss, the namespace Sub is unique within.
+	Issuer            string
+	Email             string
+	Name              string
+	PreferredUsername string
+	GivenName         string
+	FamilyName        string
+	EmailVerified     bool
+	// For logs only; empty when EmailVerified is true.
+	EmailVerifiedReason string
+	Groups              []string
+	Picture             string
+	IDToken             string
 }
 
 // Client wraps the OIDC provider and OAuth2 config.
@@ -47,12 +59,13 @@ type UserInfo struct {
 // the issuer's discovery endpoint, so startup succeeds even when the provider is
 // temporarily unreachable.
 type Client struct {
-	cfg      Config
-	scopes   []string
-	mu       sync.Mutex
-	provider *oidc.Provider
-	verifier *oidc.IDTokenVerifier
-	oauth2   *oauth2.Config
+	cfg                Config
+	scopes             []string
+	discoverySuffixCut bool
+	mu                 sync.Mutex
+	provider           *oidc.Provider
+	verifier           *oidc.IDTokenVerifier
+	oauth2             *oauth2.Config
 }
 
 // Config holds OIDC client configuration.
@@ -67,21 +80,62 @@ type Config struct {
 // NewClient creates a new OIDC client. Provider discovery is deferred until the
 // first login attempt, so this never fails due to network issues at startup.
 func NewClient(_ context.Context, cfg Config) (*Client, error) {
+	var cut bool
+	cfg.IssuerURL, cut = normaliseIssuerURL(cfg.IssuerURL)
 	return &Client{
-		cfg:    cfg,
-		scopes: parseScopes(cfg.Scopes),
+		cfg:                cfg,
+		scopes:             parseScopes(cfg.Scopes),
+		discoverySuffixCut: cut,
 	}, nil
+}
+
+const discoveryPath = "/.well-known/openid-configuration"
+
+func normaliseIssuerURL(issuer string) (string, bool) {
+	issuer = strings.TrimSpace(issuer)
+	trimmed := strings.TrimSuffix(strings.TrimSuffix(issuer, "/"), discoveryPath)
+	if trimmed == strings.TrimSuffix(issuer, "/") {
+		return issuer, false
+	}
+	return trimmed, true
+}
+
+// ProbeDiscovery fetches the discovery document. Only a transport failure or a
+// 5xx counts as unreachable: any other answer means the provider is up, even if
+// PatchMon is misconfigured against it.
+func (c *Client) ProbeDiscovery(ctx context.Context, hc *http.Client) (unreachable bool, reason string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(c.cfg.IssuerURL, "/")+discoveryPath, nil)
+	if err != nil {
+		return false, ""
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return true, "discovery request failed: " + err.Error()
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return true, fmt.Sprintf("discovery returned HTTP %d", resp.StatusCode)
+	}
+	return false, ""
 }
 
 // connect performs provider discovery and populates the oauth2 config and token
 // verifier. It is idempotent and safe for concurrent callers.
 func (c *Client) connect(ctx context.Context) error {
+	ctx = withCappedHTTPClient(ctx)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.provider != nil {
 		return nil
 	}
 	provider, err := oidc.NewProvider(ctx, c.cfg.IssuerURL)
+	if err != nil && c.discoverySuffixCut {
+		// The issuer may need the slash that preceded the discovery path (Authentik does).
+		if p, slashErr := oidc.NewProvider(ctx, c.cfg.IssuerURL+"/"); slashErr == nil {
+			provider, err = p, nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("oidc: discover provider: %w", err)
 	}
@@ -96,6 +150,65 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	return nil
 }
+
+// withCappedHTTPClient bounds every body read from the provider, including the
+// JWKS fetches go-oidc makes later with the client captured at discovery.
+func withCappedHTTPClient(ctx context.Context) context.Context {
+	base := http.DefaultClient
+	if hc, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && hc != nil {
+		if _, capped := hc.Transport.(*cappedTransport); capped {
+			return ctx
+		}
+		base = hc
+	}
+	capped := *base
+	capped.Transport = &cappedTransport{base: base.Transport}
+	if capped.Timeout == 0 {
+		capped.Timeout = providerRequestTimeout
+	}
+	return oidc.ClientContext(ctx, &capped)
+}
+
+type cappedTransport struct {
+	base http.RoundTripper
+}
+
+func (t *cappedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &cappedBody{body: resp.Body, remaining: maxProviderResponseBytes}
+	return resp, nil
+}
+
+type cappedBody struct {
+	body      io.ReadCloser
+	remaining int64
+}
+
+func (b *cappedBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		var probe [1]byte
+		n, err := b.body.Read(probe[:])
+		if n > 0 {
+			return 0, errProviderResponseTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.body.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+func (b *cappedBody) Close() error { return b.body.Close() }
 
 func parseScopes(s string) []string {
 	if s == "" {
@@ -154,6 +267,7 @@ func generateNonce() (string, error) {
 
 // Exchange exchanges the authorization code for tokens and fetches UserInfo.
 func (c *Client) Exchange(ctx context.Context, code, codeVerifier, expectedState, expectedNonce string, callbackParams url.Values) (*UserInfo, error) {
+	ctx = withCappedHTTPClient(ctx)
 	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -211,17 +325,37 @@ func (c *Client) Exchange(ctx context.Context, code, codeVerifier, expectedState
 				return nil, fmt.Errorf("oidc: fetch userinfo: %w", err)
 			}
 		} else {
-			if oidcUserInfo.Subject != "" && oidcUserInfo.Subject != idToken.Subject {
+			if oidcUserInfo.Subject == "" {
+				return nil, errors.New("oidc: UserInfo response has no sub claim")
+			}
+			if oidcUserInfo.Subject != idToken.Subject {
 				return nil, errors.New("oidc: UserInfo sub does not match id_token sub")
 			}
 			userInfoClaims["sub"] = oidcUserInfo.Subject
 			userInfoClaims["email"] = oidcUserInfo.Email
-			userInfoClaims["email_verified"] = oidcUserInfo.EmailVerified
+			// Positive only: go-oidc decodes a missing claim to false, and
+			// absent must stay distinguishable from denied.
+			if oidcUserInfo.EmailVerified {
+				userInfoClaims["email_verified"] = true
+			}
 			userInfoClaims["profile"] = oidcUserInfo.Profile
 			var extraClaims map[string]interface{}
 			if err := oidcUserInfo.Claims(&extraClaims); err == nil {
 				for k, v := range extraClaims {
 					userInfoClaims[k] = v
+				}
+			} else {
+				// No raw view, so fail closed rather than read as absent.
+				userInfoClaims["email_verified"] = oidcUserInfo.EmailVerified
+			}
+			// encoding/json is case-insensitive, the merge above is not, so a
+			// non-canonical key would read as absent and lose a denial.
+			if _, ok := userInfoClaims["email_verified"]; !ok {
+				for k, v := range extraClaims {
+					if strings.EqualFold(k, "email_verified") {
+						userInfoClaims["email_verified"] = v
+						break
+					}
 				}
 			}
 		}
@@ -229,16 +363,23 @@ func (c *Client) Exchange(ctx context.Context, code, codeVerifier, expectedState
 
 	idClaims := make(map[string]interface{})
 	_ = idToken.Claims(&idClaims)
+	tid, _ := idClaims["tid"].(string)
+	userInfo.Issuer = canonicalIssuer(idToken.Issuer, tid)
+	if userInfo.Issuer == "" {
+		return nil, errors.New("oidc: id_token missing iss claim")
+	}
 
-	userInfo.Email = getStringClaim(userInfoClaims, idClaims, "email")
+	email, emailFromIDToken := lookupStringClaim(userInfoClaims, idClaims, "email")
+	userInfo.Email = email
 	if userInfo.Email == "" {
 		return nil, errors.New("oidc: no email in UserInfo or id_token")
 	}
 
-	userInfo.EmailVerified = getBoolClaim(userInfoClaims, idClaims, "email_verified")
+	userInfo.EmailVerified, userInfo.EmailVerifiedReason = resolveEmailVerified(userInfoClaims, idClaims, emailFromIDToken, c.cfg.IssuerURL)
+	userInfo.PreferredUsername = getStringClaim(userInfoClaims, idClaims, "preferred_username")
 	userInfo.Name = getStringClaim(userInfoClaims, idClaims, "name")
 	if userInfo.Name == "" {
-		userInfo.Name = getStringClaim(userInfoClaims, idClaims, "preferred_username")
+		userInfo.Name = userInfo.PreferredUsername
 	}
 	if userInfo.Name == "" {
 		userInfo.Name = strings.Split(userInfo.Email, "@")[0]
@@ -260,6 +401,64 @@ func (c *Client) Exchange(ctx context.Context, code, codeVerifier, expectedState
 	userInfo.Groups = extractGroups(userInfoClaims, idClaims)
 
 	return userInfo, nil
+}
+
+var microsoftTenantPlaceholders = map[string]bool{"{tenantid}": true, "common": true, "organizations": true, "consumers": true}
+
+var microsoftTenantIssuerHosts = map[string]bool{
+	"login.microsoftonline.com":        true,
+	"login.microsoftonline.us":         true,
+	"login.partner.microsoftonline.cn": true,
+	"login.chinacloudapi.cn":           true,
+	"sts.windows.net":                  true,
+}
+
+func isMicrosoftTenantIssuer(u *url.URL) bool {
+	return microsoftTenantIssuerHosts[strings.ToLower(u.Hostname())]
+}
+
+// canonicalIssuer substitutes Entra's tid for a templated or shared tenant
+// segment, so the stored issuer always names the tenant that issued the sub.
+func canonicalIssuer(iss, tid string) string {
+	iss = strings.TrimSuffix(strings.TrimSpace(iss), "/")
+	if tid == "" {
+		return iss
+	}
+	u, err := url.Parse(iss)
+	if err != nil || !isMicrosoftTenantIssuer(u) {
+		return iss
+	}
+	segs := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(segs) > 0 && microsoftTenantPlaceholders[strings.ToLower(segs[0])] {
+		segs[0] = tid
+		u.Path = "/" + strings.Join(segs, "/")
+		return u.String()
+	}
+	return iss
+}
+
+// SameIssuer reports whether two issuers name the same subject namespace.
+// Microsoft issuers compare by tenant, so its v1 and v2.0 forms are equal.
+func SameIssuer(a, b string) bool {
+	ka, okA := issuerKey(a)
+	kb, okB := issuerKey(b)
+	return okA && okB && ka == kb
+}
+
+func issuerKey(iss string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(iss))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	if isMicrosoftTenantIssuer(u) {
+		tenant := strings.ToLower(strings.SplitN(strings.TrimPrefix(u.Path, "/"), "/", 2)[0])
+		if tenant == "" || microsoftTenantPlaceholders[tenant] {
+			return "", false
+		}
+		return "microsoft:" + tenant, true
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) + path, true
 }
 
 func resolveProviderPicture(ctx context.Context, issuerURL string, token *oauth2.Token, rawPicture string) (string, error) {
@@ -388,31 +587,122 @@ func fetchMicrosoftGraphPhotoDataURL(ctx context.Context, token *oauth2.Token) (
 }
 
 func getStringClaim(primary, fallback map[string]interface{}, key string) string {
-	if v, ok := primary[key]; ok && v != nil {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	if v, ok := fallback[key]; ok && v != nil {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return ""
+	v, _ := lookupStringClaim(primary, fallback, key)
+	return v
 }
 
-func getBoolClaim(primary, fallback map[string]interface{}, key string) bool {
-	if v, ok := primary[key]; ok && v != nil {
-		if b, ok := v.(bool); ok {
-			return b
+// Empty counts as absent. Arrays are the ADFS encoding; strings return verbatim
+// because a padded value may already be stored against an account.
+func lookupStringClaim(primary, fallback map[string]interface{}, key string) (value string, fromFallback bool) {
+	for i, claims := range []map[string]interface{}{primary, fallback} {
+		v, ok := claims[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			if strings.TrimSpace(t) != "" {
+				return t, i == 1
+			}
+		case []interface{}:
+			for _, item := range t {
+				s, ok := item.(string)
+				if !ok {
+					continue
+				}
+				if s = strings.TrimSpace(s); s != "" {
+					return s, i == 1
+				}
+			}
 		}
 	}
-	if v, ok := fallback[key]; ok && v != nil {
-		if b, ok := v.(bool); ok {
-			return b
+	return "", false
+}
+
+// lookupBoolClaim reports a boolean claim's value and whether it was found in a
+// form it could decode. An undecodable value counts as not found, so resolution
+// continues to the fallback map. Tolerates the string and numeric encodings real
+// providers emit, not just v.(bool).
+func lookupBoolClaim(primary, fallback map[string]interface{}, key string) (value, found bool) {
+	for _, claims := range []map[string]interface{}{primary, fallback} {
+		v, ok := claims[key]
+		if !ok || v == nil {
+			continue
+		}
+		if b, ok := decodeBoolClaim(v); ok {
+			return b, true
+		}
+		// Same ADFS array encoding lookupStringClaim handles.
+		if arr, ok := v.([]interface{}); ok {
+			for _, item := range arr {
+				if b, ok := decodeBoolClaim(item); ok {
+					return b, true
+				}
+			}
 		}
 	}
-	return false
+	return false, false
+}
+
+func decodeBoolClaim(v interface{}) (value, ok bool) {
+	switch t := v.(type) {
+	case bool:
+		return t, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "1", "yes":
+			return true, true
+		case "false", "0", "no", "":
+			return false, true
+		}
+	case float64: // encoding/json decodes all JSON numbers as float64
+		return t != 0, true
+	}
+	return false, false
+}
+
+// resolveEmailVerified reports whether the IdP asserted the email is verified,
+// and why not when it did not. Gates account linking and auto-creation, so an
+// absent assertion fails closed.
+//
+// xms_edov is Entra's equivalent, consulted only when email_verified is absent:
+// an explicit false is a denial and is never overridden. It is accepted only
+// from a Microsoft issuer, because an IdP with user-controlled claim mapping
+// could otherwise forge it, and only from the signature-verified ID token.
+// emailFromFallback makes the map that supplied the email win, so an unsigned
+// UserInfo assertion cannot override a signed denial in the ID token.
+func resolveEmailVerified(primary, fallback map[string]interface{}, emailFromFallback bool, issuerURL string) (bool, string) {
+	first, second := primary, fallback
+	if emailFromFallback {
+		first, second = fallback, primary
+	}
+	if v, found := lookupBoolClaim(first, second, "email_verified"); found {
+		if v {
+			return true, ""
+		}
+		return false, "provider sent email_verified=false"
+	}
+
+	_, edovInIDToken := lookupBoolClaim(fallback, nil, "xms_edov")
+	_, edovInUserInfo := lookupBoolClaim(primary, nil, "xms_edov")
+
+	if !isMicrosoftIdentityIssuer(issuerURL) {
+		if edovInIDToken || edovInUserInfo {
+			return false, "xms_edov was sent but is only honoured from a Microsoft identity platform issuer, and this issuer is not one"
+		}
+		return false, "provider sent no email_verified claim"
+	}
+	if edovInIDToken {
+		v, _ := lookupBoolClaim(fallback, nil, "xms_edov")
+		if v {
+			return true, ""
+		}
+		return false, "provider sent xms_edov=false"
+	}
+	if edovInUserInfo {
+		return false, "xms_edov was sent in the UserInfo response but is only honoured from the ID token; add it as an ID token optional claim"
+	}
+	return false, "provider sent neither email_verified nor xms_edov"
 }
 
 // extractGroups extracts group names from claims (groups or ak_groups for Authentik).

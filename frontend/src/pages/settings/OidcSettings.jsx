@@ -14,6 +14,9 @@ import { useEffect, useMemo, useState } from "react";
 import { useToast } from "../../contexts/ToastContext";
 import { oidcAPI, permissionsAPI } from "../../utils/api";
 
+const SSO_FALLBACK_DOCS_URL =
+	"https://patchmon.net/docs/patchmon-operator-guide#sso-provider-unreachable-password-login";
+
 // Map PatchMon role to OIDC form field (backend supports these 5 + default)
 const ROLE_TO_OIDC_FIELD = {
 	superadmin: "oidc_superadmin_group",
@@ -69,6 +72,9 @@ const OidcSettings = () => {
 	const [showSetupGuide, setShowSetupGuide] = useState(false);
 
 	// Local form state - only saved when user clicks Apply
+	const [isDirty, setIsDirty] = useState(false);
+	// Last values loaded from the server; Apply sends only fields that differ from it.
+	const [baseline, setBaseline] = useState(null);
 	const [form, setForm] = useState({
 		oidc_issuer_url: "",
 		oidc_client_id: "",
@@ -85,6 +91,8 @@ const OidcSettings = () => {
 		oidc_disable_local_auth: false,
 		oidc_auto_create_users: true,
 		oidc_enforce_https: true,
+		oidc_trust_unverified_email: false,
+		oidc_local_auth_fallback: false,
 	});
 
 	// Fetch OIDC settings
@@ -117,10 +125,11 @@ const OidcSettings = () => {
 		});
 	}, [rolesData]);
 
-	// Sync form from server when settings load; pre-fill redirect URI from callback_url when empty
+	// Sync form from server; pre-fill redirect URI from callback_url when empty.
+	// Never hydrate over unsaved edits: a refetch would otherwise discard them.
 	useEffect(() => {
-		if (!settings) return;
-		setForm({
+		if (!settings || isDirty) return;
+		const loaded = {
 			oidc_issuer_url: settings.oidc_issuer_url || "",
 			oidc_client_id: settings.oidc_client_id || "",
 			oidc_redirect_uri:
@@ -137,15 +146,21 @@ const OidcSettings = () => {
 			oidc_disable_local_auth: settings.oidc_disable_local_auth ?? false,
 			oidc_auto_create_users: settings.oidc_auto_create_users ?? true,
 			oidc_enforce_https: settings.oidc_enforce_https ?? true,
-		});
-	}, [settings]);
+			oidc_trust_unverified_email:
+				settings.oidc_trust_unverified_email ?? false,
+			oidc_local_auth_fallback: settings.oidc_local_auth_fallback ?? false,
+		};
+		setForm(loaded);
+		setBaseline(loaded);
+	}, [settings, isDirty]);
 
 	// Update settings mutation
 	const updateMutation = useMutation({
 		mutationFn: (data) => oidcAPI.updateSettings(data),
 		onSuccess: () => {
-			queryClient.invalidateQueries(["oidcSettings"]);
+			queryClient.invalidateQueries({ queryKey: ["oidcSettings"] });
 			setSecretInput("");
+			setIsDirty(false);
 			toast.success("OIDC settings saved");
 		},
 		onError: (err) => {
@@ -157,7 +172,9 @@ const OidcSettings = () => {
 	const importMutation = useMutation({
 		mutationFn: () => oidcAPI.importFromEnv(),
 		onSuccess: () => {
-			queryClient.invalidateQueries(["oidcSettings"]);
+			queryClient.invalidateQueries({ queryKey: ["oidcSettings"] });
+			// The imported values are meant to land in the form, so drop the guard.
+			setIsDirty(false);
 			toast.success("OIDC settings imported from .env");
 		},
 		onError: (err) => {
@@ -172,30 +189,42 @@ const OidcSettings = () => {
 	};
 
 	const handleFieldChange = (field, value) => {
+		setIsDirty(true);
 		setForm((prev) => ({ ...prev, [field]: value }));
 	};
 
+	const toPayload = (f) => ({
+		oidc_issuer_url: f.oidc_issuer_url || "",
+		oidc_client_id: f.oidc_client_id || "",
+		oidc_redirect_uri: f.oidc_redirect_uri || settings?.callback_url || "",
+		oidc_scopes: f.oidc_scopes || "openid email profile groups",
+		oidc_button_text: f.oidc_button_text || "Login with SSO",
+		oidc_sync_roles: f.oidc_sync_roles,
+		oidc_default_role: f.oidc_default_role || "user",
+		oidc_superadmin_group: f.oidc_superadmin_group || "",
+		oidc_admin_group: f.oidc_admin_group || "",
+		oidc_host_manager_group: f.oidc_host_manager_group || "",
+		oidc_readonly_group: f.oidc_readonly_group || "",
+		oidc_user_group: f.oidc_user_group || "",
+		oidc_disable_local_auth: f.oidc_disable_local_auth,
+		oidc_auto_create_users: f.oidc_auto_create_users,
+		oidc_enforce_https: f.oidc_enforce_https ?? true,
+		oidc_trust_unverified_email: f.oidc_trust_unverified_email ?? false,
+		oidc_local_auth_fallback: f.oidc_local_auth_fallback ?? false,
+	});
+
 	const handleApply = () => {
-		const payload = {
-			oidc_enabled: settings?.oidc_enabled ?? false,
-			oidc_issuer_url: form.oidc_issuer_url || "",
-			oidc_client_id: form.oidc_client_id || "",
-			oidc_redirect_uri: form.oidc_redirect_uri || settings?.callback_url || "",
-			oidc_scopes: form.oidc_scopes || "openid email profile groups",
-			oidc_button_text: form.oidc_button_text || "Login with SSO",
-			oidc_sync_roles: form.oidc_sync_roles,
-			oidc_default_role: form.oidc_default_role || "user",
-			oidc_superadmin_group: form.oidc_superadmin_group || "",
-			oidc_admin_group: form.oidc_admin_group || "",
-			oidc_host_manager_group: form.oidc_host_manager_group || "",
-			oidc_readonly_group: form.oidc_readonly_group || "",
-			oidc_user_group: form.oidc_user_group || "",
-			oidc_disable_local_auth: form.oidc_disable_local_auth,
-			oidc_auto_create_users: form.oidc_auto_create_users,
-			oidc_enforce_https: form.oidc_enforce_https ?? true,
-		};
+		const next = toPayload(form);
+		const prev = baseline ? toPayload(baseline) : {};
+		const payload = Object.fromEntries(
+			Object.entries(next).filter(([key, value]) => prev[key] !== value),
+		);
 		if (secretInput.trim()) {
 			payload.oidc_client_secret = secretInput.trim();
+		}
+		if (Object.keys(payload).length === 0) {
+			setIsDirty(false);
+			return;
 		}
 		updateMutation.mutate(payload);
 	};
@@ -245,8 +274,14 @@ const OidcSettings = () => {
 								OIDC is configured via .env
 							</h3>
 							<p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
-								Import these settings and save to database to manage from the
-								UI. After saving, remove OIDC_* from .env.
+								<strong>
+									Every OIDC setting below is read from the environment, so
+									changes saved here take no effect yet.
+								</strong>{" "}
+								That includes the toggles. They are still saved, and they start
+								applying the moment the OIDC_* variables are removed from .env,
+								so check them before you do. Import these settings and save to
+								database to manage from the UI.
 							</p>
 							{settings?.env_preview &&
 								Object.keys(settings.env_preview).length > 0 && (
@@ -284,7 +319,7 @@ const OidcSettings = () => {
 				<h3 className="font-medium text-secondary-900 dark:text-white mb-4">
 					Configuration
 				</h3>
-				<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+				<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
 					{/* Enable OIDC */}
 					<ToggleCard
 						label="Enable OIDC / SSO"
@@ -326,6 +361,31 @@ const OidcSettings = () => {
 						}
 						disabled={updateMutation.isPending}
 					/>
+					{/* Password login while the IdP is unreachable */}
+					<ToggleCard
+						label="Superadmin password login if SSO is down"
+						description={
+							<>
+								Superadmins with 2FA, while local auth is disabled.{" "}
+								<a
+									href={SSO_FALLBACK_DOCS_URL}
+									target="_blank"
+									rel="noopener noreferrer"
+									className="text-primary-600 dark:text-primary-400 hover:underline"
+								>
+									Learn more
+								</a>
+							</>
+						}
+						checked={form.oidc_local_auth_fallback}
+						onChange={() =>
+							handleFieldChange(
+								"oidc_local_auth_fallback",
+								!form.oidc_local_auth_fallback,
+							)
+						}
+						disabled={updateMutation.isPending || !form.oidc_disable_local_auth}
+					/>
 					{/* Auto-create users */}
 					<ToggleCard
 						label="Auto-create users"
@@ -339,7 +399,40 @@ const OidcSettings = () => {
 						}
 						disabled={updateMutation.isPending}
 					/>
+					{/* Trust unverified email */}
+					<ToggleCard
+						label="Trust unverified email"
+						description="Only if your IdP cannot confirm addresses"
+						checked={form.oidc_trust_unverified_email}
+						onChange={() =>
+							handleFieldChange(
+								"oidc_trust_unverified_email",
+								!form.oidc_trust_unverified_email,
+							)
+						}
+						disabled={updateMutation.isPending}
+					/>
 				</div>
+				{form.oidc_trust_unverified_email && (
+					<div className="mt-4 p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
+						<p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+							Trust unverified email is on. Anyone who can set their own email
+							address at your identity provider can sign in as an existing
+							PatchMon user. Only leave this on if you control who can change
+							addresses in your directory.
+						</p>
+					</div>
+				)}
+				{form.oidc_disable_local_auth && form.oidc_local_auth_fallback && (
+					<div className="mt-4 p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
+						<p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+							Superadmins with two-factor authentication can sign in with a
+							password whenever PatchMon cannot reach your identity provider.
+							Anyone who can cut PatchMon off from your provider, and holds a
+							superadmin password and second factor, can use that to get in.
+						</p>
+					</div>
+				)}
 				{!form.oidc_enforce_https && (
 					<div className="mt-4 p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800">
 						<p className="text-sm font-medium text-amber-800 dark:text-amber-200">

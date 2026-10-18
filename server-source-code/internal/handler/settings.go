@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -12,6 +15,8 @@ import (
 
 	"github.com/PatchMon/PatchMon/server-source-code/internal/agentregistry"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/config"
+	hostctx "github.com/PatchMon/PatchMon/server-source-code/internal/context"
+	"github.com/PatchMon/PatchMon/server-source-code/internal/middleware"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/models"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/store"
 	"github.com/PatchMon/PatchMon/server-source-code/internal/util"
@@ -27,6 +32,30 @@ type SettingsHandler struct {
 	assetsDir string
 	cfg       *config.Config
 	resolved  *config.ResolvedConfig
+	// Per-context caches derived from the settings row, dropped on write.
+	evictors    []hostctx.HostEvictor
+	permissions *store.PermissionsStore
+}
+
+// WithPermissions wires the role store used to stop default-role changes granting more than the caller holds.
+func (h *SettingsHandler) WithPermissions(p *store.PermissionsStore) *SettingsHandler {
+	h.permissions = p
+	return h
+}
+
+// WithEvictors wires the caches invalidated on a settings write.
+func (h *SettingsHandler) WithEvictors(e ...hostctx.HostEvictor) *SettingsHandler {
+	h.evictors = append(h.evictors, e...)
+	return h
+}
+
+func (h *SettingsHandler) invalidateContextCaches(ctx context.Context) {
+	host := hostctx.TenantHostKey(ctx)
+	for _, e := range h.evictors {
+		if e != nil {
+			e.EvictHost(host)
+		}
+	}
 }
 
 // NewSettingsHandler creates a new settings handler.
@@ -64,6 +93,41 @@ func (h *SettingsHandler) GetServerURL(w http.ResponseWriter, r *http.Request) {
 		url = "http://localhost:3001"
 	}
 	JSON(w, http.StatusOK, map[string]string{"server_url": url})
+}
+
+type serverURLCORSCheckResponse struct {
+	ServerURL string `json:"server_url"`
+	Allowed   bool   `json:"allowed"`
+	Reason    string `json:"reason"`
+}
+
+// ServerURLCORSCheck handles GET /settings/server-url/cors-check.
+func (h *SettingsHandler) ServerURLCORSCheck(w http.ResponseWriter, r *http.Request) {
+	s, err := h.settings.GetFirst(r.Context())
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "Failed to load settings")
+		return
+	}
+	serverURL := s.ServerURL
+	if serverURL == "" {
+		serverURL = "http://localhost:3001"
+	}
+	JSON(w, http.StatusOK, checkServerURLCORS(r, serverURL))
+}
+
+func checkServerURLCORS(r *http.Request, serverURL string) serverURLCORSCheckResponse {
+	resp := serverURLCORSCheckResponse{ServerURL: serverURL}
+	if validateServerURL(serverURL) != nil {
+		resp.Reason = "server_url_invalid"
+		return resp
+	}
+	u, _ := url.Parse(serverURL)
+	if !middleware.CORSAllowsHost(r, u.Host) {
+		resp.Reason = "host_not_in_cors_origin"
+		return resp
+	}
+	resp.Allowed = true
+	return resp
 }
 
 // GetCurrentURL handles GET /settings/current-url (public). Returns the effective URL from X-Forwarded-* or Host.
@@ -114,8 +178,6 @@ func (h *SettingsHandler) VersionCurrent(version string) http.HandlerFunc {
 
 const serverVersionDNS = "server.vcheck.patchmon.net"
 
-var semverRe = regexp.MustCompile(`^\d+\.\d+\.\d+`)
-
 // VersionCheckUpdates handles GET /version/check-updates (matches Node backend).
 // Fetches latest server version from DNS (server.vcheck.patchmon.net) and returns update info.
 func (h *SettingsHandler) VersionCheckUpdates(currentVersion string) http.HandlerFunc {
@@ -138,7 +200,7 @@ func (h *SettingsHandler) VersionCheckUpdates(currentVersion string) http.Handle
 			}
 		} else {
 			latestVersion = strings.TrimSpace(strings.Trim(latestVersion, "\"'"))
-			if !semverRe.MatchString(latestVersion) {
+			if !util.HasVersionPrefix(latestVersion) {
 				latestVersion = ""
 				if s.LatestVersion != nil {
 					latestVersion = *s.LatestVersion
@@ -232,6 +294,14 @@ func (h *SettingsHandler) isDiscordProperlyConfigured(s *models.Settings) bool {
 	return err == nil
 }
 
+// resolvedConfigFor resolves config from a freshly read settings row rather than h.resolved.
+func (h *SettingsHandler) resolvedConfigFor(ctx context.Context, s *models.Settings) *config.ResolvedConfig {
+	if h.cfg == nil {
+		return h.resolved
+	}
+	return config.ResolveConfig(ctx, h.cfg, s)
+}
+
 // GetLoginSettings handles GET /settings/login-settings (public, used by login screen and first-time admin setup).
 // Includes has_admin_users and oidc fields for first-time setup flow (replaces /auth/check-admin-users).
 func (h *SettingsHandler) GetLoginSettings(w http.ResponseWriter, r *http.Request) {
@@ -272,6 +342,7 @@ func (h *SettingsHandler) GetLoginSettings(w http.ResponseWriter, r *http.Reques
 				"autoCreateUsers":  false,
 				"canBypassWelcome": false,
 			},
+			"password_policy": resolvePasswordPolicy(h.resolvedConfigFor(r.Context(), nil)),
 		})
 		return
 	}
@@ -328,6 +399,7 @@ func (h *SettingsHandler) GetLoginSettings(w http.ResponseWriter, r *http.Reques
 			"autoCreateUsers":  s.OidcAutoCreateUsers,
 			"canBypassWelcome": canBypassWelcome,
 		},
+		"password_policy": resolvePasswordPolicy(h.resolvedConfigFor(r.Context(), s)),
 	})
 }
 
@@ -455,14 +527,14 @@ func buildEnvironmentVariables(cfg *config.Config, resolved *config.ResolvedConf
 		{Category: "Database", Key: "DB_CONNECT_TIMEOUT", EffectiveValue: strconv.Itoa(cfg.DBConnectTimeout), EffectiveSource: source(env("DB_CONNECT_TIMEOUT"), "", "10"), EnvValue: env("DB_CONNECT_TIMEOUT"), DBValue: "", DefaultValue: "10", Editable: false, Conflict: false, Description: "Connect timeout (seconds); startup only - configure via .env"},
 		{Category: "Database", Key: "PM_DB_CONN_MAX_ATTEMPTS", EffectiveValue: strconv.Itoa(cfg.DBConnMaxAttempts), EffectiveSource: source(env("PM_DB_CONN_MAX_ATTEMPTS"), "", "30"), EnvValue: env("PM_DB_CONN_MAX_ATTEMPTS"), DBValue: "", DefaultValue: "30", Editable: false, Conflict: false, Description: "Retry attempts at startup; configure via .env"},
 		{Category: "Database", Key: "PM_DB_CONN_WAIT_INTERVAL", EffectiveValue: strconv.Itoa(cfg.DBConnWaitInterval), EffectiveSource: source(env("PM_DB_CONN_WAIT_INTERVAL"), "", "2"), EnvValue: env("PM_DB_CONN_WAIT_INTERVAL"), DBValue: "", DefaultValue: "2", Editable: false, Conflict: false, Description: "Seconds between connection retries; configure via .env"},
-		{Category: "Server", Key: "CORS_ORIGIN", EffectiveValue: corsEffective, EffectiveSource: corsSource, EnvValue: env("CORS_ORIGIN"), DBValue: dbStr(s.CorsOrigin), DefaultValue: "http://localhost:3000", Editable: true, Conflict: env("CORS_ORIGIN") != "" && s.CorsOrigin != nil && *s.CorsOrigin != "", Description: "Allowed origin for CORS (frontend URL). Comma-separated for multiple origins. Requires a server restart to take effect."},
+		{Category: "Server", Key: "CORS_ORIGIN", EffectiveValue: corsEffective, EffectiveSource: corsSource, EnvValue: env("CORS_ORIGIN"), DBValue: dbStr(s.CorsOrigin), DefaultValue: "http://localhost:3000", Editable: true, Conflict: env("CORS_ORIGIN") != "" && s.CorsOrigin != nil && *s.CorsOrigin != "", Description: "Browser origin(s) allowed to use PatchMon, e.g. https://patchmon.example.com. Comma-separated for multiple origins. Requires a server restart to take effect."},
 		{Category: "Server", Key: "ENABLE_HSTS", EffectiveValue: boolStr(resolved.EnableHSTS), EffectiveSource: source(env("ENABLE_HSTS"), dbBool(s.EnableHSTS), "false"), EnvValue: env("ENABLE_HSTS"), DBValue: dbBool(s.EnableHSTS), DefaultValue: "false", Editable: true, Conflict: env("ENABLE_HSTS") != "" && s.EnableHSTS != nil, Description: "Enable HSTS header for HTTPS"},
-		{Category: "Server", Key: "TRUST_PROXY", EffectiveValue: trustProxyStr, EffectiveSource: source(env("TRUST_PROXY"), dbBool(s.TrustProxy), "true"), EnvValue: env("TRUST_PROXY"), DBValue: dbBool(s.TrustProxy), DefaultValue: "true", Editable: true, Conflict: env("TRUST_PROXY") != "" && s.TrustProxy != nil, Description: "Trust proxy headers (X-Forwarded-Proto / X-Forwarded-For) from a reverse proxy. Default true; set to false only if PatchMon is exposed directly to the internet without a proxy."},
-		{Category: "Server", Key: "TRUSTED_PROXY_RANGES", EffectiveValue: strings.Join(cfg.TrustedProxyRanges, ", "), EffectiveSource: source(env("TRUSTED_PROXY_RANGES"), "", ""), EnvValue: env("TRUSTED_PROXY_RANGES"), DBValue: "", DefaultValue: "(empty)", Editable: false, Conflict: false, Description: "Comma-separated CIDRs or IPs of reverse proxies in front of PatchMon, used to resolve the real client IP from X-Forwarded-For. Leave empty for a single proxy; set it when proxies are chained (e.g. Cloudflare in front of NPM). Env only, and deliberately not editable here: widening it would allow X-Forwarded-For spoofing."},
+		{Category: "Server", Key: "TRUST_PROXY", EffectiveValue: trustProxyStr, EffectiveSource: source(env("TRUST_PROXY"), dbBool(s.TrustProxy), "true"), EnvValue: env("TRUST_PROXY"), DBValue: dbBool(s.TrustProxy), DefaultValue: "true", Editable: false, Conflict: env("TRUST_PROXY") != "" && s.TrustProxy != nil, Description: "Trust proxy headers (X-Forwarded-Proto / X-Forwarded-For) from a reverse proxy. Read once at startup and applied process-wide, so it describes the deployment rather than a single context; configure via .env. Default true; set to false only if PatchMon is exposed directly to the internet without a proxy."},
+		{Category: "Server", Key: "TRUSTED_PROXY_RANGES", EffectiveValue: strings.Join(cfg.TrustedProxyRanges, ", "), EffectiveSource: source(env("TRUSTED_PROXY_RANGES"), "", ""), EnvValue: env("TRUSTED_PROXY_RANGES"), DBValue: "", DefaultValue: "(empty)", Editable: false, Conflict: false, Description: "Comma-separated CIDRs or IPs of reverse proxies in front of PatchMon, used to resolve the real client IP from X-Forwarded-For. When empty, X-Forwarded-For is read from loopback, private, link-local and CGNAT peers; when set, only from the peers listed, so include your own proxy. Leave empty for a single proxy on a private network; set it when the proxy has a public address or proxies are chained (e.g. Cloudflare in front of NPM). Env only, and deliberately not editable here: widening it would allow X-Forwarded-For spoofing."},
 		{Category: "Server", Key: "PORT", EffectiveValue: strconv.Itoa(cfg.Port), EffectiveSource: source(env("PORT"), "", "3001"), EnvValue: env("PORT"), DBValue: "", DefaultValue: "3001", Editable: false, Conflict: false, Description: "Backend API port; configure via .env"},
 		{Category: "Server", Key: "APP_ENV", EffectiveValue: cfg.Env, EffectiveSource: source(env("APP_ENV"), "", envDefault("NODE_ENV", "production")), EnvValue: env("APP_ENV"), DBValue: "", DefaultValue: "production", Editable: false, Conflict: false, Description: "Environment mode (production/development)"},
 		{Category: "Server", Key: "TIMEZONE", EffectiveValue: resolved.Timezone, EffectiveSource: source(envTzOrTimezone(), dbStr(s.Timezone), "UTC"), EnvValue: envTzOrTimezone(), DBValue: dbStr(s.Timezone), DefaultValue: "UTC", Editable: true, Conflict: envTzOrTimezone() != "" && s.Timezone != nil && *s.Timezone != "", Description: "IANA timezone (e.g. America/New_York, Europe/London)"},
-		{Category: "Logging", Key: "ENABLE_LOGGING", EffectiveValue: enableLoggingStr, EffectiveSource: source(env("ENABLE_LOGGING"), dbBool(s.EnableLogging), "false"), EnvValue: env("ENABLE_LOGGING"), DBValue: dbBool(s.EnableLogging), DefaultValue: "false", Editable: true, Conflict: env("ENABLE_LOGGING") != "" && s.EnableLogging != nil, Description: "Enable backend logging to stdout"},
+		{Category: "Logging", Key: "ENABLE_LOGGING", EffectiveValue: enableLoggingStr, EffectiveSource: source(env("ENABLE_LOGGING"), dbBool(s.EnableLogging), "true"), EnvValue: env("ENABLE_LOGGING"), DBValue: dbBool(s.EnableLogging), DefaultValue: "true", Editable: true, Conflict: env("ENABLE_LOGGING") != "" && s.EnableLogging != nil, Description: "Enable backend logging to stdout"},
 		{Category: "Logging", Key: "LOG_LEVEL", EffectiveValue: logLevelEffective, EffectiveSource: source(env("LOG_LEVEL"), dbStr(s.LogLevel), "info"), EnvValue: env("LOG_LEVEL"), DBValue: dbStr(s.LogLevel), DefaultValue: "info", Editable: true, Conflict: env("LOG_LEVEL") != "" && s.LogLevel != nil && *s.LogLevel != "", Description: "Log level: debug, info, warn, error"},
 		{Category: "Authentication", Key: "MAX_LOGIN_ATTEMPTS", EffectiveValue: strconv.Itoa(resolved.MaxLoginAttempts), EffectiveSource: source(env("MAX_LOGIN_ATTEMPTS"), dbInt(s.MaxLoginAttempts), strconv.Itoa(cfg.MaxLoginAttempts)), EnvValue: env("MAX_LOGIN_ATTEMPTS"), DBValue: dbInt(s.MaxLoginAttempts), DefaultValue: "5", Editable: true, Conflict: env("MAX_LOGIN_ATTEMPTS") != "" && s.MaxLoginAttempts != nil, Description: "Max failed login attempts before lockout"},
 		{Category: "Authentication", Key: "LOCKOUT_DURATION_MINUTES", EffectiveValue: strconv.Itoa(resolved.LockoutDurationMin), EffectiveSource: source(env("LOCKOUT_DURATION_MINUTES"), dbInt(s.LockoutDurationMinutes), "15"), EnvValue: env("LOCKOUT_DURATION_MINUTES"), DBValue: dbInt(s.LockoutDurationMinutes), DefaultValue: "15", Editable: true, Conflict: env("LOCKOUT_DURATION_MINUTES") != "" && s.LockoutDurationMinutes != nil, Description: "Lockout duration in minutes"},
@@ -474,7 +546,9 @@ func buildEnvironmentVariables(cfg *config.Config, resolved *config.ResolvedConf
 		{Category: "Password policy", Key: "PASSWORD_REQUIRE_NUMBER", EffectiveValue: boolStr(resolved.PasswordRequireNumber), EffectiveSource: source(env("PASSWORD_REQUIRE_NUMBER"), dbBool(s.PasswordRequireNumber), "true"), EnvValue: env("PASSWORD_REQUIRE_NUMBER"), DBValue: dbBool(s.PasswordRequireNumber), DefaultValue: "true", Editable: true, Conflict: env("PASSWORD_REQUIRE_NUMBER") != "" && s.PasswordRequireNumber != nil, Description: "Require number in password"},
 		{Category: "Password policy", Key: "PASSWORD_REQUIRE_SPECIAL", EffectiveValue: boolStr(resolved.PasswordRequireSpecial), EffectiveSource: source(env("PASSWORD_REQUIRE_SPECIAL"), dbBool(s.PasswordRequireSpecial), "true"), EnvValue: env("PASSWORD_REQUIRE_SPECIAL"), DBValue: dbBool(s.PasswordRequireSpecial), DefaultValue: "true", Editable: true, Conflict: env("PASSWORD_REQUIRE_SPECIAL") != "" && s.PasswordRequireSpecial != nil, Description: "Require special char in password"},
 		{Category: "Server performance", Key: "JSON_BODY_LIMIT", EffectiveValue: formatBytesEnv(resolved.JSONBodyLimitBytes), EffectiveSource: source(env("JSON_BODY_LIMIT"), dbStr(s.JSONBodyLimit), "5mb"), EnvValue: env("JSON_BODY_LIMIT"), DBValue: dbStr(s.JSONBodyLimit), DefaultValue: "5mb", Editable: true, Conflict: env("JSON_BODY_LIMIT") != "" && s.JSONBodyLimit != nil, Description: "Max JSON body size (e.g. 5mb)"},
-		{Category: "Server performance", Key: "AGENT_UPDATE_BODY_LIMIT", EffectiveValue: formatBytesEnv(resolved.AgentUpdateBodyLimitBytes), EffectiveSource: source(env("AGENT_UPDATE_BODY_LIMIT"), dbStr(s.AgentUpdateBodyLimit), "2mb"), EnvValue: env("AGENT_UPDATE_BODY_LIMIT"), DBValue: dbStr(s.AgentUpdateBodyLimit), DefaultValue: "2mb", Editable: true, Conflict: env("AGENT_UPDATE_BODY_LIMIT") != "" && s.AgentUpdateBodyLimit != nil, Description: "Max agent report body size"},
+		{Category: "Server performance", Key: "AGENT_UPDATE_BODY_LIMIT", EffectiveValue: formatBytesEnv(resolved.AgentUpdateBodyLimitBytes), EffectiveSource: source(env("AGENT_UPDATE_BODY_LIMIT"), dbStr(s.AgentUpdateBodyLimit), "5mb"), EnvValue: env("AGENT_UPDATE_BODY_LIMIT"), DBValue: dbStr(s.AgentUpdateBodyLimit), DefaultValue: "5mb", Editable: true, Conflict: env("AGENT_UPDATE_BODY_LIMIT") != "" && s.AgentUpdateBodyLimit != nil, Description: "Max agent report body size"},
+		{Category: "Server performance", Key: "COMPLIANCE_BODY_LIMIT", EffectiveValue: formatBytesEnv(resolved.ComplianceBodyLimitBytes), EffectiveSource: source(env("COMPLIANCE_BODY_LIMIT"), dbStr(s.ComplianceBodyLimit), "20mb"), EnvValue: env("COMPLIANCE_BODY_LIMIT"), DBValue: dbStr(s.ComplianceBodyLimit), DefaultValue: "20mb", Editable: true, Conflict: env("COMPLIANCE_BODY_LIMIT") != "" && s.ComplianceBodyLimit != nil, Description: "Max compliance scan result body size"},
+		{Category: "Server performance", Key: "AGENT_PING_BODY_LIMIT", EffectiveValue: formatBytesEnv(resolved.AgentPingBodyLimitBytes), EffectiveSource: source(env("AGENT_PING_BODY_LIMIT"), dbStr(s.AgentPingBodyLimit), "64kb"), EnvValue: env("AGENT_PING_BODY_LIMIT"), DBValue: dbStr(s.AgentPingBodyLimit), DefaultValue: "64kb", Editable: true, Conflict: env("AGENT_PING_BODY_LIMIT") != "" && s.AgentPingBodyLimit != nil, Description: "Max agent ping body size"},
 		{Category: "Server performance", Key: "DB_TRANSACTION_LONG_TIMEOUT", EffectiveValue: strconv.Itoa(resolved.DBTransactionLongTimeout), EffectiveSource: source(env("DB_TRANSACTION_LONG_TIMEOUT"), dbInt(s.DBTransactionLongTimeout), "60000"), EnvValue: env("DB_TRANSACTION_LONG_TIMEOUT"), DBValue: dbInt(s.DBTransactionLongTimeout), DefaultValue: "60000", Editable: true, Conflict: env("DB_TRANSACTION_LONG_TIMEOUT") != "" && s.DBTransactionLongTimeout != nil, Description: "Long transaction timeout (ms)"},
 		{Category: "Patching", Key: "PATCH_RUN_STALL_TIMEOUT_MIN", EffectiveValue: strconv.Itoa(resolved.PatchRunStallTimeoutMin), EffectiveSource: source(env("PATCH_RUN_STALL_TIMEOUT_MIN"), dbInt(s.PatchRunStallTimeoutMinutes), "30"), EnvValue: env("PATCH_RUN_STALL_TIMEOUT_MIN"), DBValue: dbInt(s.PatchRunStallTimeoutMinutes), DefaultValue: "30", Editable: true, Conflict: env("PATCH_RUN_STALL_TIMEOUT_MIN") != "" && s.PatchRunStallTimeoutMinutes != nil, Description: "Minutes before stuck running patches are auto-marked as timed_out. Min 5. Picked up on the next cleanup sweep (every 10 min)."},
 		{Category: "Reporting", Key: "AGENT_REPORTS_RETENTION_DAYS", EffectiveValue: strconv.Itoa(resolved.AgentReportsRetentionDays), EffectiveSource: source(env("AGENT_REPORTS_RETENTION_DAYS"), dbInt(s.AgentReportsRetentionDays), "30"), EnvValue: env("AGENT_REPORTS_RETENTION_DAYS"), DBValue: dbInt(s.AgentReportsRetentionDays), DefaultValue: "30", Editable: true, Conflict: env("AGENT_REPORTS_RETENTION_DAYS") != "" && s.AgentReportsRetentionDays != nil, Description: "Days to retain Agent Activity rows (ping, full, partial, docker, compliance) before the daily cleanup deletes them. Min 7, max 365. Picked up on the next cleanup sweep (02:00 daily)."},
@@ -553,14 +627,13 @@ func boolStr(b bool) string {
 }
 
 func formatBytesEnv(n int64) string {
-	if n >= 1024*1024*1024 {
-		return strconv.FormatInt(n/(1024*1024*1024), 10) + "gb"
-	}
-	if n >= 1024*1024 {
-		return strconv.FormatInt(n/(1024*1024), 10) + "mb"
-	}
-	if n >= 1024 {
-		return strconv.FormatInt(n/1024, 10) + "kb"
+	for _, u := range []struct {
+		size   int64
+		suffix string
+	}{{1 << 30, "gb"}, {1 << 20, "mb"}, {1 << 10, "kb"}} {
+		if n != 0 && n%u.size == 0 {
+			return strconv.FormatInt(n/u.size, 10) + u.suffix
+		}
 	}
 	return strconv.FormatInt(n, 10) + "b"
 }
@@ -587,19 +660,64 @@ func (h *SettingsHandler) UpdateEnvironmentConfig(w http.ResponseWriter, r *http
 		Error(w, http.StatusBadRequest, "Value is required")
 		return
 	}
+	if key == "CORS_ORIGIN" {
+		v, ok := req.Value.(string)
+		if !ok {
+			Error(w, http.StatusBadRequest, "CORS_ORIGIN requires a string value")
+			return
+		}
+		if err := middleware.ValidateOrigins(v); err != nil {
+			Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if config.IsBodyLimitKey(key) {
+		v, _ := req.Value.(string)
+		if err := config.ValidateBodyLimit(key, v); err != nil {
+			Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	slog.Debug("env config update", "key", key, "value", req.Value)
 	s, err := h.settings.GetFirst(r.Context())
 	if err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to load settings")
 		return
 	}
+	if v, ok := req.Value.(string); ok && key == "DEFAULT_USER_ROLE" && strings.TrimSpace(v) != s.DefaultUserRole {
+		v = strings.TrimSpace(v)
+		req.Value = v
+		callerRole, _ := r.Context().Value(middleware.UserRoleKey).(string)
+		if !canGrantRole(r.Context(), h.permissions, callerRole, v) {
+			Error(w, http.StatusForbidden, "You cannot set the default role to a role you are not allowed to grant: "+v)
+			return
+		}
+	}
 	if err := h.settings.UpdateConfigKey(r.Context(), s.ID, key, req.Value, s); err != nil {
 		slog.Error("env config update failed", "key", key, "error", err)
 		Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	h.invalidateContextCaches(r.Context())
 	slog.Debug("env config update saved", "key", key, "settings_id", s.ID)
-	JSON(w, http.StatusOK, map[string]string{"message": "Saved. Restart the application for changes to take effect."})
+	msg := "Saved. The new value is in effect."
+	if startupOnlyConfigKeys[key] {
+		msg = "Saved. Restart the application for this change to take effect."
+	}
+	JSON(w, http.StatusOK, map[string]string{"message": msg})
+}
+
+// startupOnlyConfigKeys are wired into middleware or the logger when the process
+// boots, so a saved value sits unused until a restart. Everything else resolves
+// per request through ConfigResolver, whose cache this handler has just
+// invalidated, and so applies immediately.
+var startupOnlyConfigKeys = map[string]bool{
+	"CORS_ORIGIN":                 true,
+	"ENABLE_LOGGING":              true,
+	"LOG_LEVEL":                   true,
+	"ENABLE_HSTS":                 true,
+	"TRUST_PROXY":                 true,
+	"DB_TRANSACTION_LONG_TIMEOUT": true,
 }
 
 func orEmpty(s, fallback string) string {
@@ -670,12 +788,22 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	oldComplianceScanInterval := s.ComplianceScanInterval
 	oldPackageCacheRefreshMode := s.PackageCacheRefreshMode
 	oldPackageCacheRefreshMaxAge := s.PackageCacheRefreshMaxAge
-	applySettingsUpdate(s, req, h.enc)
+	before := *s
+	if err := applySettingsUpdate(s, req, h.enc); err != nil {
+		Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	callerRole, _ := r.Context().Value(middleware.UserRoleKey).(string)
+	if role := ungrantableRoleChange(r.Context(), h.permissions, callerRole, &before, s); role != "" {
+		Error(w, http.StatusForbidden, "You cannot set the default role to a role you are not allowed to grant: "+role)
+		return
+	}
 
 	if err := h.settings.Update(r.Context(), s); err != nil {
 		Error(w, http.StatusInternalServerError, "Failed to update settings")
 		return
 	}
+	h.invalidateContextCaches(r.Context())
 
 	intervalChanged := s.UpdateInterval != oldInterval && s.UpdateInterval > 0
 	complianceIntervalChanged := s.ComplianceScanInterval != oldComplianceScanInterval && s.ComplianceScanInterval > 0
@@ -689,7 +817,10 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 			"package_cache_refresh_max_age": s.PackageCacheRefreshMaxAge,
 		}
 		pushed := 0
-		for _, apiID := range h.registry.GetConnectedApiIDs() {
+		// Scoped to the caller's context: the registry pools every context this
+		// process serves, so an unscoped fan-out would push one context's
+		// settings onto every other context's agents.
+		for _, apiID := range h.registry.GetConnectedApiIDs(hostctx.TenantHostKey(r.Context())) {
 			if err := h.registry.SendJSON(apiID, msg); err != nil {
 				slog.Warn("failed to push settings_update to agent", "api_id", apiID, "error", err)
 			} else {
@@ -790,27 +921,102 @@ func constructServerURL(protocol, host string, port int) string {
 	return proto + "://" + host + ":" + strconv.Itoa(port)
 }
 
-func applySettingsUpdate(s *models.Settings, req map[string]interface{}, enc *util.Encryption) {
+// Interpolated into generated install scripts across three sinks with different
+// escaping rules: double-quoted sh, double-quoted PowerShell (backtick escapes),
+// and single-quoted sh inside pct exec. Widening this set means checking all three.
+// [ ] are for IPv6 literals; safe only because every expansion is quoted.
+// Go's `$` is end-of-text, not end-of-line: do not add (?m).
+var serverURLSafeChars = regexp.MustCompile(`^[A-Za-z0-9._:/\[\]-]+$`)
+
+var serverHostSafeChars = regexp.MustCompile(`^[A-Za-z0-9._:\[\]-]+$`)
+
+func validateServerURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if len(raw) > 2048 {
+		return errors.New("server URL is too long")
+	}
+	if !serverURLSafeChars.MatchString(raw) {
+		return errors.New("server URL contains disallowed characters")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("server URL is not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("server URL must use http or https")
+	}
+	if u.Host == "" {
+		return errors.New("server URL must include a host")
+	}
+	// url.Parse does not range-check the port unless asked.
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return errors.New("server URL port must be between 1 and 65535")
+		}
+	}
+	return nil
+}
+
+func validateServerURLParts(protocol, host string, port int, hasProtocol, hasHost, hasPort bool) error {
+	if hasProtocol {
+		switch strings.ToLower(protocol) {
+		case "http", "https":
+		default:
+			return errors.New("server protocol must be http or https")
+		}
+	}
+	if hasHost {
+		if host == "" || len(host) > 253 || !serverHostSafeChars.MatchString(host) {
+			return errors.New("server host is not a valid hostname")
+		}
+	}
+	if hasPort && (port < 1 || port > 65535) {
+		return errors.New("server port must be between 1 and 65535")
+	}
+	return nil
+}
+
+func applySettingsUpdate(s *models.Settings, req map[string]interface{}, enc *util.Encryption) error {
 	urlVal, hasExplicitURL := getReqString(req, "server_url", "serverUrl")
+	protoVal, hasProtocolVal := getReqString(req, "server_protocol", "serverProtocol")
+	hostVal, hasHostVal := getReqString(req, "server_host", "serverHost")
+	portVal, hasPortVal := getReqFloat64(req, "server_port", "serverPort")
+
+	// Validate before mutating so a rejection leaves settings untouched.
+	if hasExplicitURL {
+		if err := validateServerURL(urlVal); err != nil {
+			return err
+		}
+	}
+	if err := validateServerURLParts(protoVal, hostVal, int(portVal), hasProtocolVal, hasHostVal, hasPortVal); err != nil {
+		return err
+	}
+
 	if hasExplicitURL {
 		s.ServerURL = urlVal
 	}
-	if v, ok := getReqString(req, "server_protocol", "serverProtocol"); ok {
-		s.ServerProtocol = v
+	if hasProtocolVal {
+		s.ServerProtocol = protoVal
 	}
-	if v, ok := getReqString(req, "server_host", "serverHost"); ok {
-		s.ServerHost = v
+	if hasHostVal {
+		s.ServerHost = hostVal
 	}
-	if v, ok := getReqFloat64(req, "server_port", "serverPort"); ok {
-		s.ServerPort = int(v)
+	if hasPortVal {
+		s.ServerPort = int(portVal)
 	}
 	// Derive server_url from protocol/host/port when any of those were updated (matches Node backend behavior).
 	// Only derive when server_url was not explicitly sent (explicit URL takes precedence).
-	_, hasProtocol := getReqString(req, "server_protocol", "serverProtocol")
-	_, hasHost := getReqString(req, "server_host", "serverHost")
-	_, hasPort := getReqFloat64(req, "server_port", "serverPort")
-	if !hasExplicitURL && (hasProtocol || hasHost || hasPort) {
-		s.ServerURL = constructServerURL(s.ServerProtocol, s.ServerHost, s.ServerPort)
+	if !hasExplicitURL && (hasProtocolVal || hasHostVal || hasPortVal) {
+		// Built from a mix of new and stored values, so validate the result:
+		// validateServerURLParts only saw the fields this request supplied.
+		candidate := constructServerURL(s.ServerProtocol, s.ServerHost, s.ServerPort)
+		if err := validateServerURL(candidate); err != nil {
+			return err
+		}
+		s.ServerURL = candidate
 	}
 	if v, ok := getReqFloat64(req, "update_interval", "updateInterval"); ok {
 		s.UpdateInterval = int(v)
@@ -851,7 +1057,7 @@ func applySettingsUpdate(s *models.Settings, req map[string]interface{}, enc *ut
 		s.SignupEnabled = v
 	}
 	if v, ok := getReqString(req, "default_user_role", "defaultUserRole"); ok {
-		s.DefaultUserRole = v
+		s.DefaultUserRole = strings.TrimSpace(v)
 	}
 	if v, ok := getReqBool(req, "ignore_ssl_self_signed", "ignoreSslSelfSigned"); ok {
 		s.IgnoreSSLSelfSigned = v
@@ -924,6 +1130,7 @@ func applySettingsUpdate(s *models.Settings, req map[string]interface{}, enc *ut
 			s.AiAPIKey = &v
 		}
 	}
+	return nil
 }
 
 // logoUploadReq is the request body for POST /settings/logos/upload.
@@ -993,8 +1200,12 @@ func (h *SettingsHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 	} else if isJpeg {
 		contentType = "image/jpeg"
 	} else if isSvg {
-		sanitizedSvg := sanitizeSVG(string(fileBuf))
-		fileBuf = []byte(sanitizedSvg)
+		clean, err := sanitizeSVG(fileBuf)
+		if err != nil {
+			Error(w, http.StatusBadRequest, "Invalid SVG file")
+			return
+		}
+		fileBuf = clean
 		contentType = "image/svg+xml"
 	} else {
 		Error(w, http.StatusBadRequest, "Invalid file type. Allowed: PNG, JPEG, SVG")
@@ -1126,76 +1337,8 @@ func (h *SettingsHandler) GetLogo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", logoCSP)
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	_, _ = w.Write(data)
-}
-
-// sanitizeSVG removes script tags, event handlers, and javascript: URLs from SVG to prevent XSS.
-// Uses strings instead of Perl-style regex (lookahead) since Go's regexp is RE2-based.
-func sanitizeSVG(s string) string {
-	// Remove script tags and contents (loop: RE2 has no lookahead)
-	s = removeTagAndContent(s, "script")
-	// Remove self-closing script tags: <script ... />
-	selfCloseScript := regexp.MustCompile(`(?i)<script[^>]*/\s*>`)
-	s = selfCloseScript.ReplaceAllString(s, "")
-	// Remove foreignObject (can embed arbitrary HTML)
-	s = removeTagAndContent(s, "foreignObject")
-	// Remove dangerous SVG animation/mutation elements
-	for _, tag := range []string{"set", "animate", "animateTransform", "animateMotion"} {
-		s = removeTagAndContent(s, tag)
-		selfClose := regexp.MustCompile(`(?i)<` + tag + `[^>]*/\s*>`)
-		s = selfClose.ReplaceAllString(s, "")
-	}
-	// Remove <use> elements with external references (can load external SVG)
-	useExtRe := regexp.MustCompile(`(?i)<use[^>]+href\s*=\s*["']https?://[^"']*["'][^>]*/?\s*>`)
-	s = useExtRe.ReplaceAllString(s, "")
-	s = removeTagAndContent(s, "use")
-	// Remove on* event handlers
-	onRe := regexp.MustCompile(`(?i)\s+on\w+\s*=\s*["'][^"']*["']`)
-	s = onRe.ReplaceAllString(s, "")
-	onRe2 := regexp.MustCompile(`(?i)\s+on\w+\s*=\s*[^\s>]+`)
-	s = onRe2.ReplaceAllString(s, "")
-	// Remove javascript: URLs (href, xlink:href, and any src-like attributes)
-	jsRe := regexp.MustCompile(`(?i)(href|src|xlink:href)\s*=\s*["']\s*javascript:[^"']*["']`)
-	s = jsRe.ReplaceAllString(s, `$1=""`)
-	// Remove data: URLs (RE2 has no lookahead, so match all data: and restore safe image types)
-	dataRe := regexp.MustCompile(`(?i)(href|src|xlink:href)\s*=\s*["']\s*data:[^"']*["']`)
-	s = dataRe.ReplaceAllStringFunc(s, func(m string) string {
-		lower := strings.ToLower(m)
-		for _, safe := range []string{"data:image/png", "data:image/jpeg", "data:image/jpg", "data:image/gif", "data:image/svg+xml", "data:image/webp"} {
-			if strings.Contains(lower, safe) {
-				return m
-			}
-		}
-		eqIdx := strings.Index(m, "=")
-		if eqIdx >= 0 {
-			return m[:eqIdx] + `=""`
-		}
-		return m
-	})
-	// Remove CSS @import (can exfiltrate data or load external styles)
-	importRe := regexp.MustCompile(`(?i)@import\s+[^;]+;?`)
-	s = importRe.ReplaceAllString(s, "")
-	return s
-}
-
-// removeTagAndContent removes <tag...>...</tag> and its contents. Case-insensitive.
-func removeTagAndContent(s, tag string) string {
-	openTag := "<" + tag
-	closeTag := "</" + tag + ">"
-	lower := strings.ToLower(s)
-	for {
-		i := strings.Index(lower, strings.ToLower(openTag))
-		if i < 0 {
-			break
-		}
-		j := strings.Index(lower[i:], strings.ToLower(closeTag))
-		if j < 0 {
-			break
-		}
-		end := i + j + len(closeTag)
-		s = s[:i] + s[end:]
-		lower = strings.ToLower(s)
-	}
-	return s
 }

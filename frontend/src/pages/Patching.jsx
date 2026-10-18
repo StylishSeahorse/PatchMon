@@ -24,7 +24,7 @@ import {
 	X,
 	XCircle,
 } from "lucide-react";
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import {
 	Link,
 	useLocation,
@@ -44,12 +44,23 @@ import {
 } from "../components/patching/widgets";
 import TierBadge from "../components/TierBadge";
 import UpgradeRequiredContent from "../components/UpgradeRequiredContent";
+import ModalPortal from "../components/ui/ModalPortal";
 import { getRequiredTier } from "../constants/tiers";
 import { useAuth } from "../contexts/AuthContext";
+import { useConfirm } from "../contexts/ConfirmContext";
 import { useSettings } from "../contexts/SettingsContext";
 import { useToast } from "../contexts/ToastContext";
+import { searchWithoutTab, useTabParam } from "../hooks/useTabParam";
 import { adminHostsAPI, formatDate, hostGroupsAPI } from "../utils/api";
 import { patchingAPI } from "../utils/patchingApi";
+import {
+	buildRecurrenceCron,
+	DEFAULT_RECURRENCE,
+	describeRecurrence,
+	parseRecurrenceCron,
+	WEEKDAYS,
+} from "../utils/patchRecurrence";
+import { hasExtraDependencies } from "../utils/patchRun";
 
 const PATCHING_TABS = [
 	{ id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -78,19 +89,21 @@ const Patching = () => {
 	const initialType = searchParams.get("type") || "";
 	const [activeTab, setActiveTab] = useState(initialTab);
 
-	// Sync tab and filter state on actual URL navigation (not in-page tab clicks)
+	useTabParam(activeTab);
+
 	useEffect(() => {
-		const params = new URLSearchParams(location.search);
-		const tab = params.get("tab");
-		if (tab && ["overview", "runs", "policies"].includes(tab)) {
-			setActiveTab(tab);
+		if (urlTab && ["overview", "runs", "policies"].includes(urlTab)) {
+			setActiveTab(urlTab);
 		}
-		const status = params.get("status") || "";
-		setRunsFilterStatus(status);
-		const type = params.get("type") || "";
-		setRunsFilterType(type);
+	}, [urlTab]);
+
+	const filterSearch = searchWithoutTab(location.search);
+	useEffect(() => {
+		const params = new URLSearchParams(filterSearch);
+		setRunsFilterStatus(params.get("status") || "");
+		setRunsFilterType(params.get("type") || "");
 		setRunsPage(1);
-	}, [location.search]);
+	}, [filterSearch]);
 
 	const [runsFilterStatus, setRunsFilterStatus] = useState(initialStatus);
 	const [runsFilterType, setRunsFilterType] = useState(initialType);
@@ -119,7 +132,15 @@ const Patching = () => {
 	});
 
 	const { data: runsData } = useQuery({
-		queryKey: ["patching-runs", runsFilterStatus, runsFilterType, runsPage],
+		// runsLimit is in the key because the queryFn uses it; without it,
+		// changing page size on page 1 serves the cached result.
+		queryKey: [
+			"patching-runs",
+			runsFilterStatus,
+			runsFilterType,
+			runsPage,
+			runsLimit,
+		],
 		queryFn: () =>
 			patchingAPI.getRuns({
 				...(runsFilterStatus ? { status: runsFilterStatus } : {}),
@@ -249,6 +270,7 @@ const Patching = () => {
 			hostname: run.hosts?.hostname,
 		},
 		patchType: run.patch_type,
+		windowsScope: run.windows_scope || null,
 		packageNames:
 			Array.isArray(run.package_names) && run.package_names.length > 0
 				? run.package_names
@@ -365,16 +387,18 @@ const Patching = () => {
 					type="button"
 					onClick={() => navigate("/patching?tab=runs&status=active")}
 					className="card p-4 hover:shadow-card-hover dark:hover:shadow-card-hover-dark transition-shadow text-left"
-					title="View queued and running runs"
+					title="View queued, validating and running runs"
 				>
 					<div className="flex items-center">
 						<Clock className="h-5 w-5 text-blue-600 mr-2" />
 						<div>
 							<p className="text-sm text-secondary-500 dark:text-white">
-								Queued / Running
+								Active
 							</p>
 							<p className="text-xl font-semibold text-secondary-900 dark:text-white">
-								{(summary.queued ?? 0) + (summary.running ?? 0)}
+								{(summary.queued ?? 0) +
+									(summary.pending_validation ?? 0) +
+									(summary.running ?? 0)}
 							</p>
 						</div>
 					</div>
@@ -536,11 +560,16 @@ const Patching = () => {
 					lockPackages
 					presetHosts={approveWizardRuns.map((r) => r.host)}
 					validationRunIds={approveWizardRuns.map((r) => r.runId)}
-					packagesByHost={Object.fromEntries(
-						approveWizardRuns.map((r) => [r.host.id, r.packageNames]),
+					packagesByRun={Object.fromEntries(
+						approveWizardRuns.map((r) => [r.runId, r.packageNames]),
 					)}
-					patchTypeByHost={Object.fromEntries(
-						approveWizardRuns.map((r) => [r.host.id, r.patchType]),
+					patchTypeByRun={Object.fromEntries(
+						approveWizardRuns.map((r) => [r.runId, r.patchType]),
+					)}
+					windowsScopeByRun={Object.fromEntries(
+						approveWizardRuns
+							.filter((r) => r.windowsScope)
+							.map((r) => [r.runId, r.windowsScope]),
 					)}
 					onSuccess={handleApproveWizardSuccess}
 				/>
@@ -553,7 +582,7 @@ const Patching = () => {
 
 const STATUS_OPTIONS = [
 	{ value: "", label: "All statuses" },
-	{ value: "active", label: "Active (queued + running)" },
+	{ value: "active", label: "Active (queued, validating or running)" },
 	{ value: "queued", label: "Queued" },
 	{ value: "pending_validation", label: "Pending validation" },
 	{ value: "pending_approval", label: "Pending approval" },
@@ -931,10 +960,7 @@ function RunsTab({
 								const isApprovable = approvableStatuses.has(run.status);
 								const isSelectedForDelete = selectedRunIds.has(run.id);
 								const isSelectedForApprove = selectedApproveIds.has(run.id);
-								const hasExtraDeps =
-									run.status === "validated" &&
-									run.packages_affected?.length >
-										(run.package_names?.length || 1);
+								const hasExtraDeps = hasExtraDependencies(run);
 								const hostLabel =
 									run.hosts?.friendly_name ||
 									run.hosts?.hostname ||
@@ -1149,10 +1175,7 @@ function RunsTab({
 										const isSelectedForApprove = selectedApproveIds.has(run.id);
 										const isSelected =
 											isSelectedForDelete || isSelectedForApprove;
-										const hasExtraDeps =
-											run.status === "validated" &&
-											run.packages_affected?.length >
-												(run.package_names?.length || 1);
+										const hasExtraDeps = hasExtraDependencies(run);
 										const hostLabel =
 											run.hosts?.friendly_name ||
 											run.hosts?.hostname ||
@@ -1329,6 +1352,7 @@ const delay_type_labels = {
 function PoliciesTab() {
 	const queryClient = useQueryClient();
 	const toast = useToast();
+	const confirm = useConfirm();
 	const { settings } = useSettings();
 	const orgTimezone = settings?.timezone || "UTC";
 	const [showModal, setShowModal] = useState(false);
@@ -1339,6 +1363,8 @@ function PoliciesTab() {
 		patch_delay_type: "immediate",
 		delay_minutes: 60,
 		fixed_time_utc: "03:00",
+		recurrence: { ...DEFAULT_RECURRENCE },
+		auto_reboot: false,
 	});
 	const [expandedPolicyId, setExpandedPolicyId] = useState(null);
 
@@ -1353,8 +1379,11 @@ function PoliciesTab() {
 	});
 
 	const { data: hostsData } = useQuery({
-		queryKey: ["hosts-list"],
-		queryFn: () => adminHostsAPI.list().then((res) => res.data),
+		// Distinct key: other pages cache the default first-page response under
+		// "hosts-list", and the exclusion picker intersects this with group
+		// membership, so a truncated page renders as "nothing left to exclude".
+		queryKey: ["hosts-list", "all"],
+		queryFn: () => adminHostsAPI.list({ all: true }).then((res) => res.data),
 	});
 	const hosts = hostsData?.data || [];
 
@@ -1396,6 +1425,8 @@ function PoliciesTab() {
 			patch_delay_type: "immediate",
 			delay_minutes: 60,
 			fixed_time_utc: "03:00",
+			recurrence: { ...DEFAULT_RECURRENCE },
+			auto_reboot: false,
 		});
 
 	const openCreate = () => {
@@ -1412,12 +1443,21 @@ function PoliciesTab() {
 			patch_delay_type: policy.patch_delay_type || "immediate",
 			delay_minutes: policy.delay_minutes ?? 60,
 			fixed_time_utc: policy.fixed_time_utc || "03:00",
+			recurrence: parseRecurrenceCron(policy.recurrence_cron),
+			auto_reboot: policy.auto_reboot || false,
 		});
 		setShowModal(true);
 	};
 
 	const handleSubmit = (e) => {
 		e.preventDefault();
+		if (
+			form.recurrence.mode === "weekly" &&
+			form.recurrence.weekdays.length === 0
+		) {
+			toast.error("Select at least one day to repeat on");
+			return;
+		}
 		const payload = {
 			name: form.name.trim(),
 			description: form.description.trim() || null,
@@ -1426,6 +1466,8 @@ function PoliciesTab() {
 				form.patch_delay_type === "delayed" ? Number(form.delay_minutes) : null,
 			fixed_time_utc:
 				form.patch_delay_type === "fixed_time" ? form.fixed_time_utc : null,
+			recurrence_cron: buildRecurrenceCron(form.recurrence),
+			auto_reboot: form.recurrence.mode !== "none" && form.auto_reboot,
 		};
 		if (editingPolicy) {
 			updateMutation.mutate({ id: editingPolicy.id, data: payload });
@@ -1446,12 +1488,29 @@ function PoliciesTab() {
 		return label;
 	};
 
+	const setRecurrence = (patch) =>
+		setForm((f) => ({ ...f, recurrence: { ...f.recurrence, ...patch } }));
+
+	const toggleWeekday = (day) =>
+		setForm((f) => {
+			const days = f.recurrence.weekdays;
+			return {
+				...f,
+				recurrence: {
+					...f.recurrence,
+					weekdays: days.includes(day)
+						? days.filter((d) => d !== day)
+						: [...days, day].sort((a, b) => Number(a) - Number(b)),
+				},
+			};
+		});
+
 	return (
 		<div className="mt-4 space-y-4">
 			<div className="flex items-center justify-between">
 				<p className="text-sm text-secondary-600 dark:text-secondary-400">
-					Patch policies control when patches run. Assign policies to hosts or
-					host groups.
+					Patch policies control when patches run, and can repeat on a schedule.
+					Assign policies to hosts or host groups.
 				</p>
 				<button
 					type="button"
@@ -1522,6 +1581,17 @@ function PoliciesTab() {
 													<Clock className="h-3.5 w-3.5" />
 													{formatSchedule(policy)}
 												</span>
+												{policy.recurrence_cron && (
+													<div className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+														{describeRecurrence(
+															policy.recurrence_cron,
+															orgTimezone,
+														)}
+														{policy.auto_reboot && " · reboots if needed"}
+														{policy.recurrence_next_run_at &&
+															` · next ${formatDate(policy.recurrence_next_run_at)}`}
+													</div>
+												)}
 											</td>
 											<td className="px-4 py-3 whitespace-nowrap text-sm">
 												<button
@@ -1550,11 +1620,13 @@ function PoliciesTab() {
 													</button>
 													<button
 														type="button"
-														onClick={() => {
+														onClick={async () => {
 															if (
-																window.confirm(
-																	`Delete policy "${policy.name}"?`,
-																)
+																await confirm({
+																	title: "Delete policy",
+																	message: `Delete the patching policy "${policy.name}"?`,
+																	confirmLabel: "Delete policy",
+																})
 															)
 																deleteMutation.mutate(policy.id);
 														}}
@@ -1592,134 +1664,280 @@ function PoliciesTab() {
 
 			{/* Create/Edit Modal */}
 			{showModal && (
-				<div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
-					<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto">
-						<div className="flex items-center justify-between p-4 border-b border-secondary-200 dark:border-secondary-600">
-							<h3 className="text-lg font-semibold text-secondary-900 dark:text-white">
-								{editingPolicy ? "Edit policy" : "Create policy"}
-							</h3>
-							<button
-								type="button"
-								onClick={() => setShowModal(false)}
-								className="p-1 rounded hover:bg-secondary-100 dark:hover:bg-secondary-700"
-							>
-								<X className="h-5 w-5" />
-							</button>
-						</div>
-						<form onSubmit={handleSubmit} className="p-4 space-y-4">
-							<div>
-								<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-									Name
-								</label>
-								<input
-									type="text"
-									value={form.name}
-									onChange={(e) =>
-										setForm((f) => ({ ...f, name: e.target.value }))
-									}
-									className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-									required
-								/>
-							</div>
-							<div>
-								<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-									Description (optional)
-								</label>
-								<input
-									type="text"
-									value={form.description}
-									onChange={(e) =>
-										setForm((f) => ({
-											...f,
-											description: e.target.value,
-										}))
-									}
-									className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-								/>
-							</div>
-							<div>
-								<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-									Patch delay
-								</label>
-								<select
-									value={form.patch_delay_type}
-									onChange={(e) =>
-										setForm((f) => ({
-											...f,
-											patch_delay_type: e.target.value,
-										}))
-									}
-									className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-								>
-									<option value="immediate">Immediate</option>
-									<option value="delayed">Delayed (run after N minutes)</option>
-									<option value="fixed_time">Fixed time (e.g. 3:00 AM)</option>
-								</select>
-							</div>
-							{form.patch_delay_type === "delayed" && (
-								<div>
-									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-										Delay (minutes)
-									</label>
-									<input
-										type="number"
-										min={1}
-										value={form.delay_minutes}
-										onChange={(e) =>
-											setForm((f) => ({
-												...f,
-												delay_minutes: e.target.value,
-											}))
-										}
-										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-									/>
-								</div>
-							)}
-							{form.patch_delay_type === "fixed_time" && (
-								<div>
-									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
-										Time (HH:MM)
-									</label>
-									<input
-										type="text"
-										placeholder="03:00"
-										value={form.fixed_time_utc}
-										onChange={(e) =>
-											setForm((f) => ({
-												...f,
-												fixed_time_utc: e.target.value,
-											}))
-										}
-										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
-									/>
-									<p className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
-										Local time in the organization timezone (
-										<span className="font-medium">{orgTimezone}</span>). Change
-										it under Settings &rarr; General.
-									</p>
-								</div>
-							)}
-							<div className="flex justify-end gap-2 pt-2">
+				<ModalPortal>
+					<div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/50">
+						<div className="bg-white dark:bg-secondary-800 rounded-lg shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto">
+							<div className="flex items-center justify-between p-4 border-b border-secondary-200 dark:border-secondary-600">
+								<h3 className="text-lg font-semibold text-secondary-900 dark:text-white">
+									{editingPolicy ? "Edit policy" : "Create policy"}
+								</h3>
 								<button
 									type="button"
 									onClick={() => setShowModal(false)}
-									className="btn-outline"
+									className="p-1 rounded hover:bg-secondary-100 dark:hover:bg-secondary-700"
 								>
-									Cancel
-								</button>
-								<button
-									type="submit"
-									className="btn-primary"
-									disabled={
-										createMutation.isPending || updateMutation.isPending
-									}
-								>
-									{editingPolicy ? "Update" : "Create"}
+									<X className="h-5 w-5" />
 								</button>
 							</div>
-						</form>
+							<form onSubmit={handleSubmit} className="p-4 space-y-4">
+								<div>
+									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+										Name
+									</label>
+									<input
+										type="text"
+										value={form.name}
+										onChange={(e) =>
+											setForm((f) => ({ ...f, name: e.target.value }))
+										}
+										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										required
+									/>
+								</div>
+								<div>
+									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+										Description (optional)
+									</label>
+									<input
+										type="text"
+										value={form.description}
+										onChange={(e) =>
+											setForm((f) => ({
+												...f,
+												description: e.target.value,
+											}))
+										}
+										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+									/>
+								</div>
+								<div>
+									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+										Patch delay
+									</label>
+									<select
+										value={form.patch_delay_type}
+										onChange={(e) =>
+											setForm((f) => ({
+												...f,
+												patch_delay_type: e.target.value,
+											}))
+										}
+										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+									>
+										<option value="immediate">Immediate</option>
+										<option value="delayed">
+											Delayed (run after N minutes)
+										</option>
+										<option value="fixed_time">
+											Fixed time (e.g. 3:00 AM)
+										</option>
+									</select>
+								</div>
+								{form.patch_delay_type === "delayed" && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Delay (minutes)
+										</label>
+										<input
+											type="number"
+											min={1}
+											value={form.delay_minutes}
+											onChange={(e) =>
+												setForm((f) => ({
+													...f,
+													delay_minutes: e.target.value,
+												}))
+											}
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										/>
+									</div>
+								)}
+								{form.patch_delay_type === "fixed_time" && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Time (HH:MM)
+										</label>
+										<input
+											type="text"
+											placeholder="03:00"
+											value={form.fixed_time_utc}
+											onChange={(e) =>
+												setForm((f) => ({
+													...f,
+													fixed_time_utc: e.target.value,
+												}))
+											}
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										/>
+										<p className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+											Local time in the organization timezone (
+											<span className="font-medium">{orgTimezone}</span>).
+											Change it under Settings &rarr; General.
+										</p>
+									</div>
+								)}
+								<div>
+									<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+										Repeat
+									</label>
+									<select
+										value={form.recurrence.mode}
+										onChange={(e) => setRecurrence({ mode: e.target.value })}
+										className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+									>
+										<option value="none">
+											Never (run only when triggered)
+										</option>
+										<option value="daily">Every day</option>
+										<option value="weekly">Every week</option>
+										<option value="monthly">Every month</option>
+										<option value="custom">Custom (cron)</option>
+									</select>
+									{form.recurrence.mode === "none" && (
+										<p className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+											Runs are started by someone and this policy only decides
+											when they fire.
+										</p>
+									)}
+								</div>
+								{form.recurrence.mode === "weekly" && (
+									<fieldset>
+										<legend className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Days
+										</legend>
+										<div className="flex flex-wrap gap-2">
+											{WEEKDAYS.map((name, i) => {
+												const day = String(i);
+												const checked = form.recurrence.weekdays.includes(day);
+												return (
+													<label
+														key={name}
+														className={`flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-sm cursor-pointer select-none focus-within:ring-2 focus-within:ring-primary-500 ${
+															checked
+																? "border-primary-500 bg-primary-50 dark:bg-primary-900/30 text-primary-700 dark:text-primary-300"
+																: "border-secondary-300 dark:border-secondary-600 text-secondary-700 dark:text-secondary-300"
+														}`}
+													>
+														<input
+															type="checkbox"
+															checked={checked}
+															onChange={() => toggleWeekday(day)}
+															className="sr-only"
+														/>
+														{name.slice(0, 3)}
+													</label>
+												);
+											})}
+										</div>
+									</fieldset>
+								)}
+								{form.recurrence.mode === "monthly" && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Day of month
+										</label>
+										<input
+											type="number"
+											min={1}
+											max={28}
+											value={form.recurrence.monthday}
+											onChange={(e) =>
+												setRecurrence({ monthday: e.target.value })
+											}
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										/>
+									</div>
+								)}
+								{["daily", "weekly", "monthly"].includes(
+									form.recurrence.mode,
+								) && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Time
+										</label>
+										<input
+											type="time"
+											value={form.recurrence.time}
+											onChange={(e) => setRecurrence({ time: e.target.value })}
+											required
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2"
+										/>
+									</div>
+								)}
+								{form.recurrence.mode === "custom" && (
+									<div>
+										<label className="block text-sm font-medium text-secondary-700 dark:text-secondary-300 mb-1">
+											Cron expression
+										</label>
+										<input
+											type="text"
+											placeholder="0 3 * * 1-5"
+											value={form.recurrence.cron}
+											onChange={(e) => setRecurrence({ cron: e.target.value })}
+											required
+											className="w-full rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white px-3 py-2 font-mono"
+										/>
+										<p className="mt-1 text-xs text-secondary-500 dark:text-secondary-400">
+											Five fields: minute hour day-of-month month day-of-week.
+											Minute and hour must be single numbers.
+										</p>
+									</div>
+								)}
+								{form.recurrence.mode !== "none" && (
+									<label className="flex items-start gap-2 text-sm text-secondary-700 dark:text-secondary-300">
+										<input
+											type="checkbox"
+											checked={form.auto_reboot}
+											onChange={(e) =>
+												setForm((f) => ({
+													...f,
+													auto_reboot: e.target.checked,
+												}))
+											}
+											className="mt-0.5"
+										/>
+										<span>
+											Reboot after patching if the host needs it
+											<span className="block text-xs text-secondary-500 dark:text-secondary-400">
+												Applies to scheduled runs only. The host reboots one
+												minute after a successful run, and only if it reports a
+												pending reboot. Needs an agent updated to this release.
+											</span>
+										</span>
+									</label>
+								)}
+								{form.recurrence.mode !== "none" && (
+									<p className="text-xs text-secondary-500 dark:text-secondary-400">
+										At each occurrence PatchMon patches every outdated package
+										on every connected host this policy applies to. Times are in
+										the organization timezone (
+										<span className="font-medium">{orgTimezone}</span>). An
+										occurrence missed for more than 30 minutes (for example
+										during downtime) is skipped.
+									</p>
+								)}
+								<div className="flex justify-end gap-2 pt-2">
+									<button
+										type="button"
+										onClick={() => setShowModal(false)}
+										className="btn-outline"
+									>
+										Cancel
+									</button>
+									<button
+										type="submit"
+										className="btn-primary"
+										disabled={
+											createMutation.isPending || updateMutation.isPending
+										}
+									>
+										{editingPolicy ? "Update" : "Create"}
+									</button>
+								</div>
+							</form>
+						</div>
 					</div>
-				</div>
+				</ModalPortal>
 			)}
 		</div>
 	);
@@ -1734,7 +1952,11 @@ function PolicyAssignments({ policy, hosts, hostGroups, onUpdate }) {
 	const [addTargetId, setAddTargetId] = useState("");
 	const [addExclusionHostId, setAddExclusionHostId] = useState("");
 
-	const { data: fullPolicy } = useQuery({
+	const {
+		data: fullPolicy,
+		isPending: policyPending,
+		isError: policyError,
+	} = useQuery({
 		queryKey: ["patching-policy", policy.id],
 		queryFn: () => patchingAPI.getPolicyById(policy.id),
 		enabled: !!policy.id,
@@ -1807,6 +2029,30 @@ function PolicyAssignments({ policy, hosts, hostGroups, onUpdate }) {
 		const g = hostGroups.find((x) => x.id === a.target_id);
 		return g?.name || a.target_id;
 	};
+
+	const assignedGroupIds = useMemo(
+		() =>
+			new Set(
+				assignments
+					.filter((a) => a.target_type === "host_group")
+					.map((a) => a.target_id),
+			),
+		[assignments],
+	);
+
+	// An exclusion only has meaning against a group assignment, so the picker
+	// offers members of the assigned groups that are not already excluded.
+	const excludableHosts = useMemo(() => {
+		if (assignedGroupIds.size === 0) return [];
+		const excludedHostIds = new Set(exclusions.map((e) => e.host_id));
+		return hosts.filter(
+			(h) =>
+				!excludedHostIds.has(h.id) &&
+				(h.host_group_memberships || []).some((m) =>
+					assignedGroupIds.has(m?.host_groups?.id ?? m?.id),
+				),
+		);
+	}, [hosts, exclusions, assignedGroupIds]);
 
 	return (
 		<div className="px-4 pb-4 pt-3 bg-secondary-50 dark:bg-secondary-900/50 border-t border-secondary-200 dark:border-secondary-600">
@@ -1910,28 +2156,49 @@ function PolicyAssignments({ policy, hosts, hostGroups, onUpdate }) {
 						))}
 					</ul>
 				)}
-				<div className="flex flex-wrap items-center gap-2">
-					<select
-						value={addExclusionHostId}
-						onChange={(e) => setAddExclusionHostId(e.target.value)}
-						className="rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white text-sm px-2 py-1 min-w-[160px]"
-					>
-						<option value="">Select host to exclude...</option>
-						{hosts.map((h) => (
-							<option key={h.id} value={h.id}>
-								{h.friendly_name || h.hostname || h.id}
+				{policyPending ? (
+					<p className="text-sm text-secondary-500 dark:text-secondary-400">
+						Loading assignments...
+					</p>
+				) : policyError ? (
+					<p className="text-sm text-danger-600 dark:text-danger-400">
+						Could not load this policy's assignments.
+					</p>
+				) : assignedGroupIds.size === 0 ? (
+					<p className="text-sm text-secondary-500 dark:text-secondary-400">
+						Assign a host group to this policy before excluding hosts from it.
+					</p>
+				) : (
+					<div className="flex flex-wrap items-center gap-2">
+						<select
+							value={addExclusionHostId}
+							onChange={(e) => setAddExclusionHostId(e.target.value)}
+							disabled={excludableHosts.length === 0}
+							className="rounded border border-secondary-300 dark:border-secondary-600 bg-white dark:bg-secondary-700 text-secondary-900 dark:text-white text-sm px-2 py-1 min-w-[160px] disabled:opacity-50 disabled:cursor-not-allowed"
+						>
+							<option value="">
+								{excludableHosts.length === 0
+									? "No hosts left to exclude"
+									: "Select host to exclude..."}
 							</option>
-						))}
-					</select>
-					<button
-						type="button"
-						onClick={() => addExclusionHostId && addExclusionMutation.mutate()}
-						disabled={!addExclusionHostId || addExclusionMutation.isPending}
-						className="btn-outline text-sm py-1"
-					>
-						Exclude host
-					</button>
-				</div>
+							{excludableHosts.map((h) => (
+								<option key={h.id} value={h.id}>
+									{h.friendly_name || h.hostname || h.id}
+								</option>
+							))}
+						</select>
+						<button
+							type="button"
+							onClick={() =>
+								addExclusionHostId && addExclusionMutation.mutate()
+							}
+							disabled={!addExclusionHostId || addExclusionMutation.isPending}
+							className="btn-outline text-sm py-1 disabled:opacity-50 disabled:cursor-not-allowed"
+						>
+							Exclude host
+						</button>
+					</div>
+				)}
 			</div>
 		</div>
 	);
